@@ -34,12 +34,8 @@ registry.dispatch("CreateFileW", ctx)
 
 ## Status
 
-- [x] M0: skeleton + nimble + smoke tests
-- [x] M1: framework files (registry, reentrancy, propagation env helpers, inline hook primitive, IAT patcher)
-- [x] M2: cross-platform propagation framework (per-library `PropagationNode` registry + auto-propagation hooks on POSIX/Windows + safety knobs on the Windows injection path)
-- [x] M3: consumer migration (codetracer-native-recorder's `ct_interpose` re-exports `stackable_hooks` instead of carrying these files itself)
-- [x] M4: consumer migration (reprobuild's `repro_monitor_*` libs drop the `--path:..\codetracer-native-recorder\ct_interpose\src` overlay)
-- [x] M5: v0.1.0 docs + nimble release
+v0.1.0 — first release. See [CHANGELOG.md](./CHANGELOG.md) for what's
+in the box.
 
 ## License
 

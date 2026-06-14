@@ -1,0 +1,13 @@
+nimcache/
+build/
+*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+*.obj
+*.o
+*.a
+*.lib
+*.exp
+test-logs/

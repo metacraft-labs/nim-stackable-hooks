@@ -33,23 +33,41 @@ const TotalNodes = ConcurrencyThreads * NodesPerThread
 var
   testNodes: array[TotalNodes, PropagationNode]
   cursorAtomic: Atomic[int]
+  testNodesReady {.global.}: bool = false
+
+proc initTestNodesOnce() =
+  ## Populate the per-node ``libraryPath`` strings from the main
+  ## thread BEFORE any worker thread inspects the registry. Nim's
+  ## ORC tracks string ownership per-thread; if a worker thread
+  ## allocated the string and the main thread later dealloced it
+  ## at program exit, the cross-thread free walks an allocator
+  ## arena owned by a different thread and SIGSEGVs in
+  ## ``addToSharedFreeList``. Pre-populating from the main thread
+  ## keeps every string under the main-thread allocator.
+  if testNodesReady:
+    return
+  for i in 0 ..< TotalNodes:
+    testNodes[i].libraryPath = "/concurrent/lib-" & $i & ".so"
+  testNodesReady = true
 
 proc registerWorker(threadIdx: int) {.thread, gcsafe.} =
-  ## Grab N consecutive slots and register them all, flipping the
-  ## enabled bit on alternate slots so half are enabled half disabled.
+  ## Grab N consecutive slots and call register/enable on them.
+  ## The string assignment was already performed by
+  ## ``initTestNodesOnce`` on the main thread, so the workers only
+  ## flip atomics + push to the CAS-published registry.
   let base = cursorAtomic.fetchAdd(NodesPerThread)
   for k in 0 ..< NodesPerThread:
     let i = base + k
     if i >= testNodes.len:
       break
     {.cast(gcsafe).}:
-      testNodes[i].libraryPath = "/concurrent/lib-" & $i & ".so"
       registerPropagationNode(addr testNodes[i])
       if (i mod 2) == 0:
         enableAutoPropagation(addr testNodes[i])
 
 suite "propagation_registry_concurrent":
   test "N threads register N nodes; enabledLibraryPaths sees exactly the enabled half":
+    initTestNodesOnce()
     cursorAtomic.store(0)
     var threads: array[ConcurrencyThreads, Thread[int]]
     for t in 0 ..< ConcurrencyThreads:

@@ -94,6 +94,42 @@ proc isSipProtected*(binaryPath: string): bool =
       return true
   result = false
 
+proc unrewriteSipPath*(binaryPath: string, sandboxToolsDir: string): string =
+  ## Inverse of `rewriteSipPath`: given a path that may point into a
+  ## `sandboxToolsDir` SIP sandbox copy, return the ORIGINAL system path it
+  ## mirrors. If `binaryPath` is not under `sandboxToolsDir`, return it
+  ## unchanged.
+  ##
+  ## The sandbox layout mirrors the original directory structure under the
+  ## sandbox root (see `rewriteSipPath` / `prepareSandboxCopy`), so the inverse
+  ## strips the sandbox prefix and restores the leading slash — but ONLY when the
+  ## resulting path is genuinely SIP-protected, so an unrelated path that merely
+  ## happens to share the prefix string is not mis-mapped.
+  ##
+  ## Example:
+  ##   unrewriteSipPath("/opt/ct/sandbox-tools/bin/sh", "/opt/ct/sandbox-tools")
+  ##   => "/bin/sh"
+  ##
+  ##   unrewriteSipPath("/opt/ct/sandbox-tools/bin/sh", "/opt/ct/sandbox-tools/")
+  ##   => "/bin/sh"  (a trailing slash on the sandbox dir is tolerated)
+  if sandboxToolsDir.len == 0:
+    return binaryPath
+  var root = sandboxToolsDir
+  # Normalise a single trailing slash so the prefix comparison is exact.
+  while root.len > 1 and root[^1] == '/':
+    root.setLen(root.len - 1)
+  let prefix = root & "/"
+  if not binaryPath.startsWith(prefix):
+    return binaryPath
+  # Restore the original absolute path: leading slash + the mirrored remainder.
+  let original = "/" & binaryPath[prefix.len .. ^1]
+  # Only treat it as a sandbox copy if the restored path is genuinely SIP-
+  # protected; otherwise leave the input untouched (defensive — never invent a
+  # system path for an unrelated sandbox-rooted file).
+  if isSipProtected(original):
+    return original
+  result = binaryPath
+
 proc sandboxToolsDir*(): string =
   ## Return the sandbox-tools directory path.
   ## Uses CT_SANDBOX_TOOLS_DIR if set, otherwise defaults to

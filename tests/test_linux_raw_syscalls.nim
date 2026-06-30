@@ -73,6 +73,7 @@ suite "linux raw syscall primitives":
       check resolveDefaultSymbol(cstring("syscall")) == nil
 
 when defined(linux) and defined(amd64):
+  {.compile: "fixtures/linux_raw_syscalls_c_abi_smoke.c".}
   {.emit: """
 #define _GNU_SOURCE
 #include <stdint.h>
@@ -122,6 +123,8 @@ int stackable_test_replacement_value(void) {
     {.importc: "stackable_test_replacement_value", cdecl.}
   proc allocSyscallScanBuffer(): pointer
     {.importc: "stackable_test_alloc_syscall_scan_buffer", cdecl.}
+  proc cAbiLinkSmoke(): cint
+    {.importc: "stackable_test_c_abi_link_smoke", cdecl.}
 
   type TestFn = proc(): cint {.cdecl.}
 
@@ -132,15 +135,92 @@ int stackable_test_replacement_value(void) {
       let fn = cast[TestFn](target)
       check fn() == 7
 
-      var handle = installAbsoluteJumpPatch(target, cast[pointer](replacementValue))
-      check handle.diagnostic == lrsOk
-      check handle.active
-      check handle.patchSize == linuxAbsoluteJumpPatchSize
+      let tx = installAbsoluteJumpPatchTransaction(
+        target, cast[pointer](replacementValue), captureRestoreBytes = true)
+      check tx.diagnostic == lrsOk
+      check tx.stage == lpsComplete
+      check tx.patchLive
+      check tx.restoreBytesCaptured
+      check tx.handle.diagnostic == lrsOk
+      check tx.handle.active
+      check tx.handle.patchSize == linuxAbsoluteJumpPatchSize
       check fn() == 42
 
+      var handle = tx.handle
       check restoreAbsoluteJumpPatch(handle) == lrsOk
       check not handle.active
       check fn() == 7
+
+    test "transaction reports invalid target at validation stage":
+      let tx = installAbsoluteJumpPatchTransaction(nil, cast[pointer](replacementValue))
+      check tx.diagnostic == lrsInvalidArgument
+      check tx.stage == lpsValidateTarget
+      check not tx.patchLive
+      check not tx.handle.active
+      check not tx.restoreBytesCaptured
+
+    test "transaction reports pre-patch mprotect failure before reading target bytes":
+      let tx = installAbsoluteJumpPatchTransaction(
+        cast[pointer](0x1), cast[pointer](replacementValue))
+      check tx.diagnostic == lrsPrePatchMprotectFailed
+      check tx.stage == lpsPrePatchMprotect
+      check tx.osErrno != 0
+      check not tx.patchLive
+      check not tx.restoreBytesCaptured
+
+    test "transaction can skip restore-byte capture":
+      let target = allocPatchTarget()
+      check target != nil
+      let fn = cast[TestFn](target)
+      check fn() == 7
+
+      let tx = installAbsoluteJumpPatchTransaction(
+        target, cast[pointer](replacementValue), captureRestoreBytes = false)
+      check tx.diagnostic == lrsOk
+      check tx.patchLive
+      check not tx.restoreBytesCaptured
+      check fn() == 42
+
+    test "transaction reports already-patched targets without recapturing bytes":
+      let target = allocPatchTarget()
+      check target != nil
+      let first = installAbsoluteJumpPatchTransaction(
+        target, cast[pointer](replacementValue), captureRestoreBytes = true)
+      check first.diagnostic == lrsOk
+
+      let second = installAbsoluteJumpPatchTransaction(
+        target, cast[pointer](replacementValue), captureRestoreBytes = true)
+      check second.diagnostic == lrsAlreadyPatched
+      check second.stage == lpsValidateTarget
+      check not second.patchLive
+      check not second.restoreBytesCaptured
+
+      var handle = first.handle
+      check restoreAbsoluteJumpPatch(handle) == lrsOk
+
+    test "resolver chains are consumer controlled":
+      let libc = openLibraryNoLoad(cstring("libc.so.6"))
+      let chain = if libc != nil:
+        @[handleSymbolResolver(libc), defaultSymbolResolver()]
+      else:
+        @[defaultSymbolResolver()]
+      check resolveSymbolChain(cstring("syscall"), chain) != nil
+      check resolveSymbolChain(cstring("__stackable_missing_symbol"), chain) == nil
+
+    test "duplicate patch book is optional and executable segment validation is reusable":
+      clearLinuxPatchBook()
+      check not linuxPatchBookContains(cast[pointer](replacementValue))
+      check recordLinuxPatchBookTarget(cast[pointer](replacementValue)) == 0
+      check linuxPatchBookContains(cast[pointer](replacementValue))
+      check recordLinuxPatchBookTarget(cast[pointer](replacementValue)) == 1
+      check addrInLinuxExecutableSegment(cast[pointer](replacementValue))
+
+      let anon = allocPatchTarget()
+      check anon != nil
+      check not addrInLinuxExecutableSegment(anon)
+
+    test "C ABI symbols compile and link from a C translation unit":
+      check cAbiLinkSmoke() == 0
 
     test "memory scanner describes callsites in a controlled executable buffer":
       let buf = allocSyscallScanBuffer()

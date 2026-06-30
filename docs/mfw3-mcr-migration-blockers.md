@@ -5,6 +5,16 @@ accepted 2026-06-30. No MCR source was migrated in this pass because the
 current `stackable_hooks/platform/linux_raw_syscalls` and Windows inline-hook
 API surfaces are not yet sufficient to preserve MCR behavior.
 
+M-FW-3A update 2026-06-30: the Linux patch transaction / C ABI / resolver
+slice is implemented and independently reviewed in
+`stackable_hooks/platform/linux_raw_syscalls`. This addresses the helper
+contracts needed before migrating MCR's
+`syscall_callsite_patch.nim` and the C translation unit
+`clone3_callsite_patch.c`: stage-aware absolute-jump transactions,
+post-patch-live diagnostics, neutral C ABI entry points, consumer-controlled
+resolver chains, executable-segment validation, and optional duplicate-target
+bookkeeping. M-FW-3 remains blocked on the other helper families listed below.
+
 This document is the M-FW-3 implementation artifact. It records why a narrow
 partial migration would be misleading, which MCR modules depend on the missing
 contracts, and which algorithmic APIs should be added before attempting the
@@ -28,6 +38,15 @@ The current M-FW-2 Linux helper module provides:
 - `/proc/self/maps` executable mapping enumeration;
 - byte, memory, and selected-mapping scanners for `0f 05` syscall opcodes;
 - structured diagnostics for those primitives.
+
+With M-FW-3A, the same module also provides:
+
+- stage-aware patch transactions that distinguish validation, pre-patch
+  `mprotect`, write, post-patch `mprotect`-back, and complete stages;
+- neutral C ABI functions for transaction patching, resolver lookup,
+  executable-segment validation, and optional duplicate-target bookkeeping;
+- consumer-controlled resolver chains, including `RTLD_DEFAULT` and opened
+  library handles such as `libc.so.6` with `RTLD_NOLOAD`.
 
 Those helpers are useful but do not yet cover the behavior-preserving contracts
 used by MCR. Replacing MCR internals with them now would either leave most
@@ -60,16 +79,23 @@ Current MCR dependencies:
 
 Missing stackable-hooks APIs:
 
+- instruction-aware original-call trampoline construction for wrappers that
+  need to call through rather than replace the whole function;
+- wrapper-level counters and target-selection policy, which should stay in MCR
+  but still need migration design once the low-level helpers are consumed;
+- full behavior-preserving MCR migration to the new neutral transaction/C ABI
+  helper names;
+
+Addressed by M-FW-3A:
+
 - a policy-free patch transaction API that reports stage-specific permission
   failures without imposing restore/uninstall semantics;
 - a C ABI wrapper surface suitable for C translation units such as
   `clone3_callsite_patch.c`;
 - executable-segment validation helpers independent of MCR diagnostics;
 - duplicate-target bookkeeping as an optional helper, not as consumer policy;
-- instruction-aware original-call trampoline construction for wrappers that
-  need to call through rather than replace the whole function;
-- a symbol resolver that can be driven by a consumer-supplied lookup chain
-  such as `RTLD_DEFAULT` then `libc.so.6` `RTLD_NOLOAD`.
+- a symbol resolver that can be driven by a consumer-supplied lookup chain such
+  as `RTLD_DEFAULT` then `libc.so.6` `RTLD_NOLOAD`.
 
 Why migration now would change behavior:
 
@@ -210,20 +236,17 @@ path on private symbols.
 
 ## Required API Additions Before Reattempt
 
-1. Add a Linux patch transaction layer that exposes permission-stage
-   diagnostics, optional restore byte capture, consumer-controlled resolver
-   chains, and a C ABI usable from MCR C translation units.
-2. Add instruction-aware trampoline/original-call construction for wrapper
+1. Add instruction-aware trampoline/original-call construction for wrapper
    patches, with explicit architecture support and tests.
-3. Add a reusable INT3/SIGTRAP callsite substrate: callsite table, trap
+2. Add a reusable INT3/SIGTRAP callsite substrate: callsite table, trap
    install/chain, register-state view, result writeback, and continuation
    policy hooks.
-4. Add static-runtime compatible C ABI variants for raw syscall/trap helpers
+3. Add static-runtime compatible C ABI variants for raw syscall/trap helpers
    that do not require libc.
-5. Add vDSO ELF resolver and direct-or-overlay patch transaction helpers.
-6. Add generic executable-range/JIT bookkeeping and near-trampoline allocation
+4. Add vDSO ELF resolver and direct-or-overlay patch transaction helpers.
+5. Add generic executable-range/JIT bookkeeping and near-trampoline allocation
    helpers for POSIX code patching.
-7. Export and test Windows no-suspend and noreturn no-suspend inline install
+6. Export and test Windows no-suspend and noreturn no-suspend inline install
    primitives with precondition documentation.
 
 ## M-FW-3 Status

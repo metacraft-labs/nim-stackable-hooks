@@ -71,6 +71,18 @@ helpers for consumers that need to close direct syscall bypasses:
   `replayLinuxX8664SyscallRegisters` for policy-free Linux x86_64 `ucontext_t`
   register extraction, result/RIP writeback, and raw replay of the captured
   syscall ABI state.
+- `isLinuxX8664DefaultCloneContinuationSyscall`,
+  `isLinuxX8664CloneContinuationSyscall`,
+  `computeLinuxX8664Int3ResumeRip`, and
+  `computeLinuxX8664CloneContinuation` for policy-free clone/fork/vfork
+  continuation-state calculation on top of the INT3 substrate. The helpers
+  describe parent result/RIP writeback and child resume-RIP shape; consumers
+  decide when clone-like handling applies.
+- `staticRawSyscall6`, `rtSigreturnRestorerAddress`, and
+  `cloneContinuationTrampolineAddress`, plus matching neutral
+  `stackable_linux_*` C ABI symbols, for static-runtime/no-libc-oriented
+  consumers that need raw syscall, signal-restorer, and clone-continuation
+  building blocks without calling libc's `syscall(2)` wrapper.
 - `installLinuxSigtrapHandler`, `chainLinuxSigtrap`, and
   `uninstallLinuxSigtrapHandler` as a low-level SIGTRAP install/chaining
   substrate. The install helper rejects double installation in the same
@@ -90,9 +102,9 @@ RIP-relative relocation, or thread-suspension/install policy.
 
 The INT3 raw-syscall helpers are also deliberately policy-free. They patch only
 consumer-selected callsites, expose the x86_64 register continuation contract,
-and provide a signal chaining substrate, but they do not classify syscalls,
-record events, special-case `clone`/`fork`/`vfork`, manage static-runtime
-signal restorers, or decide which executable mappings are safe to scan.
+provide a signal chaining substrate, and expose default clone/fork/vfork
+continuation mechanics. They do not record events, choose mapping scan policy,
+decide which syscalls are mission-relevant, or own process lifecycle policy.
 Handlers built on this substrate must explicitly dispatch known callsites and
 chain or escalate unrelated SIGTRAPs; the helper returns
 `lrsTrapChainUnavailable` when the saved predecessor cannot be invoked.

@@ -49,6 +49,28 @@ struct stackable_linux_syscall_regs {
   unsigned long resume_rip;
 };
 
+struct stackable_linux_clone_continuation {
+  int clone_like;
+  long nr;
+  unsigned long syscall_address;
+  unsigned long trap_rip;
+  unsigned long resume_rip;
+  long parent_result;
+  unsigned long parent_resume_rip;
+  long child_result;
+  unsigned long child_resume_rip;
+};
+
+extern long stackable_linux_static_raw_syscall6(
+    long nr, long a1, long a2, long a3, long a4, long a5, long a6);
+extern void stackable_linux_rt_sigreturn_restorer(void);
+extern long stackable_linux_clone_continuation_trampoline(
+    long nr, long a0, long a1, long a2, long a3, long a4, long a5,
+    void *resume_rip, long *user_gregs);
+extern int stackable_linux_is_default_clone_continuation_syscall(long nr);
+extern int stackable_linux_compute_clone_continuation(
+    struct stackable_linux_syscall_regs *regs, long parent_result,
+    int clone_like, struct stackable_linux_clone_continuation *out);
 extern int stackable_linux_patch_absolute_jump_tx(
     void *target, void *replacement, int capture_restore,
     struct stackable_linux_patch_result *out);
@@ -116,6 +138,8 @@ static void stackable_live_int3_handler(int signo, siginfo_t *info, void *uctx) 
 int stackable_test_c_abi_link_smoke(void) {
   struct stackable_linux_patch_result tx;
   struct stackable_linux_trampoline_result tramp;
+  struct stackable_linux_clone_continuation continuation;
+  struct stackable_linux_syscall_regs regs;
   int rc = stackable_linux_patch_absolute_jump_tx(NULL, NULL, 1, &tx);
   if (rc != 3 || tx.diagnostic != 3 || tx.stage != 1) return -1;
   if (tx.patch_live != 0 || tx.restore_captured != 0) return -2;
@@ -132,6 +156,24 @@ int stackable_test_c_abi_link_smoke(void) {
   if (stackable_linux_addr_in_executable_segment(
       (unsigned long)(uintptr_t)&stackable_c_fixture_function) != 1) return -5;
   if (stackable_linux_resolve_symbol_in_handle(NULL, "syscall") == NULL) return -6;
+  if (stackable_linux_static_raw_syscall6(39, 0, 0, 0, 0, 0, 0) <= 0) return -10;
+  if ((void *)&stackable_linux_rt_sigreturn_restorer == NULL) return -11;
+  if ((void *)&stackable_linux_clone_continuation_trampoline == NULL) return -12;
+  if (stackable_linux_clone_continuation_trampoline(
+      39, 0, 0, 0, 0, 0, 0, NULL, NULL) <= 0) return -18;
+  if (stackable_linux_is_default_clone_continuation_syscall(56) != 1) return -13;
+  if (stackable_linux_is_default_clone_continuation_syscall(39) != 0) return -14;
+  memset(&regs, 0, sizeof(regs));
+  regs.nr = 56;
+  regs.trap_rip = 0x5011UL;
+  regs.syscall_address = 0x5010UL;
+  regs.resume_rip = 0x5012UL;
+  rc = stackable_linux_compute_clone_continuation(
+      &regs, 777, 1, &continuation);
+  if (rc != 0 || continuation.clone_like != 1 || continuation.nr != 56) return -15;
+  if (continuation.parent_result != 777 || continuation.child_result != 0) return -16;
+  if (continuation.parent_resume_rip != 0x5012UL ||
+      continuation.child_resume_rip != 0x5012UL) return -17;
   return 0;
 }
 

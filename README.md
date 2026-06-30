@@ -61,6 +61,20 @@ helpers for consumers that need to close direct syscall bypasses:
   `visitLinuxX8664SyscallMemory`, `visitLinuxExecutableMappingSyscalls`,
   `parseLinuxMapsLine`, and `enumerateLinuxExecutableMappings` for finding and
   describing raw `0f 05` callsites.
+- `LinuxInt3CallsiteTable`, `addLinuxInt3Callsite`,
+  `findLinuxInt3Callsite`, and `findLinuxInt3CallsiteForTrapRip` for sorted
+  raw-syscall callsite lookup suitable for signal-handler dispatch.
+- `installInt3SyscallPatchTransaction` and `restoreInt3SyscallPatch` for
+  replacing byte 0 of a selected `0f 05` instruction with `INT3` and restoring
+  the original byte.
+- `captureLinuxX8664SyscallRegisters`, `writeLinuxX8664SyscallResult`, and
+  `replayLinuxX8664SyscallRegisters` for policy-free Linux x86_64 `ucontext_t`
+  register extraction, result/RIP writeback, and raw replay of the captured
+  syscall ABI state.
+- `installLinuxSigtrapHandler`, `chainLinuxSigtrap`, and
+  `uninstallLinuxSigtrapHandler` as a low-level SIGTRAP install/chaining
+  substrate. The install helper rejects double installation in the same
+  process so uninstall can restore the saved predecessor predictably.
 
 `rawSyscall6` returns the kernel result directly; failed syscalls are negative
 errno values and do not set libc `errno`. Patch/restore temporarily changes the
@@ -73,6 +87,15 @@ instructions, `syscall`, calls, jumps, returns, absolute moffs forms, and
 RIP-relative memory operands with `lrsUnsupportedInstruction` instead of
 relocating them incorrectly. It does not yet provide a full disassembler,
 RIP-relative relocation, or thread-suspension/install policy.
+
+The INT3 raw-syscall helpers are also deliberately policy-free. They patch only
+consumer-selected callsites, expose the x86_64 register continuation contract,
+and provide a signal chaining substrate, but they do not classify syscalls,
+record events, special-case `clone`/`fork`/`vfork`, manage static-runtime
+signal restorers, or decide which executable mappings are safe to scan.
+Handlers built on this substrate must explicitly dispatch known callsites and
+chain or escalate unrelated SIGTRAPs; the helper returns
+`lrsTrapChainUnavailable` when the saved predecessor cannot be invoked.
 
 `installAbsoluteJumpPatchTransaction` exposes the lower-level install contract
 needed by C translation units and behavior-preserving migrations: it

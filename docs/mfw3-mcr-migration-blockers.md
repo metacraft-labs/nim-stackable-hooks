@@ -25,6 +25,19 @@ patch window is covered, executable trampoline memory is allocated, and a
 prologues are rejected with structured diagnostics. This is still an
 algorithmic helper only; MCR source is not migrated by this slice.
 
+M-FW-3C update 2026-06-30: the Linux x86_64 INT3 raw-syscall callsite
+substrate is implemented and independently reviewed in
+`stackable_hooks/platform/linux_raw_syscalls`. This adds sorted callsite-table
+lookup, INT3 patch/restore transactions for selected `0f 05` sites, Linux
+x86_64 `ucontext_t` syscall-register capture and result/RIP writeback, raw
+syscall replay from captured register state, neutral C ABI entry points, and a
+low-level SIGTRAP install/chain/uninstall substrate. The review added live
+coverage for an INT3-patched `getpid` syscall stub continuing through replay
+and RIP writeback. It remains policy-free: MCR event conversion, mapping
+selection, clone/fork/vfork continuation, stage0/static-shim lifecycle,
+unrelated-trap escalation policy, and no-libc signal restorer machinery are not
+migrated by this slice.
+
 This document is the M-FW-3 implementation artifact. It records why a narrow
 partial migration would be misleading, which MCR modules depend on the missing
 contracts, and which algorithmic APIs should be added before attempting the
@@ -147,22 +160,26 @@ Current MCR dependencies:
 - static-shim raw syscall and no-libc signal-restorer machinery;
 - MCR event conversion and replay policy.
 
-Missing stackable-hooks APIs:
+Previously missing stackable-hooks APIs addressed by M-FW-3C:
 
 - INT3 callsite patch/unpatch transactions;
 - sorted callsite-table lookup helpers suitable for a signal handler;
 - SIGTRAP install/chain/uninstall substrate;
 - an architecture-specific register-state continuation contract;
 - raw syscall replay from captured register state;
+
+Still missing after M-FW-3C:
+
 - clone/fork/vfork continuation helpers with explicit child-resume semantics;
 - static-runtime/no-libc compatible C ABI variants.
 
 Why migration now would change behavior:
 
-M-FW-2 only extracted scanners. MCR's observable behavior comes from trap
-installation and register-state continuation. Reusing only the scanner would
-not reduce the private low-level patch substrate and could accidentally diverge
-from MCR's existing self-exclusion and clone continuation rules.
+M-FW-3C now covers the generic trap installation, callsite table, register
+state, and raw replay substrate. MCR migration is still not behavior-preserving
+until the consumer-owned mapping/self-exclusion policy, event conversion,
+clone/fork/vfork child continuation, and static-runtime/no-libc restorer
+contracts are mapped explicitly.
 
 ### Linux vDSO Patching
 
@@ -259,9 +276,8 @@ path on private symbols.
 
 ## Required API Additions Before Reattempt
 
-1. Add a reusable INT3/SIGTRAP callsite substrate: callsite table, trap
-   install/chain, register-state view, result writeback, and continuation
-   policy hooks.
+1. Add clone/fork/vfork continuation helpers as explicit policy hooks on top of
+   the reusable INT3/SIGTRAP callsite substrate.
 2. Add static-runtime compatible C ABI variants for raw syscall/trap helpers
    that do not require libc.
 3. Add vDSO ELF resolver and direct-or-overlay patch transaction helpers.

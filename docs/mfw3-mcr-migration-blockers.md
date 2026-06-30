@@ -15,6 +15,16 @@ post-patch-live diagnostics, neutral C ABI entry points, consumer-controlled
 resolver chains, executable-segment validation, and optional duplicate-target
 bookkeeping. M-FW-3 remains blocked on the other helper families listed below.
 
+M-FW-3B update 2026-06-30: the Linux x86_64 original-call trampoline slice is
+complete after independent review in
+`stackable_hooks/platform/linux_raw_syscalls`. This adds conservative
+instruction-aware prefix measurement and trampoline construction for wrapper
+body patches: supported whole instructions are copied until the absolute-jump
+patch window is covered, executable trampoline memory is allocated, and a
+14-byte absolute jump back to `target + copiedLen` is appended. Unsupported
+prologues are rejected with structured diagnostics. This is still an
+algorithmic helper only; MCR source is not migrated by this slice.
+
 This document is the M-FW-3 implementation artifact. It records why a narrow
 partial migration would be misleading, which MCR modules depend on the missing
 contracts, and which algorithmic APIs should be added before attempting the
@@ -79,8 +89,6 @@ Current MCR dependencies:
 
 Missing stackable-hooks APIs:
 
-- instruction-aware original-call trampoline construction for wrappers that
-  need to call through rather than replace the whole function;
 - wrapper-level counters and target-selection policy, which should stay in MCR
   but still need migration design once the low-level helpers are consumed;
 - full behavior-preserving MCR migration to the new neutral transaction/C ABI
@@ -97,13 +105,28 @@ Addressed by M-FW-3A:
 - a symbol resolver that can be driven by a consumer-supplied lookup chain such
   as `RTLD_DEFAULT` then `libc.so.6` `RTLD_NOLOAD`.
 
+Addressed by M-FW-3B:
+
+- instruction-aware original-call trampoline construction for Linux x86_64
+  wrapper body patches that can be safely copied without relocation;
+- measure-only validation so consumers can reject unsupported prologues before
+  allocating trampoline memory;
+- neutral C ABI entry points for trampoline measurement/construction.
+
+Still not addressed by M-FW-3B:
+
+- RIP-relative relocation and a full instruction decoder;
+- thread-suspension or install-timing policy;
+- wrapper-level MCR counters and target-selection policy;
+- actual MCR migration to call the neutral helpers.
+
 Why migration now would change behavior:
 
-The current stackable helper can patch a target to a replacement, but it does
-not reproduce MCR's install-stage diagnostics, C ABI interop, libc resolver
-fallback, or trampoline/original-call contract. A wrapper around
-`installAbsoluteJumpPatch` would move only the byte write while leaving the
-behavioral machinery private, so it would not satisfy M-FW-3.
+The current stackable helper surface now covers the main Linux wrapper patch
+transaction, resolver, C ABI, executable-segment, duplicate-book, and
+original-call trampoline primitives. MCR migration is still blocked because the
+consumer-owned wrapper policy and the remaining helper families below must be
+handled without changing event stream shape or stage0 composition.
 
 ### Program-Text Raw Syscall Scan and INT3 Trap
 
@@ -236,17 +259,15 @@ path on private symbols.
 
 ## Required API Additions Before Reattempt
 
-1. Add instruction-aware trampoline/original-call construction for wrapper
-   patches, with explicit architecture support and tests.
-2. Add a reusable INT3/SIGTRAP callsite substrate: callsite table, trap
+1. Add a reusable INT3/SIGTRAP callsite substrate: callsite table, trap
    install/chain, register-state view, result writeback, and continuation
    policy hooks.
-3. Add static-runtime compatible C ABI variants for raw syscall/trap helpers
+2. Add static-runtime compatible C ABI variants for raw syscall/trap helpers
    that do not require libc.
-4. Add vDSO ELF resolver and direct-or-overlay patch transaction helpers.
-5. Add generic executable-range/JIT bookkeeping and near-trampoline allocation
+3. Add vDSO ELF resolver and direct-or-overlay patch transaction helpers.
+4. Add generic executable-range/JIT bookkeeping and near-trampoline allocation
    helpers for POSIX code patching.
-6. Export and test Windows no-suspend and noreturn no-suspend inline install
+5. Export and test Windows no-suspend and noreturn no-suspend inline install
    primitives with precondition documentation.
 
 ## M-FW-3 Status

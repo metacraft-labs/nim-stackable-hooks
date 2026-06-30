@@ -354,6 +354,36 @@ Remaining Windows risks:
 - MCR diagnostics around target resolution, install ordering, and stage0
   transitions remain MCR-owned and must be reviewed against Windows traces.
 
+### Linux syscall wrapper / clone3 patch migration
+
+Migrated in parent M-FW-3H implementation pass, accepted after independent
+review:
+
+- `codetracer-native-recorder/ct_interpose/src/ct_interpose/recording/syscall_callsite_patch.nim`
+  imports `stackable_hooks/platform/linux_raw_syscalls` so the neutral
+  `stackable_linux_*` C ABI is linked into the MCR interpose library.
+- MCR's `_ct_cp_apply_patch` compatibility symbol now delegates to
+  `stackable_linux_patch_absolute_jump_tx` while preserving the historical
+  `_ct_cp_last_stage` / `_ct_cp_last_errno` diagnostic surface consumed by
+  MCR lifecycle logging and `clone3_callsite_patch.c`. The wrapper maps a
+  successful patch with a failed post-patch `mprotect` hardening step back to
+  historical stage `2` and continues because the patch is live.
+- MCR's `_ct_cp_addr_in_executable_segment`,
+  `_ct_cp_addr_already_patched`, `_ct_cp_record_patched_addr`, libc symbol
+  resolution, libc `RTLD_NOLOAD` fallback, and libpreload target lookup now
+  delegate to the stackable helper C ABI.
+- `clone3_callsite_patch.c` keeps MCR-owned clone3 pattern scanning,
+  trampoline assembly, pthread/clone3 attribution payloads, and install
+  result policy; it reuses the migrated `_ct_cp_*` wrappers unchanged.
+
+What remains MCR-owned:
+
+- event recording/replay and syscall classification in the libc `syscall(2)`
+  trampoline;
+- clone3 attribution, pending TLS payloads, trampoline body, and constructor
+  lifecycle;
+- fatal/non-fatal install policy and user-facing diagnostics.
+
 ## Required API Additions Before Reattempt
 
 1. Map MCR's program syscall scanner to the new INT3/continuation/static-helper
@@ -371,5 +401,8 @@ Remaining Windows risks:
 M-FW-3 is partial, not done. The first parent migration pass moved the
 behavior-preserving Windows inline-hook install users onto
 `stackable_hooks/inline_hook/windows_inline_hook` while preserving MCR-owned
-stage0 composition and diagnostics. Linux syscall-wrapper, program-text
-syscall-scan, vDSO, and POSIX atomic/JIT migrations remain open.
+stage0 composition and diagnostics. M-FW-3H then moved Linux `syscall(2)`
+wrapper and clone3 callsite low-level patch/resolver/bookkeeping helpers onto
+`stackable_hooks/platform/linux_raw_syscalls` through MCR compatibility
+wrappers. Program-text syscall-scan, vDSO, and POSIX atomic/JIT migrations
+remain open.

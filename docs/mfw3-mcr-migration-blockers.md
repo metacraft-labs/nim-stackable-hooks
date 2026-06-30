@@ -1,9 +1,13 @@
 # M-FW-3 MCR Migration Blockers
 
-Status: blocked after implementation audit; independently reviewed and
-accepted 2026-06-30. No MCR source was migrated in this pass because the
-current `stackable_hooks/platform/linux_raw_syscalls` and Windows inline-hook
-API surfaces are not yet sufficient to preserve MCR behavior.
+Status: partial after the first parent M-FW-3 implementation pass on
+2026-06-30. The original blocked audit was independently reviewed and accepted;
+subsequent M-FW-3A..G helper slices closed the missing primitive gaps. The
+first MCR migration pass moved the behavior-preserving Windows inline-hook
+install surfaces onto `stackable_hooks/inline_hook/windows_inline_hook`, while
+leaving MCR policy and stage0 composition in MCR. Linux syscall-wrapper,
+program-text syscall-scan, vDSO, and POSIX atomic/JIT MCR migration remain
+open.
 
 M-FW-3A update 2026-06-30: the Linux patch transaction / C ABI / resolver
 slice is implemented and independently reviewed in
@@ -38,6 +42,21 @@ selection, clone/fork/vfork continuation, stage0/static-shim lifecycle,
 unrelated-trap escalation policy, and no-libc signal restorer machinery are not
 migrated by this slice.
 
+M-FW-3 parent migration pass 1 update 2026-06-30: MCR's Windows inline-hook
+users now consume the stackable helper module directly. The migrated files are:
+
+- `codetracer-native-recorder/ct_interpose/src/ct_interpose/ntdll_detours_windows.nim`
+- `codetracer-native-recorder/ct_interpose/src/ct_interpose/ldrloaddll_detour_windows.nim`
+- `codetracer-native-recorder/ct_interpose/src/ct_interpose/getprocaddress_detour_windows.nim`
+- `codetracer-native-recorder/ct_interpose/src/ct_interpose/gfx_capture_windows.nim`
+
+This pass preserves the architecture boundary: MCR still owns stage0
+discrimination, target resolution, install ordering, diagnostics, trampoline
+consumers, and event bodies. `nim-stackable-hooks` supplies only the low-level
+inline-hook helper and unsafe no-suspend primitive. The parent milestone is
+still open because the Linux helper families below have not yet been migrated
+in MCR.
+
 This document is the M-FW-3 implementation artifact. It records why a narrow
 partial migration would be misleading, which MCR modules depend on the missing
 contracts, and which algorithmic APIs should be added before attempting the
@@ -71,9 +90,10 @@ With M-FW-3A, the same module also provides:
 - consumer-controlled resolver chains, including `RTLD_DEFAULT` and opened
   library handles such as `libc.so.6` with `RTLD_NOLOAD`.
 
-Those helpers are useful but do not yet cover the behavior-preserving contracts
-used by MCR. Replacing MCR internals with them now would either leave most
-private copies in place or change observable behavior in the recorder.
+Those helpers are useful and now cover enough primitive surface for targeted
+MCR migrations. Windows inline-hook consumers have been migrated. The Linux
+helper families below still need explicit MCR-side migration work to avoid
+changing observable recorder behavior.
 
 ## Blocking Gaps by Helper Family
 
@@ -285,6 +305,8 @@ MCR modules:
 
 - `codetracer-native-recorder/ct_interpose/src/ct_interpose/ntdll_detours_windows.nim`
 - `codetracer-native-recorder/ct_interpose/src/ct_interpose/ldrloaddll_detour_windows.nim`
+- `codetracer-native-recorder/ct_interpose/src/ct_interpose/getprocaddress_detour_windows.nim`
+- `codetracer-native-recorder/ct_interpose/src/ct_interpose/gfx_capture_windows.nim`
 
 Current MCR dependencies:
 
@@ -310,21 +332,27 @@ Previously missing stackable-hooks APIs addressed by M-FW-3G:
   underlying C symbols, plus Linux-host runtime checks that the non-Windows C
   stubs return unsupported instead of crashing.
 
-Still missing after M-FW-3G:
+Migrated in parent M-FW-3 pass 1:
 
-- live MCR migration of `ntdll_detours_windows.nim` and
-  `ldrloaddll_detour_windows.nim` to import the stackable-hooks wrappers;
-- MCR-owned proof and enforcement of the stage0/single-thread lifecycle
-  precondition;
+- `ntdll_detours_windows.nim` imports the stackable wrapper for normal,
+  unsafe no-suspend, noreturn, and unsafe no-suspend noreturn installs while
+  keeping MCR's stage0 discriminator and diagnostics local.
+- `ldrloaddll_detour_windows.nim` imports the stackable wrapper for normal and
+  unsafe no-suspend installs plus handler enter/leave guards while keeping
+  module-load policy local.
+- `getprocaddress_detour_windows.nim` imports the stackable wrapper for normal
+  and unsafe no-suspend installs plus handler-state checks while keeping the
+  redirect policy local.
+- `gfx_capture_windows.nim` no longer compiles the old local inline-hook C
+  sources; it imports the stackable wrapper as the shared compile point while
+  keeping graphics-capture policy local.
+
+Remaining Windows risks:
+
+- live Windows runtime validation still has to prove the stage0/single-thread
+  no-suspend precondition at the migrated call sites;
 - MCR diagnostics around target resolution, install ordering, and stage0
-  transitions.
-
-Why migration now would change behavior:
-
-M-FW-3G supplies the primitive no-suspend entry points without moving stage0
-into `nim-stackable-hooks`. A behavior-preserving migration is still blocked
-until MCR is explicitly rewired to these helpers and proves the no-suspend
-precondition at each call site.
+  transitions remain MCR-owned and must be reviewed against Windows traces.
 
 ## Required API Additions Before Reattempt
 
@@ -335,13 +363,13 @@ precondition at each call site.
    target lists, trampoline bodies, event/replay policy, and diagnostics.
 3. Wire M-FW-3F's POSIX atomic/JIT helper slice into MCR-owned
    scanner/trampoline/event lifecycle code without changing MCR behavior.
-4. After independent review of M-FW-3G, migrate Windows NT-detour and
-   LdrLoadDll-detour install sites to the stackable-hooks inline API while
-   keeping stage0 lifecycle proof and diagnostics in MCR.
+4. Run independent review and live Windows validation for the parent M-FW-3
+   Windows migration pass.
 
 ## M-FW-3 Status
 
-M-FW-3 is blocked, not done. M-FW-3G has implemented and passed independent
-review for the Windows no-suspend inline-hook primitive surface. MCR source
-remains unchanged rather than claiming a migration that would not preserve MCR
-behavior or event stream shape.
+M-FW-3 is partial, not done. The first parent migration pass moved the
+behavior-preserving Windows inline-hook install users onto
+`stackable_hooks/inline_hook/windows_inline_hook` while preserving MCR-owned
+stage0 composition and diagnostics. Linux syscall-wrapper, program-text
+syscall-scan, vDSO, and POSIX atomic/JIT migrations remain open.

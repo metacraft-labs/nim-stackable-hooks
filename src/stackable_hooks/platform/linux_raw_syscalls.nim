@@ -30,6 +30,9 @@ type
     lrsUnsupportedInstruction = "unsupported-instruction"
     lrsTrampolineAllocFailed = "trampoline-alloc-failed"
     lrsTrampolineBuildFailed = "trampoline-build-failed"
+    lrsNotSyscallSite = "not-syscall-site"
+    lrsTrapInstallFailed = "trap-install-failed"
+    lrsTrapChainUnavailable = "trap-chain-unavailable"
 
   LinuxPatchStage* = enum
     lpsNone = "none"
@@ -75,6 +78,45 @@ type
     diagnostic*: LinuxRawSyscallDiagnostic
     osErrno*: cint
     unsupportedOffset*: int
+
+  LinuxInt3Callsite* = object
+    ## One raw `0f 05` callsite selected by a consumer for INT3 handling.
+    ## `address` points at byte 0 of the syscall instruction, not the saved
+    ## SIGTRAP RIP. Consumers own mapping/self-exclusion policy.
+    address*: uint
+    originalFirstByte*: byte
+    patched*: bool
+
+  LinuxInt3CallsiteTable* = object
+    ## Sorted table for signal-handler lookup. INT3 reports saved RIP as
+    ## `callsite + 1`, so use `findLinuxInt3CallsiteForTrapRip` in handlers.
+    sites*: seq[LinuxInt3Callsite]
+
+  LinuxInt3PatchHandle* = object
+    target*: pointer
+    originalFirstByte*: byte
+    secondByte*: byte
+    active*: bool
+    diagnostic*: LinuxRawSyscallDiagnostic
+    osErrno*: cint
+
+  LinuxInt3PatchTransaction* = object
+    handle*: LinuxInt3PatchHandle
+    stage*: LinuxPatchStage
+    diagnostic*: LinuxRawSyscallDiagnostic
+    osErrno*: cint
+    patchLive*: bool
+    restoreByteCaptured*: bool
+
+  LinuxX8664SyscallRegisters* = object
+    ## Policy-free view of the Linux x86_64 syscall ABI captured from a
+    ## SIGTRAP `ucontext_t` at an INT3-patched raw syscall site.
+    syscallNumber*: int
+    args*: array[6, int]
+    result*: int
+    trapRip*: uint
+    syscallAddress*: uint
+    resumeRip*: uint
 
   LinuxSymbolResolverKind* = enum
     lsrDefault = "rtld-default"
@@ -122,6 +164,26 @@ type CStackableLinuxTrampolineResult {.importc: "struct stackable_linux_trampoli
   minPatchLen {.importc: "min_patch_len".}: culong
   unsupportedOffset {.importc: "unsupported_offset".}: clong
 
+type CStackableLinuxInt3PatchResult {.importc: "struct stackable_linux_int3_patch_result",
+                                      bycopy.} = object
+  diagnostic {.importc: "diagnostic".}: cint
+  stage {.importc: "stage".}: cint
+  osErrno {.importc: "os_errno".}: cint
+  patchLive {.importc: "patch_live".}: cint
+  restoreCaptured {.importc: "restore_captured".}: cint
+  target {.importc: "target".}: culong
+  originalFirstByte {.importc: "original_first_byte".}: byte
+  secondByte {.importc: "second_byte".}: byte
+
+type CStackableLinuxSyscallRegs {.importc: "struct stackable_linux_syscall_regs",
+                                  bycopy.} = object
+  nr {.importc: "nr".}: clong
+  args {.importc: "args".}: array[6, clong]
+  result {.importc: "result".}: clong
+  trapRip {.importc: "trap_rip".}: culong
+  syscallAddress {.importc: "syscall_address".}: culong
+  resumeRip {.importc: "resume_rip".}: culong
+
 const
   linuxSyscallOpcode0* = byte 0x0f
   linuxSyscallOpcode1* = byte 0x05
@@ -150,6 +212,8 @@ when defined(linux) and defined(amd64):
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <signal.h>
+#include <ucontext.h>
 
 #ifndef STACKABLE_LINUX_RTLD_NOLOAD
 #define STACKABLE_LINUX_RTLD_NOLOAD RTLD_NOLOAD
@@ -169,7 +233,10 @@ enum {
   STACKABLE_LINUX_PATCH_RESTORE_FAILED = 10,
   STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION = 11,
   STACKABLE_LINUX_PATCH_TRAMPOLINE_ALLOC_FAILED = 12,
-  STACKABLE_LINUX_PATCH_TRAMPOLINE_BUILD_FAILED = 13
+  STACKABLE_LINUX_PATCH_TRAMPOLINE_BUILD_FAILED = 13,
+  STACKABLE_LINUX_PATCH_NOT_SYSCALL_SITE = 14,
+  STACKABLE_LINUX_PATCH_TRAP_INSTALL_FAILED = 15,
+  STACKABLE_LINUX_PATCH_TRAP_CHAIN_UNAVAILABLE = 16
 };
 
 enum {
@@ -201,6 +268,26 @@ struct stackable_linux_trampoline_result {
   unsigned long copied_len;
   unsigned long min_patch_len;
   long unsupported_offset;
+};
+
+struct stackable_linux_int3_patch_result {
+  int diagnostic;
+  int stage;
+  int os_errno;
+  int patch_live;
+  int restore_captured;
+  unsigned long target;
+  unsigned char original_first_byte;
+  unsigned char second_byte;
+};
+
+struct stackable_linux_syscall_regs {
+  long nr;
+  long args[6];
+  long result;
+  unsigned long trap_rip;
+  unsigned long syscall_address;
+  unsigned long resume_rip;
 };
 
 long stackable_linux_raw_syscall6(long nr, long a1, long a2, long a3,
@@ -328,6 +415,126 @@ int stackable_linux_patch_absolute_jump_tx(
   if (out) {
     out->stage = STACKABLE_LINUX_PATCH_STAGE_COMPLETE;
     out->diagnostic = STACKABLE_LINUX_PATCH_OK;
+  }
+  return STACKABLE_LINUX_PATCH_OK;
+}
+
+static void stackable_linux_init_int3_result(
+    struct stackable_linux_int3_patch_result *out, void *target) {
+  if (out == NULL) return;
+  memset(out, 0, sizeof(*out));
+  out->diagnostic = STACKABLE_LINUX_PATCH_OK;
+  out->stage = STACKABLE_LINUX_PATCH_STAGE_NONE;
+  out->target = (unsigned long)(uintptr_t)target;
+}
+
+int stackable_linux_patch_int3_syscall_tx(
+    void *target, struct stackable_linux_int3_patch_result *out) {
+  stackable_linux_init_int3_result(out, target);
+  if (out) out->stage = STACKABLE_LINUX_PATCH_STAGE_VALIDATE_TARGET;
+  if (target == NULL) {
+    if (out) out->diagnostic = STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+    return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+  }
+
+  long page_size = sysconf(_SC_PAGESIZE);
+  if (page_size <= 0) page_size = 4096;
+  uintptr_t page_mask = (uintptr_t)(page_size - 1);
+  uintptr_t target_addr = (uintptr_t)target;
+  uintptr_t start = target_addr & ~page_mask;
+  uintptr_t end = (target_addr + 2 + page_mask) & ~page_mask;
+  size_t span = (size_t)(end - start);
+
+  if (out) out->stage = STACKABLE_LINUX_PATCH_STAGE_PRE_MPROTECT;
+  long mp1 = stackable_linux_raw_mprotect(start, span,
+                                          PROT_READ | PROT_WRITE | PROT_EXEC);
+  if (mp1 < 0) {
+    if (out) {
+      out->diagnostic = STACKABLE_LINUX_PATCH_PRE_MPROTECT_FAILED;
+      out->os_errno = (int)(-mp1);
+    }
+    return STACKABLE_LINUX_PATCH_PRE_MPROTECT_FAILED;
+  }
+
+  unsigned char *p = (unsigned char *)target;
+  if (p[0] == 0xcc && p[1] == 0x05) {
+    long mp_restore = stackable_linux_raw_mprotect(start, span, PROT_READ | PROT_EXEC);
+    if (out) {
+      out->stage = STACKABLE_LINUX_PATCH_STAGE_VALIDATE_TARGET;
+      out->diagnostic = STACKABLE_LINUX_PATCH_ALREADY_PATCHED;
+      if (mp_restore < 0) out->os_errno = (int)(-mp_restore);
+    }
+    return STACKABLE_LINUX_PATCH_ALREADY_PATCHED;
+  }
+  if (p[0] != 0x0f || p[1] != 0x05) {
+    long mp_restore = stackable_linux_raw_mprotect(start, span, PROT_READ | PROT_EXEC);
+    if (out) {
+      out->stage = STACKABLE_LINUX_PATCH_STAGE_VALIDATE_TARGET;
+      out->diagnostic = STACKABLE_LINUX_PATCH_NOT_SYSCALL_SITE;
+      if (mp_restore < 0) out->os_errno = (int)(-mp_restore);
+    }
+    return STACKABLE_LINUX_PATCH_NOT_SYSCALL_SITE;
+  }
+
+  if (out) {
+    out->original_first_byte = p[0];
+    out->second_byte = p[1];
+    out->restore_captured = 1;
+  }
+
+  if (out) out->stage = STACKABLE_LINUX_PATCH_STAGE_WRITE_PATCH;
+  *(volatile unsigned char *)p = 0xcc;
+  if (out) out->patch_live = 1;
+
+  if (out) out->stage = STACKABLE_LINUX_PATCH_STAGE_POST_MPROTECT_BACK;
+  long mp2 = stackable_linux_raw_mprotect(start, span, PROT_READ | PROT_EXEC);
+  if (mp2 < 0) {
+    if (out) {
+      out->diagnostic = STACKABLE_LINUX_PATCH_POST_MPROTECT_BACK_FAILED;
+      out->os_errno = (int)(-mp2);
+    }
+    return STACKABLE_LINUX_PATCH_POST_MPROTECT_BACK_FAILED;
+  }
+
+  if (out) {
+    out->stage = STACKABLE_LINUX_PATCH_STAGE_COMPLETE;
+    out->diagnostic = STACKABLE_LINUX_PATCH_OK;
+  }
+  return STACKABLE_LINUX_PATCH_OK;
+}
+
+int stackable_linux_restore_int3_syscall(
+    void *target, unsigned char original_first_byte, int *out_errno) {
+  if (out_errno) *out_errno = 0;
+  if (target == NULL) return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+
+  long page_size = sysconf(_SC_PAGESIZE);
+  if (page_size <= 0) page_size = 4096;
+  uintptr_t page_mask = (uintptr_t)(page_size - 1);
+  uintptr_t target_addr = (uintptr_t)target;
+  uintptr_t start = target_addr & ~page_mask;
+  uintptr_t end = (target_addr + 2 + page_mask) & ~page_mask;
+  size_t span = (size_t)(end - start);
+
+  long mp1 = stackable_linux_raw_mprotect(start, span,
+                                          PROT_READ | PROT_WRITE | PROT_EXEC);
+  if (mp1 < 0) {
+    if (out_errno) *out_errno = (int)(-mp1);
+    return STACKABLE_LINUX_PATCH_PRE_MPROTECT_FAILED;
+  }
+
+  unsigned char *p = (unsigned char *)target;
+  if (p[0] != 0xcc || p[1] != 0x05) {
+    long mp_restore = stackable_linux_raw_mprotect(start, span, PROT_READ | PROT_EXEC);
+    if (out_errno && mp_restore < 0) *out_errno = (int)(-mp_restore);
+    return STACKABLE_LINUX_PATCH_NOT_SYSCALL_SITE;
+  }
+  p[0] = original_first_byte;
+
+  long mp2 = stackable_linux_raw_mprotect(start, span, PROT_READ | PROT_EXEC);
+  if (mp2 < 0) {
+    if (out_errno) *out_errno = (int)(-mp2);
+    return STACKABLE_LINUX_PATCH_POST_MPROTECT_BACK_FAILED;
   }
   return STACKABLE_LINUX_PATCH_OK;
 }
@@ -681,6 +888,101 @@ int stackable_linux_patch_registry_record(unsigned long addr) {
   stackable_linux_patch_registry[stackable_linux_patch_registry_count++] = addr;
   return 0;
 }
+
+static int stackable_linux_copy_ucontext_regs(
+    void *ucontext_ptr, struct stackable_linux_syscall_regs *out) {
+  if (ucontext_ptr == NULL || out == NULL) {
+    return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+  }
+  ucontext_t *uc = (ucontext_t *)ucontext_ptr;
+  out->nr = (long)uc->uc_mcontext.gregs[REG_RAX];
+  out->args[0] = (long)uc->uc_mcontext.gregs[REG_RDI];
+  out->args[1] = (long)uc->uc_mcontext.gregs[REG_RSI];
+  out->args[2] = (long)uc->uc_mcontext.gregs[REG_RDX];
+  out->args[3] = (long)uc->uc_mcontext.gregs[REG_R10];
+  out->args[4] = (long)uc->uc_mcontext.gregs[REG_R8];
+  out->args[5] = (long)uc->uc_mcontext.gregs[REG_R9];
+  out->result = (long)uc->uc_mcontext.gregs[REG_RAX];
+  out->trap_rip = (unsigned long)uc->uc_mcontext.gregs[REG_RIP];
+  out->syscall_address = out->trap_rip == 0 ? 0 : out->trap_rip - 1;
+  out->resume_rip = out->trap_rip + 1;
+  return STACKABLE_LINUX_PATCH_OK;
+}
+
+int stackable_linux_capture_syscall_regs_from_ucontext(
+    void *ucontext_ptr, struct stackable_linux_syscall_regs *out) {
+  return stackable_linux_copy_ucontext_regs(ucontext_ptr, out);
+}
+
+int stackable_linux_write_syscall_result_to_ucontext(
+    void *ucontext_ptr, long result, unsigned long resume_rip) {
+  if (ucontext_ptr == NULL) return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+  ucontext_t *uc = (ucontext_t *)ucontext_ptr;
+  uc->uc_mcontext.gregs[REG_RAX] = (greg_t)result;
+  if (resume_rip != 0) {
+    uc->uc_mcontext.gregs[REG_RIP] = (greg_t)resume_rip;
+  }
+  return STACKABLE_LINUX_PATCH_OK;
+}
+
+long stackable_linux_replay_syscall_regs(
+    const struct stackable_linux_syscall_regs *regs) {
+  if (regs == NULL) return -22;
+  return stackable_linux_raw_syscall6(regs->nr, regs->args[0], regs->args[1],
+                                      regs->args[2], regs->args[3],
+                                      regs->args[4], regs->args[5]);
+}
+
+static struct sigaction stackable_linux_old_sigtrap_action;
+static int stackable_linux_sigtrap_installed = 0;
+
+int stackable_linux_install_sigtrap_handler(void *handler, int extra_flags) {
+  if (handler == NULL) return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+  if (stackable_linux_sigtrap_installed) return STACKABLE_LINUX_PATCH_ALREADY_PATCHED;
+  struct sigaction sa;
+  memset(&sa, 0, sizeof(sa));
+  sigemptyset(&sa.sa_mask);
+  sa.sa_sigaction = (void (*)(int, siginfo_t *, void *))handler;
+  sa.sa_flags = SA_SIGINFO | extra_flags;
+  if (sigaction(SIGTRAP, &sa, &stackable_linux_old_sigtrap_action) != 0) {
+    return STACKABLE_LINUX_PATCH_TRAP_INSTALL_FAILED;
+  }
+  stackable_linux_sigtrap_installed = 1;
+  return STACKABLE_LINUX_PATCH_OK;
+}
+
+int stackable_linux_uninstall_sigtrap_handler(void) {
+  if (!stackable_linux_sigtrap_installed) {
+    return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+  }
+  if (sigaction(SIGTRAP, &stackable_linux_old_sigtrap_action, NULL) != 0) {
+    return STACKABLE_LINUX_PATCH_TRAP_INSTALL_FAILED;
+  }
+  stackable_linux_sigtrap_installed = 0;
+  return STACKABLE_LINUX_PATCH_OK;
+}
+
+int stackable_linux_chain_sigtrap(int signum, void *siginfo_ptr,
+                                  void *ucontext_ptr) {
+  if (!stackable_linux_sigtrap_installed) {
+    return STACKABLE_LINUX_PATCH_TRAP_CHAIN_UNAVAILABLE;
+  }
+  if (stackable_linux_old_sigtrap_action.sa_flags & SA_SIGINFO) {
+    if (stackable_linux_old_sigtrap_action.sa_sigaction == NULL) {
+      return STACKABLE_LINUX_PATCH_TRAP_CHAIN_UNAVAILABLE;
+    }
+    stackable_linux_old_sigtrap_action.sa_sigaction(
+        signum, (siginfo_t *)siginfo_ptr, ucontext_ptr);
+    return STACKABLE_LINUX_PATCH_OK;
+  }
+  if (stackable_linux_old_sigtrap_action.sa_handler == SIG_DFL ||
+      stackable_linux_old_sigtrap_action.sa_handler == SIG_IGN ||
+      stackable_linux_old_sigtrap_action.sa_handler == NULL) {
+    return STACKABLE_LINUX_PATCH_TRAP_CHAIN_UNAVAILABLE;
+  }
+  stackable_linux_old_sigtrap_action.sa_handler(signum);
+  return STACKABLE_LINUX_PATCH_OK;
+}
 """.}
 
   proc cRawSyscall6(nr, a1, a2, a3, a4, a5, a6: clong): clong
@@ -711,6 +1013,26 @@ int stackable_linux_patch_registry_record(unsigned long addr) {
     {.importc: "stackable_linux_patch_registry_contains", cdecl.}
   proc cPatchRegistryRecord(address: culong): cint
     {.importc: "stackable_linux_patch_registry_record", cdecl.}
+  proc cPatchInt3SyscallTx(target: pointer;
+                           outResult: ptr CStackableLinuxInt3PatchResult): cint
+    {.importc: "stackable_linux_patch_int3_syscall_tx", cdecl.}
+  proc cRestoreInt3Syscall(target: pointer; originalFirstByte: byte;
+                           outErrno: ptr cint): cint
+    {.importc: "stackable_linux_restore_int3_syscall", cdecl.}
+  proc cCaptureSyscallRegsFromUcontext(ucontext: pointer;
+                                       outRegs: ptr CStackableLinuxSyscallRegs): cint
+    {.importc: "stackable_linux_capture_syscall_regs_from_ucontext", cdecl.}
+  proc cWriteSyscallResultToUcontext(ucontext: pointer; result: clong;
+                                     resumeRip: culong): cint
+    {.importc: "stackable_linux_write_syscall_result_to_ucontext", cdecl.}
+  proc cReplaySyscallRegs(regs: ptr CStackableLinuxSyscallRegs): clong
+    {.importc: "stackable_linux_replay_syscall_regs", cdecl.}
+  proc cInstallSigtrapHandler(handler: pointer; extraFlags: cint): cint
+    {.importc: "stackable_linux_install_sigtrap_handler", cdecl.}
+  proc cUninstallSigtrapHandler(): cint
+    {.importc: "stackable_linux_uninstall_sigtrap_handler", cdecl.}
+  proc cChainSigtrap(signum: cint; siginfo: pointer; ucontext: pointer): cint
+    {.importc: "stackable_linux_chain_sigtrap", cdecl.}
 
 proc rawSyscall6*(nr, a1, a2, a3, a4, a5, a6: int): int =
   ## Issue a Linux x86_64 raw syscall using the kernel calling convention.
@@ -794,6 +1116,9 @@ proc toDiagnostic(rc: cint): LinuxRawSyscallDiagnostic {.used.} =
   of 11: lrsUnsupportedInstruction
   of 12: lrsTrampolineAllocFailed
   of 13: lrsTrampolineBuildFailed
+  of 14: lrsNotSyscallSite
+  of 15: lrsTrapInstallFailed
+  of 16: lrsTrapChainUnavailable
   else: lrsPatchWriteFailed
 
 proc toPatchStage(stage: cint): LinuxPatchStage {.used.} =
@@ -832,6 +1157,34 @@ proc fromCTrampoline(cres: CStackableLinuxTrampolineResult): LinuxOriginalTrampo
     result.diagnostic = toDiagnostic(cres.diagnostic)
     result.osErrno = cres.osErrno
     result.unsupportedOffset = int(cres.unsupportedOffset)
+  else:
+    discard
+
+proc fromCInt3Transaction(cres: CStackableLinuxInt3PatchResult): LinuxInt3PatchTransaction {.used.} =
+  when defined(linux) and defined(amd64):
+    result.handle.target = cast[pointer](cres.target)
+    result.handle.originalFirstByte = cres.originalFirstByte
+    result.handle.secondByte = cres.secondByte
+    result.handle.active = cres.patchLive != 0
+    result.handle.diagnostic = toDiagnostic(cres.diagnostic)
+    result.handle.osErrno = cres.osErrno
+    result.stage = toPatchStage(cres.stage)
+    result.diagnostic = toDiagnostic(cres.diagnostic)
+    result.osErrno = cres.osErrno
+    result.patchLive = cres.patchLive != 0
+    result.restoreByteCaptured = cres.restoreCaptured != 0
+  else:
+    discard
+
+proc fromCSyscallRegs(cres: CStackableLinuxSyscallRegs): LinuxX8664SyscallRegisters {.used.} =
+  when defined(linux) and defined(amd64):
+    result.syscallNumber = int(cres.nr)
+    for i in 0 ..< 6:
+      result.args[i] = int(cres.args[i])
+    result.result = int(cres.result)
+    result.trapRip = uint(cres.trapRip)
+    result.syscallAddress = uint(cres.syscallAddress)
+    result.resumeRip = uint(cres.resumeRip)
   else:
     discard
 
@@ -974,6 +1327,169 @@ proc restoreAbsoluteJumpPatch*(handle: var LinuxPatchHandle): LinuxRawSyscallDia
       lrsRestoreFailed
   else:
     linuxRawSyscallSupported()
+
+proc addLinuxInt3Callsite*(table: var LinuxInt3CallsiteTable;
+                           address: uint;
+                           originalFirstByte: byte = linuxSyscallOpcode0;
+                           patched = false): bool =
+  ## Insert one callsite while preserving sort order. Returns false for a
+  ## duplicate address. No mapping selection or patch policy is implied.
+  var lo = 0
+  var hi = table.sites.len
+  while lo < hi:
+    let mid = lo + ((hi - lo) shr 1)
+    if table.sites[mid].address < address:
+      lo = mid + 1
+    else:
+      hi = mid
+  if lo < table.sites.len and table.sites[lo].address == address:
+    return false
+  table.sites.insert LinuxInt3Callsite(
+    address: address,
+    originalFirstByte: originalFirstByte,
+    patched: patched), lo
+  true
+
+proc findLinuxInt3Callsite*(table: LinuxInt3CallsiteTable;
+                            address: uint): int =
+  ## Return the sorted-table index for `address`, or `-1`.
+  var lo = 0
+  var hi = table.sites.len
+  while lo < hi:
+    let mid = lo + ((hi - lo) shr 1)
+    if table.sites[mid].address == address:
+      return mid
+    if table.sites[mid].address < address:
+      lo = mid + 1
+    else:
+      hi = mid
+  -1
+
+proc findLinuxInt3CallsiteForTrapRip*(table: LinuxInt3CallsiteTable;
+                                      trapRip: uint): int =
+  ## Lookup using the saved RIP from an x86_64 Linux INT3 SIGTRAP. The CPU
+  ## reports RIP after the 1-byte INT3, so the original callsite is `RIP - 1`.
+  if trapRip == 0:
+    return -1
+  findLinuxInt3Callsite(table, trapRip - 1)
+
+proc installInt3SyscallPatchTransaction*(target: pointer): LinuxInt3PatchTransaction =
+  ## Replace byte 0 of a selected Linux x86_64 raw syscall (`0f 05`) with
+  ## `INT3` and capture the restore byte. This does not install a handler and
+  ## does not decide which mappings should be patched.
+  let support = linuxRawSyscallSupported()
+  if support != lrsOk:
+    result.diagnostic = support
+    result.handle.diagnostic = support
+    return
+  when defined(linux) and defined(amd64):
+    var cres: CStackableLinuxInt3PatchResult
+    discard cPatchInt3SyscallTx(target, addr cres)
+    result = fromCInt3Transaction(cres)
+  else:
+    result.diagnostic = support
+    result.handle.diagnostic = support
+
+proc restoreInt3SyscallPatch*(handle: var LinuxInt3PatchHandle): LinuxRawSyscallDiagnostic =
+  ## Restore the first byte overwritten by `installInt3SyscallPatchTransaction`.
+  if handle.diagnostic != lrsOk:
+    return handle.diagnostic
+  if not handle.active:
+    return lrsInvalidArgument
+  when defined(linux) and defined(amd64):
+    var osErr: cint
+    let rc = cRestoreInt3Syscall(handle.target, handle.originalFirstByte, addr osErr)
+    handle.osErrno = osErr
+    if rc == 0:
+      handle.active = false
+      lrsOk
+    else:
+      toDiagnostic(rc)
+  else:
+    linuxRawSyscallSupported()
+
+proc captureLinuxX8664SyscallRegisters*(ucontext: pointer):
+    tuple[diagnostic: LinuxRawSyscallDiagnostic,
+          regs: LinuxX8664SyscallRegisters] =
+  ## Capture Linux x86_64 syscall ABI registers from a SIGTRAP `ucontext_t`.
+  ## This is policy-free: it does not classify syscalls or special-case clone.
+  let support = linuxRawSyscallSupported()
+  if support != lrsOk:
+    return (support, LinuxX8664SyscallRegisters())
+  when defined(linux) and defined(amd64):
+    var cres: CStackableLinuxSyscallRegs
+    let rc = cCaptureSyscallRegsFromUcontext(ucontext, addr cres)
+    (toDiagnostic(rc), fromCSyscallRegs(cres))
+  else:
+    (support, LinuxX8664SyscallRegisters())
+
+proc writeLinuxX8664SyscallResult*(ucontext: pointer; resultValue: int;
+                                   resumeRip: uint): LinuxRawSyscallDiagnostic =
+  ## Write a syscall result to RAX and optionally advance saved RIP. For INT3
+  ## raw syscall continuation, use the `resumeRip` produced by
+  ## `captureLinuxX8664SyscallRegisters`.
+  let support = linuxRawSyscallSupported()
+  if support != lrsOk:
+    return support
+  when defined(linux) and defined(amd64):
+    toDiagnostic(cWriteSyscallResultToUcontext(
+      ucontext, clong(resultValue), culong(resumeRip)))
+  else:
+    support
+
+proc replayLinuxX8664SyscallRegisters*(regs: LinuxX8664SyscallRegisters): int =
+  ## Re-issue the captured syscall with the Linux x86_64 raw syscall ABI.
+  ## Consumers remain responsible for deciding whether a particular syscall is
+  ## safe to replay this way.
+  if linuxRawSyscallSupported() != lrsOk:
+    return -38
+  when defined(linux) and defined(amd64):
+    var cregs: CStackableLinuxSyscallRegs
+    cregs.nr = clong(regs.syscallNumber)
+    for i in 0 ..< 6:
+      cregs.args[i] = clong(regs.args[i])
+    cregs.result = clong(regs.result)
+    cregs.trapRip = culong(regs.trapRip)
+    cregs.syscallAddress = culong(regs.syscallAddress)
+    cregs.resumeRip = culong(regs.resumeRip)
+    int(cReplaySyscallRegs(addr cregs))
+  else:
+    -38
+
+proc installLinuxSigtrapHandler*(handler: pointer; extraFlags: cint = 0):
+    LinuxRawSyscallDiagnostic =
+  ## Install a process SIGTRAP SA_SIGINFO handler and save the previous action
+  ## for explicit chaining/restoration. This is the low-level substrate only;
+  ## consumers own dispatch policy, reentrancy, and handler body.
+  let support = linuxRawSyscallSupported()
+  if support != lrsOk:
+    return support
+  when defined(linux) and defined(amd64):
+    toDiagnostic(cInstallSigtrapHandler(handler, extraFlags))
+  else:
+    support
+
+proc uninstallLinuxSigtrapHandler*(): LinuxRawSyscallDiagnostic =
+  ## Restore the previous SIGTRAP action saved by `installLinuxSigtrapHandler`.
+  let support = linuxRawSyscallSupported()
+  if support != lrsOk:
+    return support
+  when defined(linux) and defined(amd64):
+    toDiagnostic(cUninstallSigtrapHandler())
+  else:
+    support
+
+proc chainLinuxSigtrap*(signum: cint; siginfo: pointer; ucontext: pointer):
+    LinuxRawSyscallDiagnostic =
+  ## Invoke the SIGTRAP action that was active before
+  ## `installLinuxSigtrapHandler`, when one is chainable.
+  let support = linuxRawSyscallSupported()
+  if support != lrsOk:
+    return support
+  when defined(linux) and defined(amd64):
+    toDiagnostic(cChainSigtrap(signum, siginfo, ucontext))
+  else:
+    support
 
 proc looksLikeLinuxX8664Syscall*(bytes: openArray[byte]; offset: int): bool =
   ## Conservative byte-level syscall-site predicate. This follows MCR's current

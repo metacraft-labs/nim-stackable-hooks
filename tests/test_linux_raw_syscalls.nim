@@ -163,10 +163,35 @@ int stackable_test_replacement_value(void) {
     {.importc: "stackable_test_alloc_syscall_scan_buffer", cdecl.}
   proc cAbiLinkSmoke(): cint
     {.importc: "stackable_test_c_abi_link_smoke", cdecl.}
+  proc ucontextHelpersSmoke(): cint
+    {.importc: "stackable_test_ucontext_helpers_smoke", cdecl.}
+  proc replayGetpid(): clong
+    {.importc: "stackable_test_replay_getpid", cdecl.}
+  proc sigtrapInstallUninstallSmoke(): cint
+    {.importc: "stackable_test_sigtrap_install_uninstall_smoke", cdecl.}
+  proc liveInt3GetpidContinuation(): clong
+    {.importc: "stackable_test_live_int3_getpid_continuation", cdecl.}
 
   type TestFn = proc(): cint {.cdecl.}
 
   suite "linux raw syscall live patch":
+    test "INT3 callsite table keeps sorted lookup and trap-RIP lookup":
+      var table: LinuxInt3CallsiteTable
+      check addLinuxInt3Callsite(table, 0x3000'u)
+      check addLinuxInt3Callsite(table, 0x1000'u)
+      check addLinuxInt3Callsite(table, 0x2000'u, patched = true)
+      check not addLinuxInt3Callsite(table, 0x2000'u)
+      check table.sites.len == 3
+      check table.sites[0].address == 0x1000'u
+      check table.sites[1].address == 0x2000'u
+      check table.sites[1].patched
+      check table.sites[2].address == 0x3000'u
+      check findLinuxInt3Callsite(table, 0x1000'u) == 0
+      check findLinuxInt3Callsite(table, 0x2000'u) == 1
+      check findLinuxInt3Callsite(table, 0x4000'u) == -1
+      check findLinuxInt3CallsiteForTrapRip(table, 0x2001'u) == 1
+      check findLinuxInt3CallsiteForTrapRip(table, 0'u) == -1
+
     test "absolute jump patch changes and restores a controlled executable buffer":
       let target = allocPatchTarget()
       check target != nil
@@ -304,6 +329,54 @@ int stackable_test_replacement_value(void) {
 
     test "C ABI symbols compile and link from a C translation unit":
       check cAbiLinkSmoke() == 0
+
+    test "INT3 patch and restore only touch selected controlled syscall bytes":
+      let buf = allocSyscallScanBuffer()
+      check buf != nil
+      let bytes = cast[ptr UncheckedArray[byte]](buf)
+      check bytes[1] == linuxSyscallOpcode0
+      check bytes[2] == linuxSyscallOpcode1
+
+      let site = cast[pointer](cast[uint](buf) + 1'u)
+      let tx = installInt3SyscallPatchTransaction(site)
+      check tx.diagnostic == lrsOk
+      check tx.stage == lpsComplete
+      check tx.patchLive
+      check tx.restoreByteCaptured
+      check tx.handle.active
+      check tx.handle.originalFirstByte == linuxSyscallOpcode0
+      check tx.handle.secondByte == linuxSyscallOpcode1
+      check bytes[1] == linuxInt3Opcode
+      check bytes[2] == linuxSyscallOpcode1
+
+      let second = installInt3SyscallPatchTransaction(site)
+      check second.diagnostic == lrsAlreadyPatched
+      check not second.patchLive
+      check not second.restoreByteCaptured
+
+      var handle = tx.handle
+      check restoreInt3SyscallPatch(handle) == lrsOk
+      check not handle.active
+      check bytes[1] == linuxSyscallOpcode0
+      check bytes[2] == linuxSyscallOpcode1
+
+    test "INT3 patch rejects non-syscall controlled bytes":
+      let target = allocPatchTarget()
+      check target != nil
+      let tx = installInt3SyscallPatchTransaction(target)
+      check tx.diagnostic == lrsNotSyscallSite
+      check not tx.patchLive
+      check not tx.restoreByteCaptured
+
+    test "ucontext register helpers and raw register replay are exported through C ABI":
+      check ucontextHelpersSmoke() == 0
+      check replayGetpid() > 0
+
+    test "SIGTRAP install/uninstall substrate restores process handler without raising trap":
+      check sigtrapInstallUninstallSmoke() == 0
+
+    test "live INT3 handler replays raw syscall and advances saved RIP":
+      check liveInt3GetpidContinuation() > 0
 
     test "memory scanner describes callsites in a controlled executable buffer":
       let buf = allocSyscallScanBuffer()

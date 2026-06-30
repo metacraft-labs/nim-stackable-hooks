@@ -66,6 +66,23 @@ extern "C" {
  */
 int ct_inline_hook_install(void *target, void *hook, void **out_trampoline);
 
+/* Unsafe no-suspend install variant.
+ *
+ * Identical to ct_inline_hook_install except that it does NOT call
+ * suspend_other_threads / resume_other_threads around the patch write.
+ *
+ * Contract: use this entry point only when the caller has independently
+ * proved that no other thread can execute the target prologue while it is
+ * being patched. This is a primitive for consumers with their own lifecycle
+ * proof, not a generally thread-safe install API. Calling it in a
+ * multithreaded context can race with instruction fetch from the modified
+ * bytes and corrupt the process. This variant is intentionally not queued into
+ * transactions, since transaction commit suspends threads by design.
+ *
+ * Same return-value semantics as ct_inline_hook_install. */
+int ct_inline_hook_install_no_suspend(void *target, void *hook,
+                                      void **out_trampoline);
+
 /* Install a "record-then-continue" detour at `target` for a *noreturn*
  * (or noreturn-on-current-thread) NT syscall stub.  MW13
  * (MCR-Windows-CtMcr-Port.milestones.org).
@@ -143,12 +160,25 @@ int ct_inline_hook_install(void *target, void *hook, void **out_trampoline);
 int ct_inline_hook_install_noreturn(void *target, void *record_callback,
                                     void **out_trampoline);
 
+/* Unsafe no-suspend variant of ct_inline_hook_install_noreturn.
+ * See ct_inline_hook_install_no_suspend for the required caller-proved
+ * single-thread/no-executing-prologue invariant. */
+int ct_inline_hook_install_noreturn_no_suspend(void *target,
+                                               void *record_callback,
+                                               void **out_trampoline);
+
 /* Uninstall the hook at `target`, restoring the original prologue
  * bytes.  Returns 0 on success, <0 on failure:
  *   -1  no hook registered at this target
  *   -4  VirtualProtect / thread suspend failed
  */
 int ct_inline_hook_uninstall(void *target);
+
+/* Unsafe no-suspend uninstall variant. See ct_inline_hook_install_no_suspend
+ * for the required caller-proved single-thread/no-executing-prologue
+ * invariant. This variant is intentionally not queued into transactions,
+ * since transaction commit suspends threads by design. */
+int ct_inline_hook_uninstall_no_suspend(void *target);
 
 /* ---- Transactions (atomic batching) ------------------------------- */
 

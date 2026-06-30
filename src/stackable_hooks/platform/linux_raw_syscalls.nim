@@ -5,6 +5,8 @@
 ##
 ## - raw syscall forwarding for framework internals;
 ## - x86_64 absolute-jump body patching for explicit wrapper addresses;
+## - conservative x86_64 original-call trampoline construction for wrapper
+##   prologues that can be copied without relocation;
 ## - byte and mapping scanners for Linux x86_64 `syscall` (`0f 05`) sites.
 ##
 ## It deliberately does not know about MCR events, replay, io-mon records,
@@ -25,6 +27,9 @@ type
     lrsPatchWriteFailed = "patch-write-failed"
     lrsPostPatchMprotectBackFailed = "post-patch-mprotect-back-failed"
     lrsRestoreFailed = "restore-failed"
+    lrsUnsupportedInstruction = "unsupported-instruction"
+    lrsTrampolineAllocFailed = "trampoline-alloc-failed"
+    lrsTrampolineBuildFailed = "trampoline-build-failed"
 
   LinuxPatchStage* = enum
     lpsNone = "none"
@@ -38,8 +43,7 @@ type
     ## Opaque-enough patch record for consumers that need diagnostics or later
     ## restore. `originalBytes` stores the overwritten 14-byte x86_64 absolute
     ## jump window. This is not an original-call trampoline; consumers that need
-    ## forwarding should build a policy-specific trampoline after instruction
-    ## decoding in a later milestone.
+    ## forwarding should use `buildOriginalCallTrampoline` before patching.
     target*: pointer
     replacement*: pointer
     patchSize*: int
@@ -58,6 +62,19 @@ type
     osErrno*: cint
     patchLive*: bool
     restoreBytesCaptured*: bool
+
+  LinuxOriginalTrampoline* = object
+    ## Restore-free original-call trampoline for a body-patched Linux x86_64
+    ## wrapper. The trampoline contains an instruction-aware copy of the first
+    ## `copiedLen` bytes from `target`, followed by the same 14-byte absolute
+    ## jump form back to `target + copiedLen`.
+    target*: pointer
+    entry*: pointer
+    copiedLen*: int
+    minPatchLen*: int
+    diagnostic*: LinuxRawSyscallDiagnostic
+    osErrno*: cint
+    unsupportedOffset*: int
 
   LinuxSymbolResolverKind* = enum
     lsrDefault = "rtld-default"
@@ -95,11 +112,22 @@ type CStackableLinuxPatchResult {.importc: "struct stackable_linux_patch_result"
   patchSize {.importc: "patch_size".}: culong
   original {.importc: "original".}: array[14, byte]
 
+type CStackableLinuxTrampolineResult {.importc: "struct stackable_linux_trampoline_result",
+                                       bycopy.} = object
+  diagnostic {.importc: "diagnostic".}: cint
+  osErrno {.importc: "os_errno".}: cint
+  target {.importc: "target".}: culong
+  entry {.importc: "entry".}: culong
+  copiedLen {.importc: "copied_len".}: culong
+  minPatchLen {.importc: "min_patch_len".}: culong
+  unsupportedOffset {.importc: "unsupported_offset".}: clong
+
 const
   linuxSyscallOpcode0* = byte 0x0f
   linuxSyscallOpcode1* = byte 0x05
   linuxInt3Opcode* = byte 0xcc
   linuxAbsoluteJumpPatchSize* = 14
+  linuxTrampolineJumpBackSize* = linuxAbsoluteJumpPatchSize
 
 proc linuxRawSyscallSupported*(): LinuxRawSyscallDiagnostic =
   when defined(linux):
@@ -138,7 +166,10 @@ enum {
   STACKABLE_LINUX_PATCH_PRE_MPROTECT_FAILED = 7,
   STACKABLE_LINUX_PATCH_WRITE_FAILED = 8,
   STACKABLE_LINUX_PATCH_POST_MPROTECT_BACK_FAILED = 9,
-  STACKABLE_LINUX_PATCH_RESTORE_FAILED = 10
+  STACKABLE_LINUX_PATCH_RESTORE_FAILED = 10,
+  STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION = 11,
+  STACKABLE_LINUX_PATCH_TRAMPOLINE_ALLOC_FAILED = 12,
+  STACKABLE_LINUX_PATCH_TRAMPOLINE_BUILD_FAILED = 13
 };
 
 enum {
@@ -160,6 +191,16 @@ struct stackable_linux_patch_result {
   unsigned long replacement;
   unsigned long patch_size;
   unsigned char original[14];
+};
+
+struct stackable_linux_trampoline_result {
+  int diagnostic;
+  int os_errno;
+  unsigned long target;
+  unsigned long entry;
+  unsigned long copied_len;
+  unsigned long min_patch_len;
+  long unsupported_offset;
 };
 
 long stackable_linux_raw_syscall6(long nr, long a1, long a2, long a3,
@@ -195,6 +236,20 @@ void *stackable_linux_resolve_symbol_in_handle(void *handle, char *name) {
 static long stackable_linux_raw_mprotect(uintptr_t addr, size_t len, int prot) {
   return stackable_linux_raw_syscall6((long)SYS_mprotect, (long)addr,
                                       (long)len, (long)prot, 0, 0, 0);
+}
+
+static long stackable_linux_raw_mmap(void *addr, size_t len, int prot,
+                                     int flags, int fd, long offset) {
+  return stackable_linux_raw_syscall6((long)SYS_mmap, (long)addr, (long)len,
+                                      (long)prot, (long)flags, (long)fd,
+                                      offset);
+}
+
+static void stackable_linux_write_abs_jump(unsigned char *p, void *target) {
+  p[0] = 0xff; p[1] = 0x25;
+  p[2] = 0x00; p[3] = 0x00; p[4] = 0x00; p[5] = 0x00;
+  uint64_t addr = (uint64_t)(uintptr_t)target;
+  memcpy(p + 6, &addr, sizeof(addr));
 }
 
 static void stackable_linux_init_patch_result(
@@ -257,10 +312,7 @@ int stackable_linux_patch_absolute_jump_tx(
   }
 
   if (out) out->stage = STACKABLE_LINUX_PATCH_STAGE_WRITE_PATCH;
-  p[0] = 0xff; p[1] = 0x25;
-  p[2] = 0x00; p[3] = 0x00; p[4] = 0x00; p[5] = 0x00;
-  uint64_t addr = (uint64_t)(uintptr_t)replacement;
-  memcpy(p + 6, &addr, sizeof(addr));
+  stackable_linux_write_abs_jump(p, replacement);
   if (out) out->patch_live = 1;
 
   if (out) out->stage = STACKABLE_LINUX_PATCH_STAGE_POST_MPROTECT_BACK;
@@ -276,6 +328,253 @@ int stackable_linux_patch_absolute_jump_tx(
   if (out) {
     out->stage = STACKABLE_LINUX_PATCH_STAGE_COMPLETE;
     out->diagnostic = STACKABLE_LINUX_PATCH_OK;
+  }
+  return STACKABLE_LINUX_PATCH_OK;
+}
+
+static int stackable_linux_decode_one_x86_64(const unsigned char *p,
+                                             size_t max_len,
+                                             size_t *out_len) {
+  if (p == NULL || out_len == NULL || max_len == 0) {
+    return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+  }
+
+  size_t i = 0;
+  int has_operand_prefix = 0;
+  int has_rex = 0;
+  unsigned char rex = 0;
+
+  for (;;) {
+    if (i >= max_len) return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+    unsigned char b = p[i];
+    if (b == 0x66 || b == 0x67 || b == 0xf2 || b == 0xf3) {
+      has_operand_prefix = 1;
+      i++;
+      continue;
+    }
+    if (b >= 0x40 && b <= 0x4f) {
+      has_rex = 1;
+      rex = b;
+      i++;
+      continue;
+    }
+    break;
+  }
+
+  if (i >= max_len) return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+  unsigned char op = p[i++];
+
+  if (op == 0x90 || op == 0xc9) {
+    *out_len = i;
+    return STACKABLE_LINUX_PATCH_OK;
+  }
+  if ((op >= 0x50 && op <= 0x5f) || op == 0x9c || op == 0x9d) {
+    *out_len = i;
+    return STACKABLE_LINUX_PATCH_OK;
+  }
+  if (op == 0xcc ||
+      op == 0xc3 || op == 0xcb || op == 0xc2 || op == 0xca ||
+      op == 0xe8 || op == 0xe9 || op == 0xeb ||
+      (op >= 0x70 && op <= 0x7f)) {
+    return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+  }
+
+  if (op >= 0xb8 && op <= 0xbf) {
+    size_t imm = (has_rex && (rex & 0x08)) ? 8 : (has_operand_prefix ? 2 : 4);
+    if (i + imm > max_len) return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+    *out_len = i + imm;
+    return STACKABLE_LINUX_PATCH_OK;
+  }
+
+  if (op == 0x0f) {
+    if (i >= max_len) return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+    unsigned char op2 = p[i++];
+    if (op2 == 0x05 || op2 == 0x34 || op2 == 0x35 ||
+        (op2 >= 0x80 && op2 <= 0x8f)) {
+      return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+    }
+    return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+  }
+
+  int needs_modrm = 0;
+  size_t imm_len = 0;
+  switch (op) {
+    case 0x01: case 0x03: case 0x09: case 0x0b:
+    case 0x21: case 0x23: case 0x29: case 0x2b:
+    case 0x31: case 0x33: case 0x39: case 0x3b:
+    case 0x63: case 0x85: case 0x87: case 0x89:
+    case 0x8b: case 0x8d: case 0x8f:
+      needs_modrm = 1;
+      break;
+    case 0x80:
+      needs_modrm = 1; imm_len = 1; break;
+    case 0x81:
+      needs_modrm = 1; imm_len = 4; break;
+    case 0x83:
+      needs_modrm = 1; imm_len = 1; break;
+    case 0xc7:
+      needs_modrm = 1; imm_len = 4; break;
+    case 0x68:
+      imm_len = 4; break;
+    case 0x6a:
+      imm_len = 1; break;
+    case 0xa1: case 0xa3:
+      return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+    default:
+      return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+  }
+
+  if (needs_modrm) {
+    if (i >= max_len) return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+    unsigned char modrm = p[i++];
+    unsigned char mod = (modrm >> 6) & 0x3;
+    unsigned char rm = modrm & 0x7;
+    if (mod != 3 && rm == 5) {
+      return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+    }
+    if (mod != 3 && rm == 4) {
+      if (i >= max_len) return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+      unsigned char sib = p[i++];
+      unsigned char base = sib & 0x7;
+      if (mod == 0 && base == 5) {
+        if (i + 4 > max_len) return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+        i += 4;
+      }
+    }
+    if (mod == 1) {
+      if (i + 1 > max_len) return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+      i += 1;
+    } else if (mod == 2) {
+      if (i + 4 > max_len) return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+      i += 4;
+    }
+  }
+
+  if (i + imm_len > max_len) return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+  *out_len = i + imm_len;
+  return STACKABLE_LINUX_PATCH_OK;
+}
+
+static int stackable_linux_measure_relocatable_prefix(
+    void *target, size_t min_len, size_t max_scan, size_t *out_len,
+    long *unsupported_offset) {
+  if (out_len) *out_len = 0;
+  if (unsupported_offset) *unsupported_offset = -1;
+  if (target == NULL || min_len == 0 || out_len == NULL) {
+    return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+  }
+  if (max_scan < min_len) max_scan = min_len;
+
+  const unsigned char *p = (const unsigned char *)target;
+  size_t copied = 0;
+  while (copied < min_len) {
+    size_t insn_len = 0;
+    int rc = stackable_linux_decode_one_x86_64(p + copied,
+                                               max_scan - copied,
+                                               &insn_len);
+    if (rc != STACKABLE_LINUX_PATCH_OK) {
+      if (unsupported_offset) *unsupported_offset = (long)copied;
+      return rc;
+    }
+    if (insn_len == 0 || copied + insn_len > max_scan) {
+      if (unsupported_offset) *unsupported_offset = (long)copied;
+      return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+    }
+    copied += insn_len;
+  }
+  *out_len = copied;
+  return STACKABLE_LINUX_PATCH_OK;
+}
+
+static void stackable_linux_init_trampoline_result(
+    struct stackable_linux_trampoline_result *out, void *target,
+    size_t min_patch_len) {
+  if (out == NULL) return;
+  memset(out, 0, sizeof(*out));
+  out->diagnostic = STACKABLE_LINUX_PATCH_OK;
+  out->target = (unsigned long)(uintptr_t)target;
+  out->min_patch_len = (unsigned long)min_patch_len;
+  out->unsupported_offset = -1;
+}
+
+int stackable_linux_measure_original_trampoline(void *target,
+                                                unsigned long min_patch_len,
+                                                unsigned long max_scan,
+                                                struct stackable_linux_trampoline_result *out) {
+  if (min_patch_len == 0) min_patch_len = 14;
+  if (max_scan == 0) max_scan = 64;
+  stackable_linux_init_trampoline_result(out, target, (size_t)min_patch_len);
+  if (target == NULL) {
+    if (out) out->diagnostic = STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+    return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+  }
+
+  size_t copied = 0;
+  long unsupported = -1;
+  int rc = stackable_linux_measure_relocatable_prefix(
+      target, (size_t)min_patch_len, (size_t)max_scan, &copied, &unsupported);
+  if (out) {
+    out->diagnostic = rc;
+    out->copied_len = (unsigned long)copied;
+    out->unsupported_offset = unsupported;
+  }
+  return rc;
+}
+
+int stackable_linux_build_original_trampoline(void *target,
+                                              unsigned long min_patch_len,
+                                              unsigned long max_scan,
+                                              struct stackable_linux_trampoline_result *out) {
+  if (min_patch_len == 0) min_patch_len = 14;
+  if (max_scan == 0) max_scan = 64;
+  stackable_linux_init_trampoline_result(out, target, (size_t)min_patch_len);
+  if (target == NULL) {
+    if (out) out->diagnostic = STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+    return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+  }
+
+  size_t copied = 0;
+  long unsupported = -1;
+  int rc = stackable_linux_measure_relocatable_prefix(
+      target, (size_t)min_patch_len, (size_t)max_scan, &copied, &unsupported);
+  if (rc != STACKABLE_LINUX_PATCH_OK) {
+    if (out) {
+      out->diagnostic = rc;
+      out->unsupported_offset = unsupported;
+    }
+    return rc;
+  }
+
+  size_t total = copied + 14;
+  long mapped = stackable_linux_raw_mmap(NULL, total, PROT_READ | PROT_WRITE,
+                                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (mapped < 0) {
+    if (out) {
+      out->diagnostic = STACKABLE_LINUX_PATCH_TRAMPOLINE_ALLOC_FAILED;
+      out->os_errno = (int)(-mapped);
+    }
+    return STACKABLE_LINUX_PATCH_TRAMPOLINE_ALLOC_FAILED;
+  }
+
+  unsigned char *tramp = (unsigned char *)(uintptr_t)mapped;
+  memcpy(tramp, target, copied);
+  stackable_linux_write_abs_jump(tramp + copied,
+      (void *)((uintptr_t)target + copied));
+
+  long protect_rc = stackable_linux_raw_mprotect((uintptr_t)tramp, total,
+                                                 PROT_READ | PROT_EXEC);
+  if (protect_rc < 0) {
+    if (out) {
+      out->diagnostic = STACKABLE_LINUX_PATCH_TRAMPOLINE_BUILD_FAILED;
+      out->os_errno = (int)(-protect_rc);
+    }
+    return STACKABLE_LINUX_PATCH_TRAMPOLINE_BUILD_FAILED;
+  }
+
+  if (out) {
+    out->diagnostic = STACKABLE_LINUX_PATCH_OK;
+    out->entry = (unsigned long)(uintptr_t)tramp;
+    out->copied_len = (unsigned long)copied;
   }
   return STACKABLE_LINUX_PATCH_OK;
 }
@@ -395,6 +694,12 @@ int stackable_linux_patch_registry_record(unsigned long addr) {
   proc cPatchAbsoluteJumpTx(target, replacement: pointer; captureRestore: cint;
                             outResult: ptr CStackableLinuxPatchResult): cint
     {.importc: "stackable_linux_patch_absolute_jump_tx", cdecl.}
+  proc cMeasureOriginalTrampoline(target: pointer; minPatchLen, maxScan: culong;
+                                  outResult: ptr CStackableLinuxTrampolineResult): cint
+    {.importc: "stackable_linux_measure_original_trampoline", cdecl.}
+  proc cBuildOriginalTrampoline(target: pointer; minPatchLen, maxScan: culong;
+                                outResult: ptr CStackableLinuxTrampolineResult): cint
+    {.importc: "stackable_linux_build_original_trampoline", cdecl.}
   proc cRestoreAbsoluteJump(target: pointer; saved14: ptr byte;
                             outErrno: ptr cint): cint
     {.importc: "stackable_linux_restore_absolute_jump", cdecl.}
@@ -486,6 +791,9 @@ proc toDiagnostic(rc: cint): LinuxRawSyscallDiagnostic {.used.} =
   of 8: lrsPatchWriteFailed
   of 9: lrsPostPatchMprotectBackFailed
   of 10: lrsRestoreFailed
+  of 11: lrsUnsupportedInstruction
+  of 12: lrsTrampolineAllocFailed
+  of 13: lrsTrampolineBuildFailed
   else: lrsPatchWriteFailed
 
 proc toPatchStage(stage: cint): LinuxPatchStage {.used.} =
@@ -515,6 +823,18 @@ proc fromCTransaction(cres: CStackableLinuxPatchResult): LinuxPatchTransaction {
   else:
     discard
 
+proc fromCTrampoline(cres: CStackableLinuxTrampolineResult): LinuxOriginalTrampoline {.used.} =
+  when defined(linux) and defined(amd64):
+    result.target = cast[pointer](cres.target)
+    result.entry = cast[pointer](cres.entry)
+    result.copiedLen = int(cres.copiedLen)
+    result.minPatchLen = int(cres.minPatchLen)
+    result.diagnostic = toDiagnostic(cres.diagnostic)
+    result.osErrno = cres.osErrno
+    result.unsupportedOffset = int(cres.unsupportedOffset)
+  else:
+    discard
+
 proc installAbsoluteJumpPatchTransaction*(target, replacement: pointer;
                                           captureRestoreBytes = true): LinuxPatchTransaction =
   ## Install a 14-byte absolute jump and return stage-aware diagnostics. If the
@@ -534,6 +854,46 @@ proc installAbsoluteJumpPatchTransaction*(target, replacement: pointer;
   else:
     result.diagnostic = support
     result.handle.diagnostic = support
+
+proc measureOriginalCallTrampoline*(target: pointer;
+                                    minPatchLen = linuxAbsoluteJumpPatchSize;
+                                    maxScan = 64): LinuxOriginalTrampoline =
+  ## Decode a target wrapper prologue until at least `minPatchLen` bytes can be
+  ## copied into an original-call trampoline. This is validation only: no memory
+  ## is allocated and unsupported prologues are rejected with
+  ## `lrsUnsupportedInstruction`.
+  let support = linuxRawSyscallSupported()
+  if support != lrsOk:
+    result.diagnostic = support
+    return
+  when defined(linux) and defined(amd64):
+    var cres: CStackableLinuxTrampolineResult
+    discard cMeasureOriginalTrampoline(target, culong(minPatchLen), culong(maxScan),
+                                       addr cres)
+    result = fromCTrampoline(cres)
+  else:
+    result.diagnostic = support
+
+proc buildOriginalCallTrampoline*(target: pointer;
+                                  minPatchLen = linuxAbsoluteJumpPatchSize;
+                                  maxScan = 64): LinuxOriginalTrampoline =
+  ## Allocate an executable original-call trampoline for a Linux x86_64 wrapper
+  ## body patch. The copied prefix is instruction-aware and conservative:
+  ## unsupported control-flow instructions, `syscall`, absolute moffs
+  ## instructions, and RIP-relative memory operands are rejected rather than
+  ## relocated incorrectly. Successful trampolines append a 14-byte absolute
+  ## jump back to `target + copiedLen`.
+  let support = linuxRawSyscallSupported()
+  if support != lrsOk:
+    result.diagnostic = support
+    return
+  when defined(linux) and defined(amd64):
+    var cres: CStackableLinuxTrampolineResult
+    discard cBuildOriginalTrampoline(target, culong(minPatchLen), culong(maxScan),
+                                     addr cres)
+    result = fromCTrampoline(cres)
+  else:
+    result.diagnostic = support
 
 proc installAbsoluteJumpPatch*(target, replacement: pointer): LinuxPatchHandle =
   ## Patch `target` with `jmp qword ptr [rip+0]; .quad replacement`.

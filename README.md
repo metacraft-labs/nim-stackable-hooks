@@ -49,6 +49,11 @@ helpers for consumers that need to close direct syscall bypasses:
 - `installAbsoluteJumpPatchTransaction`, `installAbsoluteJumpPatch`,
   `installNamedAbsoluteJumpPatch`, and `restoreAbsoluteJumpPatch` for explicit
   wrapper/body-patch installation with structured diagnostics.
+- `measureOriginalCallTrampoline` and `buildOriginalCallTrampoline` for
+  conservative Linux x86_64 original-call trampolines: the helper decodes
+  enough whole instructions to cover the patch window, copies the relocated
+  prefix into trampoline memory, appends a 14-byte absolute jump back to
+  `target + copiedLen`, then makes the trampoline `RX`.
 - `addrInLinuxExecutableSegment`, `clearLinuxPatchBook`,
   `linuxPatchBookContains`, and `recordLinuxPatchBookTarget` as optional
   reusable validation and duplicate-target bookkeeping helpers.
@@ -58,12 +63,16 @@ helpers for consumers that need to close direct syscall bypasses:
   describing raw `0f 05` callsites.
 
 `rawSyscall6` returns the kernel result directly; failed syscalls are negative
-errno values and do not set libc `errno`. The absolute-jump patch handle stores
-the overwritten bytes for restore, but the Linux helper surface does not yet
-provide an instruction-decoded original-call trampoline. Patch/restore
-temporarily changes the affected page span to `RWX` and restores it to `RX`;
-consumers that patch non-wrapper or writable executable pages need their own
-permission policy.
+errno values and do not set libc `errno`. Patch/restore temporarily changes the
+affected page span to `RWX` and restores it to `RX`; consumers that patch
+non-wrapper or writable executable pages need their own permission policy.
+
+The original-call trampoline builder is intentionally conservative. It supports
+simple non-control-flow x86_64 prologue instructions and rejects unsupported
+instructions, `syscall`, calls, jumps, returns, absolute moffs forms, and
+RIP-relative memory operands with `lrsUnsupportedInstruction` instead of
+relocating them incorrectly. It does not yet provide a full disassembler,
+RIP-relative relocation, or thread-suspension/install policy.
 
 `installAbsoluteJumpPatchTransaction` exposes the lower-level install contract
 needed by C translation units and behavior-preserving migrations: it

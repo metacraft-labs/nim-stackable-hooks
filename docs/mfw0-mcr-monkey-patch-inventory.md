@@ -4,6 +4,14 @@ Status: M-FW-0 inventory complete. This document is an implementation-status
 artifact for the "Inventory and split MCR monkey-patch helpers" milestone. It
 does not extract code. It records the boundary for later extraction work.
 
+M-FW-2 update: the first Linux raw-syscall helper extraction now lives in
+`src/stackable_hooks/platform/linux_raw_syscalls.nim`. It covers raw syscall
+forwarding, explicit/named x86_64 absolute-jump body patching with restore
+handles and diagnostics, `/proc/self/maps` executable mapping enumeration, and
+byte/memory/mapping visitor scanners for Linux x86_64 `0f 05` callsites. It
+does not migrate MCR, patch libc in tests, install a SIGTRAP substrate, or
+implement io-mon monitor classification.
+
 ## Boundary
 
 `nim-stackable-hooks` owns reusable, algorithmic helper primitives: page
@@ -29,14 +37,22 @@ Source files:
 
 Framework-safe helper candidates:
 
-- Resolve a patch target by symbol or explicit address.
-- Validate an x86_64 syscall-wrapper prologue before patching.
+- Resolve a patch target by symbol or explicit address. Implemented for
+  `RTLD_DEFAULT` symbols in `linux_raw_syscalls`.
+- Validate an x86_64 syscall-wrapper prologue before patching. Partially
+  represented by duplicate absolute-jump detection; full instruction-aware
+  prologue validation remains for later trampoline work.
 - Change page permissions with raw syscalls so patch installation does not
-  recurse through hooked libc wrappers.
-- Install an absolute or near jump at a wrapper entry point.
-- Build and publish a trampoline/original-call handle.
+  recurse through hooked libc wrappers. Implemented for the absolute-jump
+  patch/restore primitive.
+- Install an absolute or near jump at a wrapper entry point. Absolute
+  RIP-indirect jump implemented; near-jump selection remains out of scope.
+- Build and publish a trampoline/original-call handle. A restore handle with
+  the overwritten 14-byte window is implemented; instruction-decoded
+  original-call trampolines remain for later work.
 - Provide a small raw syscall forwarding stub for framework internals.
-- Report structured install diagnostics per target.
+  Implemented as `rawSyscall6`.
+- Report structured install diagnostics per target. Implemented.
 - Provide an optional single-thread/no-suspend primitive with explicit
   preconditions, but no stage0 policy.
 
@@ -64,16 +80,21 @@ Source files:
 
 Framework-safe helper candidates:
 
-- Enumerate readable executable mappings and exclude caller-provided mappings
-  such as the shim's own code.
-- Scan instruction bytes for Linux x86_64 raw syscall opcodes.
-- Patch selected callsites with INT3 or an alternate trap byte.
+- Enumerate readable executable mappings and let consumers exclude
+  caller-provided mappings such as the shim's own code. Implemented as a
+  policy-free maps enumerator.
+- Scan instruction bytes for Linux x86_64 raw syscall opcodes. Implemented for
+  controlled byte regions and selected readable memory mappings, including
+  MCR's current immediate-operand false-positive guard.
+- Patch selected callsites with INT3 or an alternate trap byte. Still pending;
+  M-FW-2 extracted scanner/description surfaces only, not signal installation.
 - Maintain a sorted callsite table for signal-handler lookup.
 - Install and chain a SIGTRAP handler substrate.
 - Reconstruct syscall arguments from ucontext and resume execution after the
   original syscall instruction.
-- Dispatch to a consumer callback with register state and a continuation
-  contract.
+- Dispatch to a consumer callback for byte- and mapping-scanned callsite
+  descriptions. Register-state and continuation contracts remain pending with
+  the SIGTRAP substrate.
 - Emit structured scan/patch diagnostics per mapping and callsite.
 
 MCR-owned adapters and policy:

@@ -9,7 +9,7 @@ Cross-platform stackable hooks framework for Nim. A Nim port of the
   - Linux / FreeBSD: prepends the shim to `LD_PRELOAD` at `execve` / `posix_spawn` time.
   - macOS: prepends the shim to `DYLD_INSERT_LIBRARIES`, with SIP-aware sandbox-tools fallback for system binaries.
   - Windows: low-priority `CreateProcessW`/`A` hook that suspends the child, injects the shim via `CreateRemoteThread(LoadLibraryW)`, and runs the consumer's init entrypoint — gated by a global semaphore (`maxInFlight`) and per-call deadline (`waitDeadline`) so fork-bomb workloads (webpack, ninja) don't wedge the parent.
-- Platform install backends and primitives: PE IAT patcher + Detours-style inline `JMP rel32` on Windows, `dlsym(RTLD_NEXT)` on Linux/FreeBSD, `__DATA,__interpose` + canonical-symbol registry on macOS, plus macOS `mach_vm_remap` body-patch and original-call trampoline helpers under `stackable_hooks/platform/macos_bodypatch`.
+- Platform install backends and primitives: PE IAT patcher + Detours-style inline `JMP rel32` on Windows, `dlsym(RTLD_NEXT)` on Linux/FreeBSD, `__DATA,__interpose` + canonical-symbol registry on macOS, plus macOS `mach_vm_remap` body-patch/original-call helpers under `stackable_hooks/platform/macos_bodypatch` and Linux x86_64 raw-syscall helpers under `stackable_hooks/platform/linux_raw_syscalls`.
 
 The normative spec lives at
 `codetracer-specs/Recording-Backends/Multi-Core-Recorder/MCR-Library-APIs.md` §6.
@@ -36,6 +36,32 @@ registry.dispatch("CreateFileW", ctx)
 
 v0.1.0 — first release. See [CHANGELOG.md](./CHANGELOG.md) for what's
 in the box.
+
+## Linux Raw-Syscall Primitives
+
+`stackable_hooks/platform/linux_raw_syscalls` exposes low-level Linux x86_64
+helpers for consumers that need to close direct syscall bypasses:
+
+- `rawSyscall6` for internal forwarding without calling libc wrappers.
+- `resolveDefaultSymbol`, `installAbsoluteJumpPatch`,
+  `installNamedAbsoluteJumpPatch`, and `restoreAbsoluteJumpPatch` for explicit
+  wrapper/body-patch installation with structured diagnostics.
+- `scanLinuxX8664SyscallBytes`, `visitLinuxX8664SyscallBytes`,
+  `visitLinuxX8664SyscallMemory`, `visitLinuxExecutableMappingSyscalls`,
+  `parseLinuxMapsLine`, and `enumerateLinuxExecutableMappings` for finding and
+  describing raw `0f 05` callsites.
+
+`rawSyscall6` returns the kernel result directly; failed syscalls are negative
+errno values and do not set libc `errno`. The absolute-jump patch handle stores
+the overwritten bytes for restore, but M-FW-2 does not yet provide an
+instruction-decoded original-call trampoline. Patch/restore temporarily changes
+the affected page span to `RWX` and restores it to `RX`; consumers that patch
+non-wrapper or writable executable pages need their own permission policy until
+a richer transaction API lands.
+
+These APIs are intentionally policy-free. MCR keeps record/replay semantics,
+stage0 composition, event ABI, and clone attribution. io-mon keeps monitor
+classification, completeness policy, and fail-open/fail-closed decisions.
 
 ## License
 

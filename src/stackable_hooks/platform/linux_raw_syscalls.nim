@@ -816,8 +816,9 @@ static void stackable_linux_init_int3_result(
   out->target = (unsigned long)(uintptr_t)target;
 }
 
-int stackable_linux_patch_int3_syscall_tx(
-    void *target, struct stackable_linux_int3_patch_result *out) {
+static int stackable_linux_patch_int3_syscall_tx_page_size(
+    void *target, unsigned long caller_page_size,
+    struct stackable_linux_int3_patch_result *out) {
   stackable_linux_init_int3_result(out, target);
   if (out) out->stage = STACKABLE_LINUX_PATCH_STAGE_VALIDATE_TARGET;
   if (target == NULL) {
@@ -825,8 +826,8 @@ int stackable_linux_patch_int3_syscall_tx(
     return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
   }
 
-  long page_size = sysconf(_SC_PAGESIZE);
-  if (page_size <= 0) page_size = 4096;
+  unsigned long page_size = caller_page_size;
+  if (page_size == 0) page_size = 4096;
   uintptr_t page_mask = (uintptr_t)(page_size - 1);
   uintptr_t target_addr = (uintptr_t)target;
   uintptr_t start = target_addr & ~page_mask;
@@ -889,6 +890,21 @@ int stackable_linux_patch_int3_syscall_tx(
     out->diagnostic = STACKABLE_LINUX_PATCH_OK;
   }
   return STACKABLE_LINUX_PATCH_OK;
+}
+
+int stackable_linux_patch_int3_syscall_tx(
+    void *target, struct stackable_linux_int3_patch_result *out) {
+  long page_size = sysconf(_SC_PAGESIZE);
+  if (page_size <= 0) page_size = 4096;
+  return stackable_linux_patch_int3_syscall_tx_page_size(
+      target, (unsigned long)page_size, out);
+}
+
+int stackable_linux_patch_int3_syscall_tx_fixed_page(
+    void *target, unsigned long page_size,
+    struct stackable_linux_int3_patch_result *out) {
+  return stackable_linux_patch_int3_syscall_tx_page_size(
+      target, page_size, out);
 }
 
 int stackable_linux_restore_int3_syscall(
@@ -2165,6 +2181,9 @@ int stackable_linux_free_near_trampoline(unsigned long address,
   proc cPatchInt3SyscallTx(target: pointer;
                            outResult: ptr CStackableLinuxInt3PatchResult): cint
     {.importc: "stackable_linux_patch_int3_syscall_tx", cdecl.}
+  proc cPatchInt3SyscallTxFixedPage(target: pointer; pageSize: culong;
+                                    outResult: ptr CStackableLinuxInt3PatchResult): cint
+    {.importc: "stackable_linux_patch_int3_syscall_tx_fixed_page", cdecl.}
   proc cRestoreInt3Syscall(target: pointer; originalFirstByte: byte;
                            outErrno: ptr cint): cint
     {.importc: "stackable_linux_restore_int3_syscall", cdecl.}
@@ -3032,6 +3051,23 @@ proc installInt3SyscallPatchTransaction*(target: pointer): LinuxInt3PatchTransac
   when defined(linux) and defined(amd64):
     var cres: CStackableLinuxInt3PatchResult
     discard cPatchInt3SyscallTx(target, addr cres)
+    result = fromCInt3Transaction(cres)
+  else:
+    result.diagnostic = support
+    result.handle.diagnostic = support
+
+proc installInt3SyscallPatchTransaction*(target: pointer; pageSize: uint):
+    LinuxInt3PatchTransaction =
+  ## Variant for no-libc/static-runtime consumers that already know the page
+  ## size and must not call libc `sysconf` from the patch helper.
+  let support = linuxRawSyscallSupported()
+  if support != lrsOk:
+    result.diagnostic = support
+    result.handle.diagnostic = support
+    return
+  when defined(linux) and defined(amd64):
+    var cres: CStackableLinuxInt3PatchResult
+    discard cPatchInt3SyscallTxFixedPage(target, culong(pageSize), addr cres)
     result = fromCInt3Transaction(cres)
   else:
     result.diagnostic = support

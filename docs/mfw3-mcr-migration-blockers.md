@@ -384,16 +384,40 @@ What remains MCR-owned:
   lifecycle;
 - fatal/non-fatal install policy and user-facing diagnostics.
 
+### Linux program-text syscall-scan migration
+
+Implemented in M-FW-3I and accepted after independent review:
+
+- `codetracer-native-recorder/ct_interpose/src/ct_interpose/recording/program_syscall_scan.nim`
+  imports `stackable_hooks/platform/linux_raw_syscalls` so the static-runtime
+  program scanner links the neutral `stackable_linux_*` C ABI.
+- `codetracer-native-recorder/ct_interpose/src/ct_interpose/static_shim/program_syscall_scan.c`
+  now delegates selected low-level mechanics to stackable helpers:
+  fixed-page INT3 patch transactions,
+  `ucontext_t` syscall-register capture, result/RIP writeback, raw replay from
+  captured register state, the `rt_sigreturn` restorer, and the clone
+  continuation trampoline.
+- MCR keeps `ct_program_syscall_scan_install` and `_ct_ps_clone_trampoline`
+  compatibility symbols. `_ct_ps_clone_trampoline` is now a wrapper around the
+  stackable clone-continuation trampoline.
+
+What remains MCR-owned:
+
+- executable mapping selection, self-exclusion, pseudo-mapping exclusion, and
+  syscall-byte false-positive filtering;
+- the sorted patched-site registry and diagnostic counters;
+- SIGTRAP installation through the static no-libc `rt_sigaction` path;
+- user SIGTRAP interception/chaining policy, SIGTRAP mask stripping, FS-base
+  swapping, reentrancy guard policy, event conversion, and record/replay event
+  stream shape.
+
 ## Required API Additions Before Reattempt
 
-1. Map MCR's program syscall scanner to the new INT3/continuation/static-helper
-   symbols without changing its mapping selection, event conversion, or signal
-   lifecycle behavior.
-2. Migrate MCR vDSO patching onto the helper APIs while preserving MCR-owned
+1. Migrate MCR vDSO patching onto the helper APIs while preserving MCR-owned
    target lists, trampoline bodies, event/replay policy, and diagnostics.
-3. Wire M-FW-3F's POSIX atomic/JIT helper slice into MCR-owned
+2. Wire M-FW-3F's POSIX atomic/JIT helper slice into MCR-owned
    scanner/trampoline/event lifecycle code without changing MCR behavior.
-4. Run independent review and live Windows validation for the parent M-FW-3
+3. Run independent review and live Windows validation for the parent M-FW-3
    Windows migration pass.
 
 ## M-FW-3 Status
@@ -404,5 +428,8 @@ behavior-preserving Windows inline-hook install users onto
 stage0 composition and diagnostics. M-FW-3H then moved Linux `syscall(2)`
 wrapper and clone3 callsite low-level patch/resolver/bookkeeping helpers onto
 `stackable_hooks/platform/linux_raw_syscalls` through MCR compatibility
-wrappers. Program-text syscall-scan, vDSO, and POSIX atomic/JIT migrations
+wrappers. M-FW-3I then moved the program-text syscall scanner's low-level INT3,
+register continuation, raw replay, restorer, and clone-continuation mechanics
+onto the same stackable helper surface while keeping MCR's scan, signal,
+event, and static-shim policies local. vDSO and POSIX atomic/JIT migrations
 remain open.

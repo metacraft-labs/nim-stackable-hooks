@@ -156,6 +156,9 @@ extern int stackable_linux_patch_registry_contains(unsigned long addr);
 extern int stackable_linux_patch_registry_record(unsigned long addr);
 extern int stackable_linux_patch_int3_syscall_tx(
     void *target, struct stackable_linux_int3_patch_result *out);
+extern int stackable_linux_patch_int3_syscall_tx_fixed_page(
+    void *target, unsigned long page_size,
+    struct stackable_linux_int3_patch_result *out);
 extern int stackable_linux_restore_int3_syscall(
     void *target, unsigned char original_first_byte, int *out_errno);
 extern int stackable_linux_capture_syscall_regs_from_ucontext(
@@ -428,4 +431,35 @@ long stackable_test_live_int3_getpid_continuation(void) {
   if (stackable_live_int3_hits != 1) return -1007;
   if (got != expected) return -1008;
   return got;
+}
+
+int stackable_test_fixed_page_int3_patch_smoke(void) {
+  long page_size = sysconf(_SC_PAGESIZE);
+  if (page_size <= 0) page_size = 4096;
+  unsigned char *p = (unsigned char *)mmap(NULL, (size_t)page_size,
+      PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (p == MAP_FAILED) return -1;
+
+  unsigned char code[3] = {0x0f, 0x05, 0xc3};
+  memcpy(p, code, sizeof(code));
+
+  struct stackable_linux_int3_patch_result tx;
+  int rc = stackable_linux_patch_int3_syscall_tx_fixed_page(
+      p, (unsigned long)page_size, &tx);
+  if (rc != 0 || tx.patch_live == 0 || tx.restore_captured == 0 ||
+      p[0] != 0xcc || p[1] != 0x05) {
+    (void)munmap(p, (size_t)page_size);
+    return -2;
+  }
+
+  int ignored_errno = 0;
+  rc = stackable_linux_restore_int3_syscall(
+      p, tx.original_first_byte, &ignored_errno);
+  if (rc != 0 || p[0] != 0x0f || p[1] != 0x05) {
+    (void)munmap(p, (size_t)page_size);
+    return -3;
+  }
+
+  (void)munmap(p, (size_t)page_size);
+  return 0;
 }

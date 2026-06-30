@@ -57,9 +57,15 @@
  * stubs let cross-compilation and linker checks succeed. */
 int ct_inline_hook_install(void *target, void *hook, void **out_trampoline)
 { (void)target; (void)hook; (void)out_trampoline; return -4; }
+int ct_inline_hook_install_no_suspend(void *target, void *hook, void **out_trampoline)
+{ (void)target; (void)hook; (void)out_trampoline; return -4; }
 int ct_inline_hook_install_noreturn(void *target, void *hook, void **out_trampoline)
 { (void)target; (void)hook; (void)out_trampoline; return -4; }
+int ct_inline_hook_install_noreturn_no_suspend(void *target, void *hook, void **out_trampoline)
+{ (void)target; (void)hook; (void)out_trampoline; return -4; }
 int ct_inline_hook_uninstall(void *target)
+{ (void)target; return -4; }
+int ct_inline_hook_uninstall_no_suspend(void *target)
 { (void)target; return -4; }
 int ct_inline_hook_begin_transaction(void) { return -1; }
 int ct_inline_hook_commit_transaction(void) { return -1; }
@@ -972,6 +978,22 @@ int ct_inline_hook_install(void *target, void *hook, void **out_trampoline)
     return rc;
 }
 
+int ct_inline_hook_install_no_suspend(void *target, void *hook,
+                                      void **out_trampoline)
+{
+    ensure_cs_initialised();
+    EnterCriticalSection(&g_hooks_cs);
+
+    if (g_txn.active && g_txn.owner_tid == GetCurrentThreadId()) {
+        LeaveCriticalSection(&g_hooks_cs);
+        return -1;
+    }
+
+    int rc = install_locked(target, hook, out_trampoline);
+    LeaveCriticalSection(&g_hooks_cs);
+    return rc;
+}
+
 /* MW13 (MCR-Windows-CtMcr-Port.milestones.org).
  *
  * Noreturn-syscall install variant.  Emits a *different* trampoline
@@ -1235,6 +1257,23 @@ int ct_inline_hook_install_noreturn(void *target, void *record_callback,
     return rc;
 }
 
+int ct_inline_hook_install_noreturn_no_suspend(void *target,
+                                               void *record_callback,
+                                               void **out_trampoline)
+{
+    ensure_cs_initialised();
+    EnterCriticalSection(&g_hooks_cs);
+
+    if (g_txn.active && g_txn.owner_tid == GetCurrentThreadId()) {
+        LeaveCriticalSection(&g_hooks_cs);
+        return -1;
+    }
+
+    int rc = install_locked_noreturn(target, record_callback, out_trampoline);
+    LeaveCriticalSection(&g_hooks_cs);
+    return rc;
+}
+
 int ct_inline_hook_uninstall(void *target)
 {
     ensure_cs_initialised();
@@ -1261,6 +1300,21 @@ int ct_inline_hook_uninstall(void *target)
     }
     int rc = uninstall_locked(target);
     resume_other_threads(&fr);
+    LeaveCriticalSection(&g_hooks_cs);
+    return rc;
+}
+
+int ct_inline_hook_uninstall_no_suspend(void *target)
+{
+    ensure_cs_initialised();
+    EnterCriticalSection(&g_hooks_cs);
+
+    if (g_txn.active && g_txn.owner_tid == GetCurrentThreadId()) {
+        LeaveCriticalSection(&g_hooks_cs);
+        return -1;
+    }
+
+    int rc = uninstall_locked(target);
     LeaveCriticalSection(&g_hooks_cs);
     return rc;
 }

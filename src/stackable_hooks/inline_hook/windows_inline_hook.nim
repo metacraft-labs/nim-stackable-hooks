@@ -18,6 +18,12 @@
 ## (`inlineHookBeginTransaction` / `inlineHookCommitTransaction` /
 ## `inlineHookAbortTransaction`) batches multiple installs under a
 ## single thread-suspend / cache-flush pair.
+##
+## The `UnsafeNoSuspend` entry points deliberately expose a lower-level
+## primitive for consumers that have already proved a single-threaded or
+## otherwise non-racing install window. They do not suspend other threads and
+## must not be used as generally safe inline-hook installers. They also reject
+## active transactions, because transaction commit suspends threads by design.
 
 when not defined(windows):
   {.error: "stackable_hooks/inline_hook/windows_inline_hook is Windows-only".}
@@ -28,13 +34,13 @@ when not defined(windows):
 # resolves to this file so relative paths land in the `windows/`
 # sibling directory regardless of where the consumer's `nimcache`
 # lives.
-import std/os
-const inlineDir = currentSourcePath().parentDir / "windows"
+import std/strutils
+const inlineDir = currentSourcePath().replace("\\", "/").rsplit("/", 1)[0] & "/windows"
 
 {.passC: "-I" & inlineDir & " -D_CRT_SECURE_NO_WARNINGS".}
-{.compile: inlineDir / "length_decoder.c".}
-{.compile: inlineDir / "rel32_fixup.c".}
-{.compile: inlineDir / "install_windows.c".}
+{.compile: inlineDir & "/length_decoder.c".}
+{.compile: inlineDir & "/rel32_fixup.c".}
+{.compile: inlineDir & "/install_windows.c".}
 
 proc inlineHookInstall*(target: pointer; hook: pointer;
                         outTrampoline: ptr pointer): cint
@@ -54,9 +60,31 @@ proc inlineHookInstallNoReturn*(target: pointer; hook: pointer;
   ## Skips the trampoline-cache-flush step that the regular installer
   ## issues, since no code path will re-enter the target.
 
+proc inlineHookInstallUnsafeNoSuspend*(target: pointer; hook: pointer;
+                                       outTrampoline: ptr pointer): cint
+  {.importc: "ct_inline_hook_install_no_suspend", cdecl.}
+  ## Unsafe install variant that does not suspend other threads.
+  ## The caller must prove that no other thread can execute the target
+  ## prologue during patch installation. This is intended for consumers
+  ## with their own lifecycle proof; it is not a safe replacement for
+  ## `inlineHookInstall`. Returns an error if a transaction is active.
+
+proc inlineHookInstallNoReturnUnsafeNoSuspend*(target: pointer; hook: pointer;
+                                               outTrampoline: ptr pointer): cint
+  {.importc: "ct_inline_hook_install_noreturn_no_suspend", cdecl.}
+  ## Unsafe no-suspend variant of `inlineHookInstallNoReturn`.
+  ## The same caller-proved non-racing install-window precondition applies.
+  ## Returns an error if a transaction is active.
+
 proc inlineHookUninstall*(target: pointer): cint
   {.importc: "ct_inline_hook_uninstall", cdecl.}
   ## Remove the inline hook at `target` and free the trampoline.
+
+proc inlineHookUninstallUnsafeNoSuspend*(target: pointer): cint
+  {.importc: "ct_inline_hook_uninstall_no_suspend", cdecl.}
+  ## Unsafe uninstall variant that skips thread suspension. The caller must
+  ## prove no other thread can execute the target prologue during restore.
+  ## Returns an error if a transaction is active.
 
 proc inlineHookBeginTransaction*(): cint
   {.importc: "ct_inline_hook_begin_transaction", cdecl.}

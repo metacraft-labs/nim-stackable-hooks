@@ -153,6 +153,26 @@ These APIs are intentionally policy-free. MCR keeps record/replay semantics,
 stage0 composition, event ABI, and clone attribution. io-mon keeps monitor
 classification, completeness policy, and fail-open/fail-closed decisions.
 
+## Windows Inline-Hook Primitives
+
+`stackable_hooks/inline_hook/windows_inline_hook` exposes the Windows inline
+hook installer backed by `src/stackable_hooks/inline_hook/windows/`.
+
+The default `inlineHookInstall`, `inlineHookInstallNoReturn`, and
+`inlineHookUninstall` entry points suspend other threads around patch writes.
+The module also exposes explicitly unsafe primitives:
+
+- `inlineHookInstallUnsafeNoSuspend`
+- `inlineHookInstallNoReturnUnsafeNoSuspend`
+- `inlineHookUninstallUnsafeNoSuspend`
+
+Those no-suspend functions are mechanism-only helpers. The caller must prove
+that no other thread can execute the target prologue while the bytes are being
+patched or restored. They are not queued into transactions, because transaction
+commit suspends threads by design. `nim-stackable-hooks` does not know or
+validate MCR's stage0 lifecycle; MCR remains responsible for composing these
+helpers into stage0 and for proving that the no-suspend precondition holds.
+
 ## License
 
 MIT

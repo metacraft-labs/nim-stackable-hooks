@@ -297,19 +297,34 @@ Current MCR dependencies:
 
 Missing stackable-hooks APIs:
 
-- exported no-suspend install primitive with an explicit single-thread/stage0
-  precondition contract;
-- exported noreturn no-suspend primitive;
-- tests covering no-suspend behavior and parity with the MCR-vendored C
-  sources.
+Previously missing stackable-hooks APIs addressed by M-FW-3G:
+
+- exported no-suspend install primitive with an explicit caller-proved
+  single-thread/non-racing precondition contract;
+- exported noreturn no-suspend primitive with the same precondition;
+- exported no-suspend uninstall primitive for symmetry with the vendored MCR
+  helper surface;
+- explicit rejection of active transactions for the unsafe no-suspend entry
+  points, because transaction commit suspends threads by design;
+- source-level and Windows-target API checks for the public Nim wrappers and
+  underlying C symbols, plus Linux-host runtime checks that the non-Windows C
+  stubs return unsupported instead of crashing.
+
+Still missing after M-FW-3G:
+
+- live MCR migration of `ntdll_detours_windows.nim` and
+  `ldrloaddll_detour_windows.nim` to import the stackable-hooks wrappers;
+- MCR-owned proof and enforcement of the stage0/single-thread lifecycle
+  precondition;
+- MCR diagnostics around target resolution, install ordering, and stage0
+  transitions.
 
 Why migration now would change behavior:
 
-`nim-stackable-hooks` currently exports normal and noreturn Windows inline
-install wrappers, but not the no-suspend variants MCR selects when stage0 has
-already established the required installation preconditions. Migrating only the
-legacy path would split MCR's inline-hook source of truth and leave the stage0
-path on private symbols.
+M-FW-3G supplies the primitive no-suspend entry points without moving stage0
+into `nim-stackable-hooks`. A behavior-preserving migration is still blocked
+until MCR is explicitly rewired to these helpers and proves the no-suspend
+precondition at each call site.
 
 ## Required API Additions Before Reattempt
 
@@ -318,15 +333,15 @@ path on private symbols.
    lifecycle behavior.
 2. Migrate MCR vDSO patching onto the helper APIs while preserving MCR-owned
    target lists, trampoline bodies, event/replay policy, and diagnostics.
-3. Independently review M-FW-3F's POSIX atomic/JIT helper slice, then wire it
-   into MCR-owned scanner/trampoline/event lifecycle code without changing MCR
-   behavior.
-4. Export and test Windows no-suspend and noreturn no-suspend inline install
-   primitives with precondition documentation.
+3. Wire M-FW-3F's POSIX atomic/JIT helper slice into MCR-owned
+   scanner/trampoline/event lifecycle code without changing MCR behavior.
+4. After independent review of M-FW-3G, migrate Windows NT-detour and
+   LdrLoadDll-detour install sites to the stackable-hooks inline API while
+   keeping stage0 lifecycle proof and diagnostics in MCR.
 
 ## M-FW-3 Status
 
-M-FW-3 is blocked, not done. M-FW-3F has implemented and passed independent
-review for the bounded POSIX atomic/JIT helper slice. MCR source remains
-unchanged rather than claiming a migration that would not preserve MCR behavior
-or event stream shape.
+M-FW-3 is blocked, not done. M-FW-3G has implemented and passed independent
+review for the Windows no-suspend inline-hook primitive surface. MCR source
+remains unchanged rather than claiming a migration that would not preserve MCR
+behavior or event stream shape.

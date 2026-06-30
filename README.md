@@ -43,9 +43,15 @@ in the box.
 helpers for consumers that need to close direct syscall bypasses:
 
 - `rawSyscall6` for internal forwarding without calling libc wrappers.
-- `resolveDefaultSymbol`, `installAbsoluteJumpPatch`,
+- `resolveDefaultSymbol`, `openLibraryNoLoad`, `resolveSymbolInHandle`, and
+  `resolveSymbolChain` for consumer-controlled symbol resolver chains such as
+  `RTLD_DEFAULT` followed by a caller-opened libc handle.
+- `installAbsoluteJumpPatchTransaction`, `installAbsoluteJumpPatch`,
   `installNamedAbsoluteJumpPatch`, and `restoreAbsoluteJumpPatch` for explicit
   wrapper/body-patch installation with structured diagnostics.
+- `addrInLinuxExecutableSegment`, `clearLinuxPatchBook`,
+  `linuxPatchBookContains`, and `recordLinuxPatchBookTarget` as optional
+  reusable validation and duplicate-target bookkeeping helpers.
 - `scanLinuxX8664SyscallBytes`, `visitLinuxX8664SyscallBytes`,
   `visitLinuxX8664SyscallMemory`, `visitLinuxExecutableMappingSyscalls`,
   `parseLinuxMapsLine`, and `enumerateLinuxExecutableMappings` for finding and
@@ -53,11 +59,17 @@ helpers for consumers that need to close direct syscall bypasses:
 
 `rawSyscall6` returns the kernel result directly; failed syscalls are negative
 errno values and do not set libc `errno`. The absolute-jump patch handle stores
-the overwritten bytes for restore, but M-FW-2 does not yet provide an
-instruction-decoded original-call trampoline. Patch/restore temporarily changes
-the affected page span to `RWX` and restores it to `RX`; consumers that patch
-non-wrapper or writable executable pages need their own permission policy until
-a richer transaction API lands.
+the overwritten bytes for restore, but the Linux helper surface does not yet
+provide an instruction-decoded original-call trampoline. Patch/restore
+temporarily changes the affected page span to `RWX` and restores it to `RX`;
+consumers that patch non-wrapper or writable executable pages need their own
+permission policy.
+
+`installAbsoluteJumpPatchTransaction` exposes the lower-level install contract
+needed by C translation units and behavior-preserving migrations: it
+distinguishes validation failure, fatal pre-patch `mprotect` failure, patch
+write failure, and post-patch `mprotect`-back failure after the jump is already
+live. The same C ABI is exported under neutral `stackable_linux_*` symbols.
 
 These APIs are intentionally policy-free. MCR keeps record/replay semantics,
 stage0 composition, event ABI, and clone attribution. io-mon keeps monitor

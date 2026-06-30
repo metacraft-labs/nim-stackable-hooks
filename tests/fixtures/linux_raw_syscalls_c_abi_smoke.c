@@ -130,6 +130,11 @@ struct stackable_linux_near_allocation {
   int within_rel32;
 };
 
+struct stackable_linux_jit_range {
+  unsigned long start;
+  unsigned long stop;
+};
+
 extern long stackable_linux_static_raw_syscall6(
     long nr, long a1, long a2, long a3, long a4, long a5, long a6);
 extern void stackable_linux_rt_sigreturn_restorer(void);
@@ -197,6 +202,16 @@ extern int stackable_linux_allocate_near_trampoline(
     struct stackable_linux_near_allocation *out);
 extern int stackable_linux_free_near_trampoline(
     unsigned long address, unsigned long length);
+extern int stackable_linux_jit_range_add(
+    struct stackable_linux_jit_range *ranges, unsigned int *count,
+    unsigned int cap, unsigned long start, unsigned long stop);
+extern int stackable_linux_jit_range_remove(
+    struct stackable_linux_jit_range *ranges, unsigned int *count,
+    unsigned int cap, unsigned long start, unsigned long stop);
+extern unsigned int stackable_linux_jit_range_untracked(
+    const struct stackable_linux_jit_range *ranges, unsigned int count,
+    unsigned long start, unsigned long stop,
+    struct stackable_linux_jit_range *out, unsigned int out_cap);
 
 static int stackable_c_fixture_function(void) {
   return 17;
@@ -317,6 +332,33 @@ int stackable_test_c_abi_link_smoke(void) {
   } else if (rc != 12) {
     return -29;
   }
+
+  struct stackable_linux_jit_range ranges[4];
+  struct stackable_linux_jit_range gaps[4];
+  unsigned int range_count = 0;
+  memset(ranges, 0, sizeof(ranges));
+  memset(gaps, 0, sizeof(gaps));
+  rc = stackable_linux_jit_range_add(ranges, &range_count, 4, 100, 200);
+  if (rc != 0 || range_count != 1 || ranges[0].start != 100 ||
+      ranges[0].stop != 200) return -31;
+  rc = stackable_linux_jit_range_add(ranges, &range_count, 4, 250, 300);
+  if (rc != 0 || range_count != 2) return -32;
+  rc = stackable_linux_jit_range_add(ranges, &range_count, 4, 180, 260);
+  if (rc != 0 || range_count != 1 || ranges[0].start != 100 ||
+      ranges[0].stop != 300) return -33;
+  unsigned int ngaps = stackable_linux_jit_range_untracked(
+      ranges, range_count, 50, 350, gaps, 4);
+  if (ngaps != 2 || gaps[0].start != 50 || gaps[0].stop != 100 ||
+      gaps[1].start != 300 || gaps[1].stop != 350) return -34;
+  rc = stackable_linux_jit_range_remove(ranges, &range_count, 4, 140, 180);
+  if (rc != 0 || range_count != 2 || ranges[0].start != 100 ||
+      ranges[0].stop != 140 || ranges[1].start != 180 ||
+      ranges[1].stop != 300) return -35;
+  rc = stackable_linux_jit_range_remove(ranges, &range_count, 4, 90, 150);
+  if (rc != 0 || range_count != 1 || ranges[0].start != 180 ||
+      ranges[0].stop != 300) return -36;
+  rc = stackable_linux_jit_range_add(ranges, &range_count, 4, 9, 9);
+  if (rc == 0) return -37;
   return 0;
 }
 

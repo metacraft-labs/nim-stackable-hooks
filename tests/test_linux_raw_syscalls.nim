@@ -72,6 +72,126 @@ suite "linux raw syscall primitives":
     else:
       check resolveDefaultSymbol(cstring("syscall")) == nil
 
+  test "atomic instruction classifier accepts bounded LOCK, XCHG, and fence fixtures":
+    when defined(linux) and defined(amd64):
+      let lockAdd = classifyLinuxX8664AtomicWindow([
+        byte 0xf0, byte 0x01, byte 0x18, byte 0x90])
+      check lockAdd.diagnostic == lrsOk
+      check lockAdd.kind == laikLockRmw
+      check lockAdd.length == 3
+      check lockAdd.lockPrefixed
+      check lockAdd.memoryOperand
+      check lockAdd.modrmOffset == 2
+      check lockAdd.opcodeOffset == 1
+      check lockAdd.opcode0 == byte 0x01
+
+      let lockCmpxchg = classifyLinuxX8664AtomicWindow([
+        byte 0xf0, byte 0x48, byte 0x0f, byte 0xb1, byte 0x10])
+      check lockCmpxchg.diagnostic == lrsOk
+      check lockCmpxchg.kind == laikLockRmw
+      check lockCmpxchg.length == 5
+      check lockCmpxchg.opcode0 == byte 0x0f
+      check lockCmpxchg.opcode1 == byte 0xb1
+
+      let xchgMem = classifyLinuxX8664AtomicWindow([
+        byte 0x87, byte 0x03, byte 0x90])
+      check xchgMem.diagnostic == lrsOk
+      check xchgMem.kind == laikXchgMem
+      check xchgMem.length == 2
+      check not xchgMem.lockPrefixed
+      check xchgMem.memoryOperand
+
+      let mfence = classifyLinuxX8664AtomicWindow([
+        byte 0x0f, byte 0xae, byte 0xf0])
+      check mfence.diagnostic == lrsOk
+      check mfence.kind == laikMfence
+      check mfence.length == 3
+
+      let sfence = classifyLinuxX8664AtomicWindow([
+        byte 0x0f, byte 0xae, byte 0xf8])
+      check sfence.diagnostic == lrsOk
+      check sfence.kind == laikSfence
+
+      let lfence = classifyLinuxX8664AtomicWindow([
+        byte 0x0f, byte 0xae, byte 0xe8])
+      check lfence.diagnostic == lrsOk
+      check lfence.kind == laikLfence
+    else:
+      check classifyLinuxX8664AtomicWindow([byte 0xf0]).diagnostic != lrsOk
+
+  test "atomic instruction classifier rejects ambiguous or non-memory fixtures":
+    let truncated = classifyLinuxX8664AtomicWindow([byte 0xf0, byte 0x01])
+    when defined(linux) and defined(amd64):
+      check truncated.diagnostic == lrsUnsupportedInstruction
+      let registerOnly = classifyLinuxX8664AtomicWindow([
+        byte 0xf0, byte 0x01, byte 0xc0])
+      check registerOnly.diagnostic == lrsUnsupportedInstruction
+      let unlockedAdd = classifyLinuxX8664AtomicWindow([
+        byte 0x01, byte 0x18])
+      check unlockedAdd.diagnostic == lrsUnsupportedInstruction
+      let xchgRegister = classifyLinuxX8664AtomicWindow([
+        byte 0x87, byte 0xc0])
+      check xchgRegister.diagnostic == lrsUnsupportedInstruction
+      let lockMfence = classifyLinuxX8664AtomicWindow([
+        byte 0xf0, byte 0x0f, byte 0xae, byte 0xf0])
+      check lockMfence.diagnostic == lrsUnsupportedInstruction
+      let prefixedMfence = classifyLinuxX8664AtomicWindow([
+        byte 0x66, byte 0x0f, byte 0xae, byte 0xf0])
+      check prefixedMfence.diagnostic == lrsUnsupportedInstruction
+    else:
+      check truncated.diagnostic != lrsOk
+
+  test "atomic patch strategy selection chooses rel32 jmp or INT3 fallback":
+    when defined(linux) and defined(amd64):
+      let jmp = selectLinuxAtomicPatchStrategy(
+        0x10000000'u, 0x10001000'u, 5)
+      check jmp.diagnostic == lrsOk
+      check jmp.strategy == lapsJmpRel32
+      check jmp.patchSize == 5
+      check jmp.rel32Displacement == int64(0x10001000'i64 - 0x10000005'i64)
+
+      let short = selectLinuxAtomicPatchStrategy(
+        0x10000000'u, 0x10001000'u, 3)
+      check short.diagnostic == lrsOk
+      check short.strategy == lapsInt3
+      check short.patchSize == 1
+
+      let far = selectLinuxAtomicPatchStrategy(
+        0x10000000'u, 0x9000000000'u, 8)
+      check far.diagnostic == lrsOk
+      check far.strategy == lapsInt3
+      check far.patchSize == 1
+
+      let invalid = selectLinuxAtomicPatchStrategy(0'u, 0x1000'u, 5)
+      check invalid.diagnostic == lrsInvalidArgument
+    else:
+      check selectLinuxAtomicPatchStrategy(1'u, 2'u, 5).diagnostic != lrsOk
+
+  test "JIT executable range registry merges, subtracts, and deregisters ranges":
+    var registry: LinuxJitRangeRegistry
+    check addLinuxJitExecutableRange(registry, 100'u, 200'u)
+    check addLinuxJitExecutableRange(registry, 250'u, 300'u)
+    check registry.ranges == @[
+      LinuxJitExecutableRange(start: 100'u, stop: 200'u),
+      LinuxJitExecutableRange(start: 250'u, stop: 300'u)]
+    check addLinuxJitExecutableRange(registry, 180'u, 260'u)
+    check registry.ranges == @[LinuxJitExecutableRange(start: 100'u, stop: 300'u)]
+    check containsLinuxJitExecutableRange(registry, 120'u, 290'u)
+    check not containsLinuxJitExecutableRange(registry, 90'u, 120'u)
+
+    let missing = untrackedLinuxJitExecutableRanges(registry, 50'u, 350'u)
+    check missing == @[
+      LinuxJitExecutableRange(start: 50'u, stop: 100'u),
+      LinuxJitExecutableRange(start: 300'u, stop: 350'u)]
+
+    removeLinuxJitExecutableRange(registry, 140'u, 180'u)
+    check registry.ranges == @[
+      LinuxJitExecutableRange(start: 100'u, stop: 140'u),
+      LinuxJitExecutableRange(start: 180'u, stop: 300'u)]
+    removeLinuxJitExecutableRange(registry, 90'u, 150'u)
+    check registry.ranges == @[LinuxJitExecutableRange(start: 180'u, stop: 300'u)]
+    check not addLinuxJitExecutableRange(registry, 9'u, 9'u)
+
   test "clone continuation classifier is policy-extensible":
     when defined(linux) and defined(amd64):
       check isLinuxX8664DefaultCloneContinuationSyscall(linuxX8664SysClone)
@@ -543,6 +663,21 @@ int stackable_test_replacement_value(void) {
       let anon = allocPatchTarget()
       check anon != nil
       check not addrInLinuxExecutableSegment(anon)
+
+    test "near trampoline allocation returns writable rel32-reachable memory":
+      let allocation = allocateLinuxNearTrampoline(cast[pointer](replacementValue), 64)
+      check allocation.diagnostic == lrsOk
+      check allocation.address != nil
+      check allocation.length >= 64
+      check allocation.withinRel32
+      let bytes = cast[ptr UncheckedArray[byte]](allocation.address)
+      bytes[0] = byte 0xc3
+      check bytes[0] == byte 0xc3
+      let decision = selectLinuxAtomicPatchStrategy(
+        cast[pointer](replacementValue), allocation.address, 5)
+      check decision.diagnostic == lrsOk
+      check decision.strategy == lapsJmpRel32
+      check freeLinuxNearTrampoline(allocation) == lrsOk
 
     test "C ABI symbols compile and link from a C translation unit":
       check cAbiLinkSmoke() == 0

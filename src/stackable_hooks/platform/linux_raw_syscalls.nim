@@ -186,6 +186,62 @@ type
     overlayUsed*: bool
     direct*: LinuxPatchTransaction
 
+  LinuxAtomicInstructionKind* = enum
+    laikNone = "none"
+    laikLockRmw = "lock-rmw"
+    laikXchgMem = "xchg-mem"
+    laikMfence = "mfence"
+    laikSfence = "sfence"
+    laikLfence = "lfence"
+
+  LinuxAtomicPatchStrategy* = enum
+    lapsNone = "none"
+    lapsJmpRel32 = "jmp-rel32"
+    lapsInt3 = "int3"
+
+  LinuxAtomicInstructionWindow* = object
+    ## Conservative policy-free classification of one x86_64 instruction
+    ## window relevant to MCR's atomic instrumentation. This is intentionally
+    ## not a full instruction decoder: unproven byte windows are rejected.
+    diagnostic*: LinuxRawSyscallDiagnostic
+    kind*: LinuxAtomicInstructionKind
+    length*: int
+    lockPrefixed*: bool
+    memoryOperand*: bool
+    modrmOffset*: int
+    opcodeOffset*: int
+    opcode0*: byte
+    opcode1*: byte
+
+  LinuxAtomicPatchDecision* = object
+    ## Mechanism-only choice between a direct 5-byte JMP-rel32 patch and an
+    ## INT3 fallback. No event, signal, or lifecycle policy is implied.
+    diagnostic*: LinuxRawSyscallDiagnostic
+    strategy*: LinuxAtomicPatchStrategy
+    target*: uint
+    trampoline*: uint
+    instructionLength*: int
+    patchSize*: int
+    rel32Displacement*: int64
+
+  LinuxNearTrampolineAllocation* = object
+    diagnostic*: LinuxRawSyscallDiagnostic
+    anchor*: uint
+    address*: pointer
+    length*: int
+    withinRel32*: bool
+    osErrno*: cint
+
+  LinuxJitExecutableRange* = object
+    start*: uint
+    stop*: uint
+
+  LinuxJitRangeRegistry* = object
+    ## Sorted, merged half-open executable range registry for JIT mprotect
+    ## tracking. It owns only dedup/lifecycle bookkeeping; consumers own scans
+    ## and reverse-patching.
+    ranges*: seq[LinuxJitExecutableRange]
+
   LinuxSymbolResolverKind* = enum
     lsrDefault = "rtld-default"
     lsrHandle = "handle"
@@ -301,6 +357,37 @@ type CStackableLinuxVdsoPatchResult {.importc: "struct stackable_linux_vdso_patc
   symbolAddress {.importc: "symbol_address".}: culong
   replacement {.importc: "replacement".}: culong
   direct {.importc: "direct".}: CStackableLinuxPatchResult
+
+type CStackableLinuxAtomicWindow {.importc: "struct stackable_linux_atomic_window",
+                                   bycopy.} = object
+  diagnostic {.importc: "diagnostic".}: cint
+  kind {.importc: "kind".}: cint
+  length {.importc: "length".}: culong
+  lockPrefixed {.importc: "lock_prefixed".}: cint
+  memoryOperand {.importc: "memory_operand".}: cint
+  modrmOffset {.importc: "modrm_offset".}: clong
+  opcodeOffset {.importc: "opcode_offset".}: clong
+  opcode0 {.importc: "opcode0".}: byte
+  opcode1 {.importc: "opcode1".}: byte
+
+type CStackableLinuxAtomicPatchDecision {.importc: "struct stackable_linux_atomic_patch_decision",
+                                          bycopy.} = object
+  diagnostic {.importc: "diagnostic".}: cint
+  strategy {.importc: "strategy".}: cint
+  target {.importc: "target".}: culong
+  trampoline {.importc: "trampoline".}: culong
+  instructionLength {.importc: "instruction_length".}: culong
+  patchSize {.importc: "patch_size".}: culong
+  rel32Displacement {.importc: "rel32_displacement".}: clonglong
+
+type CStackableLinuxNearAllocation {.importc: "struct stackable_linux_near_allocation",
+                                     bycopy.} = object
+  diagnostic {.importc: "diagnostic".}: cint
+  osErrno {.importc: "os_errno".}: cint
+  anchor {.importc: "anchor".}: culong
+  address {.importc: "address".}: culong
+  length {.importc: "length".}: culong
+  withinRel32 {.importc: "within_rel32".}: cint
 
 const
   linuxSyscallOpcode0* = byte 0x0f
@@ -473,6 +560,37 @@ struct stackable_linux_vdso_patch_result {
   struct stackable_linux_patch_result direct;
 };
 
+struct stackable_linux_atomic_window {
+  int diagnostic;
+  int kind;
+  unsigned long length;
+  int lock_prefixed;
+  int memory_operand;
+  long modrm_offset;
+  long opcode_offset;
+  unsigned char opcode0;
+  unsigned char opcode1;
+};
+
+struct stackable_linux_atomic_patch_decision {
+  int diagnostic;
+  int strategy;
+  unsigned long target;
+  unsigned long trampoline;
+  unsigned long instruction_length;
+  unsigned long patch_size;
+  long long rel32_displacement;
+};
+
+struct stackable_linux_near_allocation {
+  int diagnostic;
+  int os_errno;
+  unsigned long anchor;
+  unsigned long address;
+  unsigned long length;
+  int within_rel32;
+};
+
 void stackable_linux_rt_sigreturn_restorer(void);
 __asm__(
   ".text\n"
@@ -595,6 +713,11 @@ static long stackable_linux_raw_mmap(void *addr, size_t len, int prot,
   return stackable_linux_raw_syscall6((long)SYS_mmap, (long)addr, (long)len,
                                       (long)prot, (long)flags, (long)fd,
                                       offset);
+}
+
+static long stackable_linux_raw_munmap(void *addr, size_t len) {
+  return stackable_linux_raw_syscall6((long)SYS_munmap, (long)addr, (long)len,
+                                      0, 0, 0, 0);
 }
 
 static void stackable_linux_write_abs_jump(unsigned char *p, void *target) {
@@ -1656,6 +1779,346 @@ int stackable_linux_chain_sigtrap(int signum, void *siginfo_ptr,
   stackable_linux_old_sigtrap_action.sa_handler(signum);
   return STACKABLE_LINUX_PATCH_OK;
 }
+
+enum {
+  STACKABLE_LINUX_ATOMIC_NONE = 0,
+  STACKABLE_LINUX_ATOMIC_LOCK_RMW = 1,
+  STACKABLE_LINUX_ATOMIC_XCHG_MEM = 2,
+  STACKABLE_LINUX_ATOMIC_MFENCE = 3,
+  STACKABLE_LINUX_ATOMIC_SFENCE = 4,
+  STACKABLE_LINUX_ATOMIC_LFENCE = 5
+};
+
+enum {
+  STACKABLE_LINUX_ATOMIC_STRATEGY_NONE = 0,
+  STACKABLE_LINUX_ATOMIC_STRATEGY_JMP_REL32 = 1,
+  STACKABLE_LINUX_ATOMIC_STRATEGY_INT3 = 2
+};
+
+static void stackable_linux_init_atomic_window(
+    struct stackable_linux_atomic_window *out) {
+  if (out == NULL) return;
+  memset(out, 0, sizeof(*out));
+  out->diagnostic = STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+  out->modrm_offset = -1;
+  out->opcode_offset = -1;
+}
+
+static int stackable_linux_atomic_read_modrm_tail(
+    const unsigned char *bytes, size_t len, size_t *pos, unsigned char modrm,
+    size_t imm_len) {
+  unsigned char mod = (unsigned char)((modrm >> 6) & 0x3);
+  unsigned char rm = (unsigned char)(modrm & 0x7);
+  if (mod != 3 && rm == 4) {
+    if (*pos >= len) return 0;
+    unsigned char sib = bytes[(*pos)++];
+    unsigned char base = (unsigned char)(sib & 0x7);
+    if (mod == 0 && base == 5) {
+      if (*pos + 4 > len) return 0;
+      *pos += 4;
+    }
+  }
+  if (mod == 1) {
+    if (*pos + 1 > len) return 0;
+    *pos += 1;
+  } else if (mod == 2 || (mod == 0 && rm == 5)) {
+    if (*pos + 4 > len) return 0;
+    *pos += 4;
+  }
+  if (*pos + imm_len > len) return 0;
+  *pos += imm_len;
+  return 1;
+}
+
+static int stackable_linux_atomic_memory_modrm(unsigned char modrm) {
+  return ((modrm >> 6) & 0x3) != 0x3;
+}
+
+static int stackable_linux_lockable_one_byte(unsigned char op,
+                                             unsigned char modrm) {
+  switch (op) {
+    case 0x00: case 0x01: case 0x08: case 0x09:
+    case 0x10: case 0x11: case 0x18: case 0x19:
+    case 0x20: case 0x21: case 0x28: case 0x29:
+    case 0x30: case 0x31:
+      return 1;
+    case 0x80: case 0x81: case 0x83:
+      return ((modrm >> 3) & 0x7) != 0x7;
+    case 0xf6: case 0xf7: {
+      unsigned char reg = (unsigned char)((modrm >> 3) & 0x7);
+      return reg == 2 || reg == 3;
+    }
+    case 0xfe: case 0xff: {
+      unsigned char reg = (unsigned char)((modrm >> 3) & 0x7);
+      return reg == 0 || reg == 1;
+    }
+    default:
+      return 0;
+  }
+}
+
+static int stackable_linux_lockable_two_byte(unsigned char op2,
+                                             unsigned char modrm) {
+  switch (op2) {
+    case 0xab: case 0xb0: case 0xb1: case 0xb3:
+    case 0xbb: case 0xc0: case 0xc1:
+      return 1;
+    case 0xba: {
+      unsigned char reg = (unsigned char)((modrm >> 3) & 0x7);
+      return reg >= 5 && reg <= 7;
+    }
+    default:
+      return 0;
+  }
+}
+
+int stackable_linux_classify_atomic_window(
+    unsigned char *bytes, unsigned long len,
+    struct stackable_linux_atomic_window *out) {
+  stackable_linux_init_atomic_window(out);
+  if (bytes == NULL || len == 0 || out == NULL) {
+    if (out) out->diagnostic = STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+    return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+  }
+  size_t i = 0;
+  int saw_lock = 0;
+  int saw_legacy_prefix = 0;
+  for (;;) {
+    if (i >= (size_t)len) return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+    unsigned char b = bytes[i];
+    if (b == 0xf0) { saw_lock = 1; i++; continue; }
+    if (b == 0x66 || b == 0x67 || b == 0xf2 || b == 0xf3 ||
+        b == 0x26 || b == 0x2e || b == 0x36 || b == 0x3e ||
+        b == 0x64 || b == 0x65) {
+      saw_legacy_prefix = 1;
+      i++;
+      continue;
+    }
+    break;
+  }
+  if (i < (size_t)len && bytes[i] >= 0x40 && bytes[i] <= 0x4f) i++;
+  if (i >= (size_t)len) return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+
+  size_t opcode_offset = i;
+  unsigned char op = bytes[i++];
+  if (op == 0x0f) {
+    if (i >= (size_t)len) return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+    unsigned char op2 = bytes[i++];
+    if (op2 == 0xae) {
+      if (i >= (size_t)len) return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+      unsigned char modrm = bytes[i++];
+      if (!saw_lock && !saw_legacy_prefix && opcode_offset == 0 &&
+          (modrm == 0xf0 || modrm == 0xf8 || modrm == 0xe8)) {
+        out->diagnostic = STACKABLE_LINUX_PATCH_OK;
+        out->kind = modrm == 0xf0 ? STACKABLE_LINUX_ATOMIC_MFENCE :
+                    modrm == 0xf8 ? STACKABLE_LINUX_ATOMIC_SFENCE :
+                                     STACKABLE_LINUX_ATOMIC_LFENCE;
+        out->length = (unsigned long)i;
+        out->lock_prefixed = saw_lock;
+        out->memory_operand = 0;
+        out->modrm_offset = (long)(i - 1);
+        out->opcode_offset = (long)opcode_offset;
+        out->opcode0 = op;
+        out->opcode1 = op2;
+        return STACKABLE_LINUX_PATCH_OK;
+      }
+      return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+    }
+    if (i >= (size_t)len) return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+    size_t modrm_offset = i;
+    unsigned char modrm = bytes[i++];
+    size_t imm_len = op2 == 0xba ? 1 : 0;
+    if (!stackable_linux_atomic_read_modrm_tail(bytes, (size_t)len, &i,
+                                                modrm, imm_len)) {
+      return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+    }
+    if (saw_lock && stackable_linux_atomic_memory_modrm(modrm) &&
+        stackable_linux_lockable_two_byte(op2, modrm)) {
+      out->diagnostic = STACKABLE_LINUX_PATCH_OK;
+      out->kind = STACKABLE_LINUX_ATOMIC_LOCK_RMW;
+      out->length = (unsigned long)i;
+      out->lock_prefixed = 1;
+      out->memory_operand = 1;
+      out->modrm_offset = (long)modrm_offset;
+      out->opcode_offset = (long)opcode_offset;
+      out->opcode0 = op;
+      out->opcode1 = op2;
+      return STACKABLE_LINUX_PATCH_OK;
+    }
+    return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+  }
+
+  if (op == 0x86 || op == 0x87) {
+    if (i >= (size_t)len) return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+    size_t modrm_offset = i;
+    unsigned char modrm = bytes[i++];
+    if (!stackable_linux_atomic_read_modrm_tail(bytes, (size_t)len, &i,
+                                                modrm, 0)) {
+      return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+    }
+    if (stackable_linux_atomic_memory_modrm(modrm)) {
+      out->diagnostic = STACKABLE_LINUX_PATCH_OK;
+      out->kind = STACKABLE_LINUX_ATOMIC_XCHG_MEM;
+      out->length = (unsigned long)i;
+      out->lock_prefixed = saw_lock;
+      out->memory_operand = 1;
+      out->modrm_offset = (long)modrm_offset;
+      out->opcode_offset = (long)opcode_offset;
+      out->opcode0 = op;
+      return STACKABLE_LINUX_PATCH_OK;
+    }
+    return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+  }
+
+  if (!saw_lock) return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+  if (i >= (size_t)len) return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+  size_t modrm_offset = i;
+  unsigned char modrm = bytes[i++];
+  size_t imm_len = 0;
+  if (op == 0x80 || op == 0x83) imm_len = 1;
+  else if (op == 0x81) imm_len = 4;
+  else if (op == 0xf6) {
+    unsigned char reg = (unsigned char)((modrm >> 3) & 0x7);
+    if (reg == 0 || reg == 1) imm_len = 1;
+  } else if (op == 0xf7) {
+    unsigned char reg = (unsigned char)((modrm >> 3) & 0x7);
+    if (reg == 0 || reg == 1) imm_len = 4;
+  }
+  if (!stackable_linux_atomic_read_modrm_tail(bytes, (size_t)len, &i,
+                                              modrm, imm_len)) {
+    return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+  }
+  if (stackable_linux_atomic_memory_modrm(modrm) &&
+      stackable_linux_lockable_one_byte(op, modrm)) {
+    out->diagnostic = STACKABLE_LINUX_PATCH_OK;
+    out->kind = STACKABLE_LINUX_ATOMIC_LOCK_RMW;
+    out->length = (unsigned long)i;
+    out->lock_prefixed = 1;
+    out->memory_operand = 1;
+    out->modrm_offset = (long)modrm_offset;
+    out->opcode_offset = (long)opcode_offset;
+    out->opcode0 = op;
+    return STACKABLE_LINUX_PATCH_OK;
+  }
+  return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+}
+
+static int stackable_linux_rel32_reachable(uintptr_t site_after_patch,
+                                           uintptr_t target,
+                                           long long *out_disp) {
+  long long disp = (long long)((int64_t)target - (int64_t)site_after_patch);
+  if (out_disp) *out_disp = disp;
+  return disp >= -2147483648LL && disp <= 2147483647LL;
+}
+
+int stackable_linux_select_atomic_patch_strategy(
+    unsigned long target, unsigned long trampoline, unsigned long instruction_len,
+    struct stackable_linux_atomic_patch_decision *out) {
+  if (out) {
+    memset(out, 0, sizeof(*out));
+    out->target = target;
+    out->trampoline = trampoline;
+    out->instruction_length = instruction_len;
+  }
+  if (target == 0 || trampoline == 0 || instruction_len == 0) {
+    if (out) out->diagnostic = STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+    return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+  }
+  long long disp = 0;
+  int reachable = stackable_linux_rel32_reachable(
+      (uintptr_t)target + 5U, (uintptr_t)trampoline, &disp);
+  if (instruction_len >= 5 && reachable) {
+    if (out) {
+      out->diagnostic = STACKABLE_LINUX_PATCH_OK;
+      out->strategy = STACKABLE_LINUX_ATOMIC_STRATEGY_JMP_REL32;
+      out->patch_size = 5;
+      out->rel32_displacement = disp;
+    }
+    return STACKABLE_LINUX_PATCH_OK;
+  }
+  if (out) {
+    out->diagnostic = STACKABLE_LINUX_PATCH_OK;
+    out->strategy = STACKABLE_LINUX_ATOMIC_STRATEGY_INT3;
+    out->patch_size = 1;
+    out->rel32_displacement = disp;
+  }
+  return STACKABLE_LINUX_PATCH_OK;
+}
+
+int stackable_linux_allocate_near_trampoline(
+    unsigned long anchor, unsigned long length,
+    struct stackable_linux_near_allocation *out) {
+  if (out) {
+    memset(out, 0, sizeof(*out));
+    out->anchor = anchor;
+    out->length = length;
+  }
+  if (anchor == 0 || length == 0) {
+    if (out) out->diagnostic = STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+    return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+  }
+  long page_size = sysconf(_SC_PAGESIZE);
+  if (page_size <= 0) page_size = 4096;
+  uintptr_t page_mask = (uintptr_t)(page_size - 1);
+  size_t span = (size_t)((length + (unsigned long)page_mask) & ~((unsigned long)page_mask));
+  if (span == 0) span = (size_t)page_size;
+
+  long mapped = stackable_linux_raw_mmap(NULL, span, PROT_READ | PROT_WRITE,
+                                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (mapped >= 0) {
+    long long disp = 0;
+    if (stackable_linux_rel32_reachable(anchor + 5U, (uintptr_t)mapped, &disp)) {
+      if (out) {
+        out->diagnostic = STACKABLE_LINUX_PATCH_OK;
+        out->address = (unsigned long)mapped;
+        out->length = (unsigned long)span;
+        out->within_rel32 = 1;
+      }
+      return STACKABLE_LINUX_PATCH_OK;
+    }
+    (void)stackable_linux_raw_munmap((void *)(uintptr_t)mapped, span);
+  }
+
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+  uintptr_t base = ((uintptr_t)anchor) & ~page_mask;
+  const uintptr_t step = (uintptr_t)page_size * 64U;
+  const uintptr_t limit = 0x7fffffffUL;
+  for (uintptr_t delta = step; delta < limit; delta += step) {
+    for (int dir = -1; dir <= 1; dir += 2) {
+      uintptr_t candidate = dir < 0 ? base - delta : base + delta;
+      if (dir < 0 && candidate > base) continue;
+      if (candidate + span <= candidate) continue;
+      long m = stackable_linux_raw_mmap((void *)candidate, span,
+          PROT_READ | PROT_WRITE,
+          MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+      if (m < 0) {
+        if (out && out->os_errno == 0) out->os_errno = (int)(-m);
+        continue;
+      }
+      if (out) {
+        out->diagnostic = STACKABLE_LINUX_PATCH_OK;
+        out->address = (unsigned long)m;
+        out->length = (unsigned long)span;
+        out->within_rel32 = stackable_linux_rel32_reachable(
+            anchor + 5U, (uintptr_t)m, NULL);
+      }
+      return STACKABLE_LINUX_PATCH_OK;
+    }
+  }
+  if (out) out->diagnostic = STACKABLE_LINUX_PATCH_TRAMPOLINE_ALLOC_FAILED;
+  return STACKABLE_LINUX_PATCH_TRAMPOLINE_ALLOC_FAILED;
+}
+
+int stackable_linux_free_near_trampoline(unsigned long address,
+                                         unsigned long length) {
+  if (address == 0 || length == 0) return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+  long rc = stackable_linux_raw_munmap((void *)(uintptr_t)address,
+                                       (size_t)length);
+  if (rc < 0) return STACKABLE_LINUX_PATCH_RESTORE_FAILED;
+  return STACKABLE_LINUX_PATCH_OK;
+}
 """.}
 
   proc cRawSyscall6(nr, a1, a2, a3, a4, a5, a6: clong): clong
@@ -1733,6 +2196,17 @@ int stackable_linux_chain_sigtrap(int signum, void *siginfo_ptr,
                           replacement: pointer; allowOverlay: cint;
                           outResult: ptr CStackableLinuxVdsoPatchResult): cint
     {.importc: "stackable_linux_vdso_patch_symbol_tx", cdecl.}
+  proc cClassifyAtomicWindow(bytes: ptr byte; length: culong;
+                             outResult: ptr CStackableLinuxAtomicWindow): cint
+    {.importc: "stackable_linux_classify_atomic_window", cdecl.}
+  proc cSelectAtomicPatchStrategy(target, trampoline, instructionLen: culong;
+                                  outResult: ptr CStackableLinuxAtomicPatchDecision): cint
+    {.importc: "stackable_linux_select_atomic_patch_strategy", cdecl.}
+  proc cAllocateNearTrampoline(anchor, length: culong;
+                               outResult: ptr CStackableLinuxNearAllocation): cint
+    {.importc: "stackable_linux_allocate_near_trampoline", cdecl.}
+  proc cFreeNearTrampoline(address, length: culong): cint
+    {.importc: "stackable_linux_free_near_trampoline", cdecl.}
 
 proc rawSyscall6*(nr, a1, a2, a3, a4, a5, a6: int): int =
   ## Issue a Linux x86_64 raw syscall using the kernel calling convention.
@@ -2023,6 +2497,60 @@ proc fromCVdsoPatch(cres: CStackableLinuxVdsoPatchResult;
   else:
     discard
 
+proc toAtomicKind(kind: cint): LinuxAtomicInstructionKind {.used.} =
+  case int(kind)
+  of 1: laikLockRmw
+  of 2: laikXchgMem
+  of 3: laikMfence
+  of 4: laikSfence
+  of 5: laikLfence
+  else: laikNone
+
+proc toAtomicStrategy(strategy: cint): LinuxAtomicPatchStrategy {.used.} =
+  case int(strategy)
+  of 1: lapsJmpRel32
+  of 2: lapsInt3
+  else: lapsNone
+
+proc fromCAtomicWindow(cres: CStackableLinuxAtomicWindow): LinuxAtomicInstructionWindow {.used.} =
+  when defined(linux) and defined(amd64):
+    result.diagnostic = toDiagnostic(cres.diagnostic)
+    result.kind = toAtomicKind(cres.kind)
+    result.length = int(cres.length)
+    result.lockPrefixed = cres.lockPrefixed != 0
+    result.memoryOperand = cres.memoryOperand != 0
+    result.modrmOffset = int(cres.modrmOffset)
+    result.opcodeOffset = int(cres.opcodeOffset)
+    result.opcode0 = cres.opcode0
+    result.opcode1 = cres.opcode1
+  else:
+    discard
+
+proc fromCAtomicPatchDecision(cres: CStackableLinuxAtomicPatchDecision):
+    LinuxAtomicPatchDecision {.used.} =
+  when defined(linux) and defined(amd64):
+    result.diagnostic = toDiagnostic(cres.diagnostic)
+    result.strategy = toAtomicStrategy(cres.strategy)
+    result.target = uint(cres.target)
+    result.trampoline = uint(cres.trampoline)
+    result.instructionLength = int(cres.instructionLength)
+    result.patchSize = int(cres.patchSize)
+    result.rel32Displacement = int64(cres.rel32Displacement)
+  else:
+    discard
+
+proc fromCNearAllocation(cres: CStackableLinuxNearAllocation):
+    LinuxNearTrampolineAllocation {.used.} =
+  when defined(linux) and defined(amd64):
+    result.diagnostic = toDiagnostic(cres.diagnostic)
+    result.anchor = uint(cres.anchor)
+    result.address = cast[pointer](cres.address)
+    result.length = int(cres.length)
+    result.withinRel32 = cres.withinRel32 != 0
+    result.osErrno = cres.osErrno
+  else:
+    discard
+
 proc installAbsoluteJumpPatchTransaction*(target, replacement: pointer;
                                           captureRestoreBytes = true): LinuxPatchTransaction =
   ## Install a 14-byte absolute jump and return stage-aware diagnostics. If the
@@ -2144,6 +2672,188 @@ proc installLinuxVdsoSymbolPatchTransaction*(image: LinuxVdsoImage;
     result = fromCVdsoPatch(cres, image, name)
   else:
     result.diagnostic = support
+
+proc classifyLinuxX8664AtomicWindow*(bytes: openArray[byte]):
+    LinuxAtomicInstructionWindow =
+  ## Conservatively classify one x86_64 instruction window relevant to atomic
+  ## instrumentation: LOCK-prefixed memory RMW instructions, implicit-lock
+  ## memory XCHG, and MFENCE/SFENCE/LFENCE. This is not a complete decoder;
+  ## ambiguous or unsupported windows return `lrsUnsupportedInstruction`.
+  let support = linuxRawSyscallSupported()
+  result.modrmOffset = -1
+  result.opcodeOffset = -1
+  if support != lrsOk:
+    result.diagnostic = support
+    return
+  if bytes.len == 0:
+    result.diagnostic = lrsInvalidArgument
+    return
+  when defined(linux) and defined(amd64):
+    var cres: CStackableLinuxAtomicWindow
+    discard cClassifyAtomicWindow(unsafeAddr bytes[0], culong(bytes.len),
+                                  addr cres)
+    result = fromCAtomicWindow(cres)
+  else:
+    result.diagnostic = support
+
+proc selectLinuxAtomicPatchStrategy*(target: uint;
+                                     trampoline: uint;
+                                     instructionLength: int):
+    LinuxAtomicPatchDecision =
+  ## Select the generic POSIX atomic callsite patch shape. A 5-byte JMP-rel32
+  ## is selected only when the original instruction window can host it and the
+  ## trampoline is reachable from `target + 5`; otherwise INT3 is selected.
+  let support = linuxRawSyscallSupported()
+  if support != lrsOk:
+    result.diagnostic = support
+    return
+  when defined(linux) and defined(amd64):
+    var cres: CStackableLinuxAtomicPatchDecision
+    discard cSelectAtomicPatchStrategy(culong(target), culong(trampoline),
+                                       culong(instructionLength), addr cres)
+    result = fromCAtomicPatchDecision(cres)
+  else:
+    result.diagnostic = support
+
+proc selectLinuxAtomicPatchStrategy*(target, trampoline: pointer;
+                                     instructionLength: int):
+    LinuxAtomicPatchDecision =
+  selectLinuxAtomicPatchStrategy(cast[uint](target), cast[uint](trampoline),
+                                 instructionLength)
+
+proc allocateLinuxNearTrampoline*(anchor: pointer; length: int):
+    LinuxNearTrampolineAllocation =
+  ## Allocate a caller-writable mapping near `anchor` where feasible. The helper
+  ## owns only allocation/proximity; the caller owns trampoline bytes,
+  ## executable-permission hardening, event callbacks, and lifetime policy.
+  let support = linuxRawSyscallSupported()
+  if support != lrsOk:
+    result.diagnostic = support
+    return
+  when defined(linux) and defined(amd64):
+    var cres: CStackableLinuxNearAllocation
+    discard cAllocateNearTrampoline(culong(cast[uint](anchor)), culong(length),
+                                    addr cres)
+    result = fromCNearAllocation(cres)
+  else:
+    result.diagnostic = support
+
+proc freeLinuxNearTrampoline*(allocation: LinuxNearTrampolineAllocation):
+    LinuxRawSyscallDiagnostic =
+  ## Release a mapping returned by `allocateLinuxNearTrampoline`.
+  if allocation.address == nil or allocation.length <= 0:
+    return lrsInvalidArgument
+  let support = linuxRawSyscallSupported()
+  if support != lrsOk:
+    return support
+  when defined(linux) and defined(amd64):
+    toDiagnostic(cFreeNearTrampoline(culong(cast[uint](allocation.address)),
+                                     culong(allocation.length)))
+  else:
+    support
+
+proc addLinuxJitExecutableRange*(registry: var LinuxJitRangeRegistry;
+                                 start, stop: uint): bool =
+  ## Insert and merge one half-open executable range. Returns false only for an
+  ## invalid or overflowed range. Adjacent ranges are merged to keep lifecycle
+  ## bookkeeping compact.
+  if start >= stop:
+    return false
+  var mergedStart = start
+  var mergedStop = stop
+  var first = registry.ranges.len
+  var last = registry.ranges.len
+  for i, r in registry.ranges:
+    if r.stop < start:
+      continue
+    if r.start > stop:
+      if last == registry.ranges.len:
+        last = i
+      break
+    if first == registry.ranges.len:
+      first = i
+    last = i + 1
+    if r.start < mergedStart:
+      mergedStart = r.start
+    if r.stop > mergedStop:
+      mergedStop = r.stop
+  if first == registry.ranges.len:
+    var ins = 0
+    while ins < registry.ranges.len and registry.ranges[ins].stop < start:
+      inc ins
+    registry.ranges.insert LinuxJitExecutableRange(start: start, stop: stop), ins
+    return true
+  registry.ranges[first] = LinuxJitExecutableRange(start: mergedStart,
+                                                   stop: mergedStop)
+  if last > first + 1:
+    for _ in first + 1 ..< last:
+      registry.ranges.delete(first + 1)
+  true
+
+proc removeLinuxJitExecutableRange*(registry: var LinuxJitRangeRegistry;
+                                    start, stop: uint) =
+  ## Remove `[start, stop)` from the registry, clipping or splitting tracked
+  ## ranges. This mirrors mprotect-to-writable lifecycle bookkeeping; consumers
+  ## still own reverse patching of any sites in the removed span.
+  if start >= stop or registry.ranges.len == 0:
+    return
+  var i = 0
+  while i < registry.ranges.len:
+    let r = registry.ranges[i]
+    if r.stop <= start:
+      inc i
+      continue
+    if r.start >= stop:
+      break
+    if r.start >= start and r.stop <= stop:
+      registry.ranges.delete(i)
+      continue
+    if r.start < start and r.stop > stop:
+      registry.ranges[i].stop = start
+      registry.ranges.insert LinuxJitExecutableRange(start: stop, stop: r.stop),
+                             i + 1
+      inc i, 2
+      continue
+    if r.start < start:
+      registry.ranges[i].stop = start
+      inc i
+    else:
+      registry.ranges[i].start = stop
+      inc i
+
+proc containsLinuxJitExecutableRange*(registry: LinuxJitRangeRegistry;
+                                      start, stop: uint): bool =
+  ## Return true when `[start, stop)` is fully covered by one tracked range.
+  if start >= stop:
+    return false
+  for r in registry.ranges:
+    if r.start <= start and r.stop >= stop:
+      return true
+    if r.start > start:
+      return false
+  false
+
+proc untrackedLinuxJitExecutableRanges*(registry: LinuxJitRangeRegistry;
+                                        start, stop: uint):
+    seq[LinuxJitExecutableRange] =
+  ## Return the sub-ranges of `[start, stop)` that are not yet tracked. This is
+  ## the reusable dedup primitive needed before a consumer scans fresh JIT code.
+  if start >= stop:
+    return @[]
+  var cursor = start
+  for r in registry.ranges:
+    if r.stop <= cursor:
+      continue
+    if r.start >= stop:
+      break
+    if r.start > cursor:
+      result.add LinuxJitExecutableRange(start: cursor, stop: min(r.start, stop))
+    if r.stop > cursor:
+      cursor = r.stop
+    if cursor >= stop:
+      break
+  if cursor < stop:
+    result.add LinuxJitExecutableRange(start: cursor, stop: stop)
 
 proc measureOriginalCallTrampoline*(target: pointer;
                                     minPatchLen = linuxAbsoluteJumpPatchSize;

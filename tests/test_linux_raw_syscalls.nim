@@ -97,6 +97,40 @@ void *stackable_test_alloc_patch_target(void) {
   return p;
 }
 
+void *stackable_test_alloc_original_trampoline_target(void) {
+  long page_size = sysconf(_SC_PAGESIZE);
+  if (page_size <= 0) page_size = 4096;
+  unsigned char *p = (unsigned char *)mmap(NULL, (size_t)page_size,
+      PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (p == MAP_FAILED) return NULL;
+  /* mov $7,%eax; add $5,%eax; push %rbp; pop %rbp; nop*4; ret */
+  unsigned char code[16] = {
+    0xb8, 0x07, 0x00, 0x00, 0x00,
+    0x83, 0xc0, 0x05,
+    0x55, 0x5d,
+    0x90, 0x90, 0x90, 0x90,
+    0xc3, 0x90
+  };
+  memcpy(p, code, sizeof(code));
+  return p;
+}
+
+void *stackable_test_alloc_rip_relative_target(void) {
+  long page_size = sysconf(_SC_PAGESIZE);
+  if (page_size <= 0) page_size = 4096;
+  unsigned char *p = (unsigned char *)mmap(NULL, (size_t)page_size,
+      PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (p == MAP_FAILED) return NULL;
+  /* mov 0(%rip),%rax; nop padding. This must be rejected, not guessed. */
+  unsigned char code[16] = {
+    0x48, 0x8b, 0x05, 0x00, 0x00, 0x00, 0x00,
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+    0xc3, 0x90
+  };
+  memcpy(p, code, sizeof(code));
+  return p;
+}
+
 void *stackable_test_alloc_syscall_scan_buffer(void) {
   long page_size = sysconf(_SC_PAGESIZE);
   if (page_size <= 0) page_size = 4096;
@@ -119,6 +153,10 @@ int stackable_test_replacement_value(void) {
 
   proc allocPatchTarget(): pointer
     {.importc: "stackable_test_alloc_patch_target", cdecl.}
+  proc allocOriginalTrampolineTarget(): pointer
+    {.importc: "stackable_test_alloc_original_trampoline_target", cdecl.}
+  proc allocRipRelativeTarget(): pointer
+    {.importc: "stackable_test_alloc_rip_relative_target", cdecl.}
   proc replacementValue(): cint
     {.importc: "stackable_test_replacement_value", cdecl.}
   proc allocSyscallScanBuffer(): pointer
@@ -150,6 +188,51 @@ int stackable_test_replacement_value(void) {
       check restoreAbsoluteJumpPatch(handle) == lrsOk
       check not handle.active
       check fn() == 7
+
+    test "original-call trampoline preserves controlled original behavior after patch":
+      let target = allocOriginalTrampolineTarget()
+      check target != nil
+      let fn = cast[TestFn](target)
+      check fn() == 12
+
+      let measured = measureOriginalCallTrampoline(target)
+      check measured.diagnostic == lrsOk
+      check measured.target == target
+      check measured.entry == nil
+      check measured.copiedLen == linuxAbsoluteJumpPatchSize
+      check measured.minPatchLen == linuxAbsoluteJumpPatchSize
+      check measured.unsupportedOffset == -1
+
+      let original = buildOriginalCallTrampoline(target)
+      check original.diagnostic == lrsOk
+      check original.entry != nil
+      check original.copiedLen == linuxAbsoluteJumpPatchSize
+      let originalFn = cast[TestFn](original.entry)
+      check originalFn() == 12
+
+      let tx = installAbsoluteJumpPatchTransaction(
+        target, cast[pointer](replacementValue), captureRestoreBytes = true)
+      check tx.diagnostic == lrsOk
+      check fn() == 42
+      check originalFn() == 12
+
+      var handle = tx.handle
+      check restoreAbsoluteJumpPatch(handle) == lrsOk
+      check fn() == 12
+
+    test "original-call trampoline rejects RIP-relative prologue":
+      let target = allocRipRelativeTarget()
+      check target != nil
+      let measured = measureOriginalCallTrampoline(target)
+      check measured.diagnostic == lrsUnsupportedInstruction
+      check measured.entry == nil
+      check measured.copiedLen == 0
+      check measured.unsupportedOffset == 0
+
+      let built = buildOriginalCallTrampoline(target)
+      check built.diagnostic == lrsUnsupportedInstruction
+      check built.entry == nil
+      check built.unsupportedOffset == 0
 
     test "transaction reports invalid target at validation stage":
       let tx = installAbsoluteJumpPatchTransaction(nil, cast[pointer](replacementValue))

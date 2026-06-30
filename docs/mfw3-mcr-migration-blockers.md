@@ -243,15 +243,18 @@ Still missing after M-FW-3E:
   install lifecycle;
 - live MCR migration of `recording/vdso_patch.nim` to the helper APIs.
 
-Why migration now would change behavior:
+M-FW-3J implementation pass:
 
-M-FW-3E covers image discovery from `AT_SYSINFO_EHDR`, bounded ELF
-dynamic-section symbol resolution, direct vDSO symbol patching, explicit
-page-aligned MAP_FIXED anonymous overlay fallback, and structured diagnostics.
-MCR migration still requires mapping MCR's time/getcpu trampoline bodies,
-event/replay semantics, recursion guard, target-list policy, and
-constructor/status lifecycle onto those helpers without changing the event
-stream or install behavior.
+`recording/vdso_patch.nim` now delegates live vDSO image discovery, exported
+symbol resolution, direct absolute-jump patch transactions, and explicit
+MAP_FIXED overlay fallback to `stackable_hooks/platform/linux_raw_syscalls`.
+MCR keeps `ct_vdso_install`, `ct_vdso_*` diagnostic exports, the exact
+time/getcpu target symbol list, per-symbol trampoline bodies, record/replay
+event schemas, recursion guards, constructor/status lifecycle, and the
+historical policy that overlay is attempted only after every resolved direct
+symbol patch fails with pre-patch `mprotect` refusal. This pass is complete
+after independent review; parent M-FW-3 remains partial until POSIX atomic/JIT
+migration and final review.
 
 ### POSIX Atomic and JIT Callsite Patching
 

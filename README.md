@@ -49,6 +49,13 @@ helpers for consumers that need to close direct syscall bypasses:
 - `installAbsoluteJumpPatchTransaction`, `installAbsoluteJumpPatch`,
   `installNamedAbsoluteJumpPatch`, and `restoreAbsoluteJumpPatch` for explicit
   wrapper/body-patch installation with structured diagnostics.
+- `locateLinuxVdsoImage`, `parseLinuxVdsoImageAt`,
+  `resolveLinuxVdsoSymbol`, `installLinuxVdsoSymbolPatchTransaction`, and
+  `installLinuxVdsoOverlayPatchTransaction` for policy-free vDSO image
+  discovery, ELF dynamic-symbol resolution, direct symbol patching, and an
+  explicit MAP_FIXED anonymous-overlay fallback. The helpers never hard-wire
+  MCR's time/getcpu target list; consumers supply symbol names and replacement
+  addresses.
 - `measureOriginalCallTrampoline` and `buildOriginalCallTrampoline` for
   conservative Linux x86_64 original-call trampolines: the helper decodes
   enough whole instructions to cover the patch window, copies the relocated
@@ -99,6 +106,17 @@ instructions, `syscall`, calls, jumps, returns, absolute moffs forms, and
 RIP-relative memory operands with `lrsUnsupportedInstruction` instead of
 relocating them incorrectly. It does not yet provide a full disassembler,
 RIP-relative relocation, or thread-suspension/install policy.
+
+The vDSO helpers are also low-level mechanisms. Live discovery parses the
+process vDSO from `AT_SYSINFO_EHDR` and resolves caller-supplied exported
+symbols from bounded ELF dynamic sections. Symbol-table walks use `DT_HASH`
+when available and otherwise fall back only to table layout bounded by the
+parsed image. Direct patching uses the existing absolute-jump transaction.
+Overlay patching is an explicit opt-in helper because `MAP_FIXED` replaces the
+mapped image with an anonymous copy; the overlay API requires a page-aligned
+range and tests exercise it only on disposable vDSO-shaped fixture mappings.
+Consumers own target lists, replacement trampoline bodies, event/replay policy,
+and the decision to allow overlay on a live vDSO.
 
 The INT3 raw-syscall helpers are also deliberately policy-free. They patch only
 consumer-selected callsites, expose the x86_64 register continuation contract,

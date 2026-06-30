@@ -130,6 +130,7 @@ when defined(linux) and defined(amd64):
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <elf.h>
 
 void *stackable_test_alloc_patch_target(void) {
   long page_size = sysconf(_SC_PAGESIZE);
@@ -196,6 +197,86 @@ void *stackable_test_alloc_syscall_scan_buffer(void) {
   return p;
 }
 
+void *stackable_test_alloc_vdso_fixture(int value) {
+  long page_size = sysconf(_SC_PAGESIZE);
+  if (page_size <= 0) page_size = 4096;
+  unsigned char *p = (unsigned char *)mmap(NULL, (size_t)page_size,
+      PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (p == MAP_FAILED) return NULL;
+  memset(p, 0, (size_t)page_size);
+
+  Elf64_Ehdr *eh = (Elf64_Ehdr *)p;
+  eh->e_ident[EI_MAG0] = ELFMAG0;
+  eh->e_ident[EI_MAG1] = ELFMAG1;
+  eh->e_ident[EI_MAG2] = ELFMAG2;
+  eh->e_ident[EI_MAG3] = ELFMAG3;
+  eh->e_ident[EI_CLASS] = ELFCLASS64;
+  eh->e_ident[EI_DATA] = ELFDATA2LSB;
+  eh->e_ident[EI_VERSION] = EV_CURRENT;
+  eh->e_type = ET_DYN;
+  eh->e_machine = EM_X86_64;
+  eh->e_version = EV_CURRENT;
+  eh->e_phoff = sizeof(Elf64_Ehdr);
+  eh->e_ehsize = sizeof(Elf64_Ehdr);
+  eh->e_phentsize = sizeof(Elf64_Phdr);
+  eh->e_phnum = 2;
+
+  Elf64_Phdr *ph = (Elf64_Phdr *)(p + eh->e_phoff);
+  ph[0].p_type = PT_LOAD;
+  ph[0].p_offset = 0;
+  ph[0].p_vaddr = 0;
+  ph[0].p_memsz = (Elf64_Xword)page_size;
+  ph[0].p_filesz = (Elf64_Xword)page_size;
+  ph[0].p_flags = PF_R | PF_X;
+  ph[0].p_align = (Elf64_Xword)page_size;
+  ph[1].p_type = PT_DYNAMIC;
+  ph[1].p_offset = 0x100;
+  ph[1].p_vaddr = 0x100;
+  ph[1].p_filesz = 5 * sizeof(Elf64_Dyn);
+  ph[1].p_memsz = 5 * sizeof(Elf64_Dyn);
+  ph[1].p_flags = PF_R;
+  ph[1].p_align = 8;
+
+  Elf64_Dyn *dyn = (Elf64_Dyn *)(p + 0x100);
+  dyn[0].d_tag = DT_SYMTAB; dyn[0].d_un.d_ptr = 0x180;
+  dyn[1].d_tag = DT_STRTAB; dyn[1].d_un.d_ptr = 0x220;
+  dyn[2].d_tag = DT_SYMENT; dyn[2].d_un.d_val = sizeof(Elf64_Sym);
+  dyn[3].d_tag = DT_STRSZ;  dyn[3].d_un.d_val = 32;
+  dyn[4].d_tag = DT_NULL;
+
+  Elf64_Sym *sym = (Elf64_Sym *)(p + 0x180);
+  memset(sym, 0, 2 * sizeof(Elf64_Sym));
+  sym[1].st_name = 1;
+  sym[1].st_info = ELF64_ST_INFO(STB_GLOBAL, STT_FUNC);
+  sym[1].st_shndx = 1;
+  sym[1].st_value = 0x300;
+  sym[1].st_size = 16;
+
+  char *str = (char *)(p + 0x220);
+  str[0] = '\0';
+  memcpy(str + 1, "__vdso_fixture", sizeof("__vdso_fixture"));
+
+  unsigned char code[16] = {
+    0xb8, 0x00, 0x00, 0x00, 0x00, 0xc3,
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+    0x90, 0x90
+  };
+  code[1] = (unsigned char)(value & 0xff);
+  code[2] = (unsigned char)((value >> 8) & 0xff);
+  code[3] = (unsigned char)((value >> 16) & 0xff);
+  code[4] = (unsigned char)((value >> 24) & 0xff);
+  memcpy(p + 0x300, code, sizeof(code));
+  return p;
+}
+
+void *stackable_test_alloc_vdso_fixture_bad_symbol(void) {
+  unsigned char *p = (unsigned char *)stackable_test_alloc_vdso_fixture(11);
+  if (p == NULL) return NULL;
+  Elf64_Sym *sym = (Elf64_Sym *)(p + 0x180);
+  sym[1].st_value = 0x5000;
+  return p;
+}
+
 int stackable_test_replacement_value(void) {
   return 42;
 }
@@ -211,6 +292,10 @@ int stackable_test_replacement_value(void) {
     {.importc: "stackable_test_replacement_value", cdecl.}
   proc allocSyscallScanBuffer(): pointer
     {.importc: "stackable_test_alloc_syscall_scan_buffer", cdecl.}
+  proc allocVdsoFixture(value: cint): pointer
+    {.importc: "stackable_test_alloc_vdso_fixture", cdecl.}
+  proc allocVdsoFixtureBadSymbol(): pointer
+    {.importc: "stackable_test_alloc_vdso_fixture_bad_symbol", cdecl.}
   proc cAbiLinkSmoke(): cint
     {.importc: "stackable_test_c_abi_link_smoke", cdecl.}
   proc ucontextHelpersSmoke(): cint
@@ -364,6 +449,88 @@ int stackable_test_replacement_value(void) {
         @[defaultSymbolResolver()]
       check resolveSymbolChain(cstring("syscall"), chain) != nil
       check resolveSymbolChain(cstring("__stackable_missing_symbol"), chain) == nil
+
+    test "live vDSO image discovery exposes structured diagnostics":
+      let image = locateLinuxVdsoImage()
+      check image.diagnostic in {lrsOk, lrsVdsoNotFound, lrsVdsoNotElf,
+                                 lrsVdsoNoDynamic, lrsVdsoNoSymbolTable}
+      if image.diagnostic == lrsOk:
+        check image.base != nil
+        check image.length > 0
+        check image.symbolTable != nil
+        check image.stringTable != nil
+        let missing = resolveLinuxVdsoSymbol(
+          image, cstring("__stackable_missing_vdso_symbol"))
+        check missing.diagnostic == lrsVdsoSymbolNotFound
+
+        for name in ["__vdso_clock_gettime", "__vdso_gettimeofday",
+                     "__vdso_time", "__vdso_getcpu", "__vdso_clock_getres"]:
+          let sym = resolveLinuxVdsoSymbol(image, cstring(name))
+          if sym.diagnostic == lrsOk:
+            check sym.address != nil
+            check sym.name == name
+          else:
+            check sym.diagnostic == lrsVdsoSymbolNotFound
+
+    test "controlled vDSO-shaped ELF fixture resolves symbols deterministically":
+      let fixture = allocVdsoFixture(31)
+      check fixture != nil
+      let image = parseLinuxVdsoImageAt(fixture)
+      check image.diagnostic == lrsOk
+      check image.base == fixture
+      check image.length >= 4096
+      check image.symbolCount >= 2
+      let sym = resolveLinuxVdsoSymbol(image, cstring("__vdso_fixture"))
+      check sym.diagnostic == lrsOk
+      check sym.address == cast[pointer](cast[uint](fixture) + 0x300'u)
+      check sym.size == 16
+      let missing = resolveLinuxVdsoSymbol(image, cstring("__vdso_absent"))
+      check missing.diagnostic == lrsVdsoSymbolNotFound
+
+    test "controlled vDSO fixture rejects out-of-image symbol values":
+      let fixture = allocVdsoFixtureBadSymbol()
+      check fixture != nil
+      let image = parseLinuxVdsoImageAt(fixture)
+      check image.diagnostic == lrsOk
+      let sym = resolveLinuxVdsoSymbol(image, cstring("__vdso_fixture"))
+      check sym.diagnostic == lrsVdsoSymbolNotFound
+
+    test "controlled vDSO symbol direct patch transaction does not touch live vDSO":
+      let fixture = allocVdsoFixture(31)
+      check fixture != nil
+      let image = parseLinuxVdsoImageAt(fixture)
+      check image.diagnostic == lrsOk
+      let sym = resolveLinuxVdsoSymbol(image, cstring("__vdso_fixture"))
+      check sym.diagnostic == lrsOk
+      let fn = cast[TestFn](sym.address)
+      check fn() == 31
+
+      let tx = installLinuxVdsoSymbolPatchTransaction(
+        image, cstring("__vdso_fixture"), cast[pointer](replacementValue))
+      check tx.diagnostic == lrsOk
+      check tx.path == lvppDirect
+      check tx.patchLive
+      check not tx.overlayUsed
+      check tx.symbol.address == sym.address
+      check fn() == 42
+
+    test "controlled vDSO overlay patch transaction uses disposable mapping only":
+      let fixture = allocVdsoFixture(23)
+      check fixture != nil
+      let image = parseLinuxVdsoImageAt(fixture)
+      check image.diagnostic == lrsOk
+      let sym = resolveLinuxVdsoSymbol(image, cstring("__vdso_fixture"))
+      check sym.diagnostic == lrsOk
+      let fn = cast[TestFn](sym.address)
+      check fn() == 23
+
+      let tx = installLinuxVdsoOverlayPatchTransaction(
+        fixture, image.length, sym.address, cast[pointer](replacementValue))
+      check tx.diagnostic == lrsOk
+      check tx.path == lvppOverlay
+      check tx.overlayUsed
+      check tx.patchLive
+      check fn() == 42
 
     test "duplicate patch book is optional and executable segment validation is reusable":
       clearLinuxPatchBook()

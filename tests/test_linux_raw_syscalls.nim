@@ -426,6 +426,8 @@ int stackable_test_replacement_value(void) {
     {.importc: "stackable_test_sigtrap_install_uninstall_smoke", cdecl.}
   proc liveInt3GetpidContinuation(): clong
     {.importc: "stackable_test_live_int3_getpid_continuation", cdecl.}
+  proc fixedPageInt3PatchSmoke(): cint
+    {.importc: "stackable_test_fixed_page_int3_patch_smoke", cdecl.}
 
   type TestFn = proc(): cint {.cdecl.}
 
@@ -711,6 +713,21 @@ int stackable_test_replacement_value(void) {
       check not handle.active
       check bytes[1] == linuxSyscallOpcode0
       check bytes[2] == linuxSyscallOpcode1
+
+    test "INT3 patch has a no-libc fixed-page-size ABI variant":
+      let buf = allocSyscallScanBuffer()
+      check buf != nil
+      let bytes = cast[ptr UncheckedArray[byte]](buf)
+      let site = cast[pointer](cast[uint](buf) + 1'u)
+      let tx = installInt3SyscallPatchTransaction(site, 4096'u)
+      check tx.diagnostic == lrsOk
+      check tx.patchLive
+      check tx.restoreByteCaptured
+      check bytes[1] == linuxInt3Opcode
+      var handle = tx.handle
+      check restoreInt3SyscallPatch(handle) == lrsOk
+      check bytes[1] == linuxSyscallOpcode0
+      check fixedPageInt3PatchSmoke() == 0
 
     test "INT3 patch rejects non-syscall controlled bytes":
       let target = allocPatchTarget()

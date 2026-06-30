@@ -73,7 +73,10 @@ helpers for consumers that need to close direct syscall bypasses:
   raw-syscall callsite lookup suitable for signal-handler dispatch.
 - `installInt3SyscallPatchTransaction` and `restoreInt3SyscallPatch` for
   replacing byte 0 of a selected `0f 05` instruction with `INT3` and restoring
-  the original byte.
+  the original byte. A fixed-page-size overload and
+  `stackable_linux_patch_int3_syscall_tx_fixed_page` C ABI are available for
+  static-runtime/no-libc consumers that already know the page size and must not
+  call libc `sysconf` inside the patch helper.
 - `captureLinuxX8664SyscallRegisters`, `writeLinuxX8664SyscallResult`, and
   `replayLinuxX8664SyscallRegisters` for policy-free Linux x86_64 `ucontext_t`
   register extraction, result/RIP writeback, and raw replay of the captured

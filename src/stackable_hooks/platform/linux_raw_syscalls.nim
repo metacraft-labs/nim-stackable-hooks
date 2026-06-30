@@ -33,6 +33,13 @@ type
     lrsNotSyscallSite = "not-syscall-site"
     lrsTrapInstallFailed = "trap-install-failed"
     lrsTrapChainUnavailable = "trap-chain-unavailable"
+    lrsVdsoNotFound = "vdso-not-found"
+    lrsVdsoNotElf = "vdso-not-elf"
+    lrsVdsoNoDynamic = "vdso-no-dynamic"
+    lrsVdsoNoSymbolTable = "vdso-no-symbol-table"
+    lrsVdsoSymbolNotFound = "vdso-symbol-not-found"
+    lrsVdsoDirectPatchFailed = "vdso-direct-patch-failed"
+    lrsVdsoOverlayFailed = "vdso-overlay-failed"
 
   LinuxPatchStage* = enum
     lpsNone = "none"
@@ -133,6 +140,52 @@ type
     childResult*: int
     childResumeRip*: uint
 
+  LinuxVdsoImage* = object
+    ## Policy-free description of a parsed Linux x86_64 vDSO image. The image
+    ## can be the live process vDSO or a controlled fixture with the same ELF
+    ## dynamic-symbol shape.
+    base*: pointer
+    length*: int
+    loadMaxAddress*: uint
+    dynamicAddress*: pointer
+    symbolTable*: pointer
+    stringTable*: pointer
+    symbolEntrySize*: int
+    symbolCount*: int
+    stringTableSize*: int
+    diagnostic*: LinuxRawSyscallDiagnostic
+    osErrno*: cint
+
+  LinuxVdsoSymbol* = object
+    name*: string
+    address*: pointer
+    size*: int
+    info*: byte
+    other*: byte
+    sectionIndex*: int
+    diagnostic*: LinuxRawSyscallDiagnostic
+
+  LinuxVdsoPatchPath* = enum
+    lvppNone = "none"
+    lvppDirect = "direct"
+    lvppOverlay = "overlay"
+
+  LinuxVdsoPatchTransaction* = object
+    ## vDSO-specific patch transaction. It resolves one caller-supplied symbol
+    ## name inside one caller-supplied image and patches it to the caller's
+    ## replacement. No target list, event policy, or replay behavior is implied.
+    image*: LinuxVdsoImage
+    symbol*: LinuxVdsoSymbol
+    replacement*: pointer
+    path*: LinuxVdsoPatchPath
+    diagnostic*: LinuxRawSyscallDiagnostic
+    directDiagnostic*: LinuxRawSyscallDiagnostic
+    overlayDiagnostic*: LinuxRawSyscallDiagnostic
+    osErrno*: cint
+    patchLive*: bool
+    overlayUsed*: bool
+    direct*: LinuxPatchTransaction
+
   LinuxSymbolResolverKind* = enum
     lsrDefault = "rtld-default"
     lsrHandle = "handle"
@@ -211,6 +264,44 @@ type CStackableLinuxCloneContinuation {.importc: "struct stackable_linux_clone_c
   childResult {.importc: "child_result".}: clong
   childResumeRip {.importc: "child_resume_rip".}: culong
 
+type CStackableLinuxVdsoImage {.importc: "struct stackable_linux_vdso_image",
+                                bycopy.} = object
+  diagnostic {.importc: "diagnostic".}: cint
+  osErrno {.importc: "os_errno".}: cint
+  base {.importc: "base".}: culong
+  length {.importc: "length".}: culong
+  loadMaxAddress {.importc: "load_max_address".}: culong
+  dynamicAddress {.importc: "dynamic_address".}: culong
+  symbolTable {.importc: "symbol_table".}: culong
+  stringTable {.importc: "string_table".}: culong
+  symbolEntrySize {.importc: "symbol_entry_size".}: culong
+  symbolCount {.importc: "symbol_count".}: culong
+  stringTableSize {.importc: "string_table_size".}: culong
+
+type CStackableLinuxVdsoSymbol {.importc: "struct stackable_linux_vdso_symbol",
+                                 bycopy.} = object
+  diagnostic {.importc: "diagnostic".}: cint
+  address {.importc: "address".}: culong
+  size {.importc: "size".}: culong
+  info {.importc: "info".}: byte
+  other {.importc: "other".}: byte
+  sectionIndex {.importc: "section_index".}: cushort
+
+type CStackableLinuxVdsoPatchResult {.importc: "struct stackable_linux_vdso_patch_result",
+                                      bycopy.} = object
+  diagnostic {.importc: "diagnostic".}: cint
+  path {.importc: "path".}: cint
+  directDiagnostic {.importc: "direct_diagnostic".}: cint
+  overlayDiagnostic {.importc: "overlay_diagnostic".}: cint
+  osErrno {.importc: "os_errno".}: cint
+  patchLive {.importc: "patch_live".}: cint
+  overlayUsed {.importc: "overlay_used".}: cint
+  imageBase {.importc: "image_base".}: culong
+  imageLength {.importc: "image_length".}: culong
+  symbolAddress {.importc: "symbol_address".}: culong
+  replacement {.importc: "replacement".}: culong
+  direct {.importc: "direct".}: CStackableLinuxPatchResult
+
 const
   linuxSyscallOpcode0* = byte 0x0f
   linuxSyscallOpcode1* = byte 0x05
@@ -244,8 +335,11 @@ when defined(linux) and defined(amd64):
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/auxv.h>
 #include <signal.h>
 #include <ucontext.h>
+#include <elf.h>
+#include <stdlib.h>
 
 #ifndef STACKABLE_LINUX_RTLD_NOLOAD
 #define STACKABLE_LINUX_RTLD_NOLOAD RTLD_NOLOAD
@@ -268,7 +362,14 @@ enum {
   STACKABLE_LINUX_PATCH_TRAMPOLINE_BUILD_FAILED = 13,
   STACKABLE_LINUX_PATCH_NOT_SYSCALL_SITE = 14,
   STACKABLE_LINUX_PATCH_TRAP_INSTALL_FAILED = 15,
-  STACKABLE_LINUX_PATCH_TRAP_CHAIN_UNAVAILABLE = 16
+  STACKABLE_LINUX_PATCH_TRAP_CHAIN_UNAVAILABLE = 16,
+  STACKABLE_LINUX_PATCH_VDSO_NOT_FOUND = 17,
+  STACKABLE_LINUX_PATCH_VDSO_NOT_ELF = 18,
+  STACKABLE_LINUX_PATCH_VDSO_NO_DYNAMIC = 19,
+  STACKABLE_LINUX_PATCH_VDSO_NO_SYMBOL_TABLE = 20,
+  STACKABLE_LINUX_PATCH_VDSO_SYMBOL_NOT_FOUND = 21,
+  STACKABLE_LINUX_PATCH_VDSO_DIRECT_PATCH_FAILED = 22,
+  STACKABLE_LINUX_PATCH_VDSO_OVERLAY_FAILED = 23
 };
 
 enum {
@@ -332,6 +433,44 @@ struct stackable_linux_clone_continuation {
   unsigned long parent_resume_rip;
   long child_result;
   unsigned long child_resume_rip;
+};
+
+struct stackable_linux_vdso_image {
+  int diagnostic;
+  int os_errno;
+  unsigned long base;
+  unsigned long length;
+  unsigned long load_max_address;
+  unsigned long dynamic_address;
+  unsigned long symbol_table;
+  unsigned long string_table;
+  unsigned long symbol_entry_size;
+  unsigned long symbol_count;
+  unsigned long string_table_size;
+};
+
+struct stackable_linux_vdso_symbol {
+  int diagnostic;
+  unsigned long address;
+  unsigned long size;
+  unsigned char info;
+  unsigned char other;
+  unsigned short section_index;
+};
+
+struct stackable_linux_vdso_patch_result {
+  int diagnostic;
+  int path;
+  int direct_diagnostic;
+  int overlay_diagnostic;
+  int os_errno;
+  int patch_live;
+  int overlay_used;
+  unsigned long image_base;
+  unsigned long image_length;
+  unsigned long symbol_address;
+  unsigned long replacement;
+  struct stackable_linux_patch_result direct;
 };
 
 void stackable_linux_rt_sigreturn_restorer(void);
@@ -989,6 +1128,414 @@ int stackable_linux_addr_in_executable_segment(unsigned long addr) {
   return q.found_in_text;
 }
 
+static void stackable_linux_init_vdso_image(
+    struct stackable_linux_vdso_image *out) {
+  if (out == NULL) return;
+  memset(out, 0, sizeof(*out));
+  out->diagnostic = STACKABLE_LINUX_PATCH_OK;
+}
+
+static unsigned long stackable_linux_vdso_ptr_value(unsigned long raw,
+                                                    unsigned long base,
+                                                    unsigned long load_max) {
+  if (raw < load_max || raw < base) return base + raw;
+  return raw;
+}
+
+static int stackable_linux_range_contains(unsigned long base,
+                                          unsigned long length,
+                                          unsigned long addr,
+                                          unsigned long size) {
+  if (base == 0 || length == 0 || addr < base) return 0;
+  unsigned long stop = base + length;
+  if (stop <= base) return 0;
+  unsigned long end = addr + size;
+  if (end < addr) return 0;
+  return end <= stop;
+}
+
+static int stackable_linux_vdso_offset_range(unsigned long offset,
+                                             unsigned long size,
+                                             unsigned long length) {
+  if (length == 0 || offset > length) return 0;
+  if (size > length - offset) return 0;
+  return 1;
+}
+
+static int stackable_linux_parse_vdso_image(
+    unsigned long base_addr, struct stackable_linux_vdso_image *out) {
+  stackable_linux_init_vdso_image(out);
+  if (base_addr == 0) {
+    if (out) out->diagnostic = STACKABLE_LINUX_PATCH_VDSO_NOT_FOUND;
+    return STACKABLE_LINUX_PATCH_VDSO_NOT_FOUND;
+  }
+  if (out) out->base = base_addr;
+
+  unsigned char *base = (unsigned char *)(uintptr_t)base_addr;
+  Elf64_Ehdr ehdr;
+  memcpy(&ehdr, base, sizeof(ehdr));
+  if (ehdr.e_ident[EI_MAG0] != ELFMAG0 ||
+      ehdr.e_ident[EI_MAG1] != ELFMAG1 ||
+      ehdr.e_ident[EI_MAG2] != ELFMAG2 ||
+      ehdr.e_ident[EI_MAG3] != ELFMAG3 ||
+      ehdr.e_ident[EI_CLASS] != ELFCLASS64 ||
+      ehdr.e_ident[EI_DATA] != ELFDATA2LSB ||
+      ehdr.e_machine != EM_X86_64 ||
+      ehdr.e_phoff == 0 || ehdr.e_phnum == 0 ||
+      ehdr.e_phnum > 64 ||
+      ehdr.e_phentsize < sizeof(Elf64_Phdr) ||
+      ehdr.e_phoff > 1024 * 1024 ||
+      (unsigned long)ehdr.e_phnum >
+          ((1024 * 1024UL - (unsigned long)ehdr.e_phoff) /
+           (unsigned long)ehdr.e_phentsize)) {
+    if (out) out->diagnostic = STACKABLE_LINUX_PATCH_VDSO_NOT_ELF;
+    return STACKABLE_LINUX_PATCH_VDSO_NOT_ELF;
+  }
+
+  unsigned long dyn_off = 0;
+  unsigned long dyn_size = 0;
+  unsigned long load_max = 0;
+  for (int i = 0; i < ehdr.e_phnum; i++) {
+    Elf64_Phdr phdr;
+    memcpy(&phdr, base + ehdr.e_phoff + (size_t)i * ehdr.e_phentsize,
+           sizeof(phdr));
+    if (phdr.p_type == PT_DYNAMIC) {
+      dyn_off = (unsigned long)phdr.p_offset;
+      dyn_size = (unsigned long)phdr.p_filesz;
+    }
+    if (phdr.p_type == PT_LOAD) {
+      unsigned long end = (unsigned long)phdr.p_vaddr +
+                          (unsigned long)phdr.p_memsz;
+      if (end < (unsigned long)phdr.p_vaddr || end > 1024 * 1024UL) {
+        if (out) out->diagnostic = STACKABLE_LINUX_PATCH_VDSO_NOT_ELF;
+        return STACKABLE_LINUX_PATCH_VDSO_NOT_ELF;
+      }
+      if (end > load_max) load_max = end;
+    }
+  }
+  if (load_max == 0 || load_max > 1024 * 1024UL) {
+    if (out) out->diagnostic = STACKABLE_LINUX_PATCH_VDSO_NOT_ELF;
+    return STACKABLE_LINUX_PATCH_VDSO_NOT_ELF;
+  }
+  if (base_addr + load_max <= base_addr) {
+    if (out) out->diagnostic = STACKABLE_LINUX_PATCH_VDSO_NOT_ELF;
+    return STACKABLE_LINUX_PATCH_VDSO_NOT_ELF;
+  }
+  if (out) {
+    out->load_max_address = load_max;
+    out->length = load_max;
+  }
+  if (dyn_off == 0 || dyn_size == 0 ||
+      !stackable_linux_vdso_offset_range(dyn_off, sizeof(Elf64_Dyn), load_max)) {
+    if (out) out->diagnostic = STACKABLE_LINUX_PATCH_VDSO_NO_DYNAMIC;
+    return STACKABLE_LINUX_PATCH_VDSO_NO_DYNAMIC;
+  }
+  if (dyn_size > load_max - dyn_off) dyn_size = load_max - dyn_off;
+
+  unsigned long symtab_v = 0, strtab_v = 0, syment = 0, strsz = 0, hash_v = 0;
+  Elf64_Dyn *dynp = (Elf64_Dyn *)(base + dyn_off);
+  unsigned long dyn_count = dyn_size / sizeof(Elf64_Dyn);
+  for (unsigned long i = 0; i < dyn_count; i++) {
+    Elf64_Dyn d;
+    memcpy(&d, &dynp[i], sizeof(d));
+    if (d.d_tag == DT_NULL) break;
+    switch (d.d_tag) {
+      case DT_SYMTAB: symtab_v = (unsigned long)d.d_un.d_ptr; break;
+      case DT_STRTAB: strtab_v = (unsigned long)d.d_un.d_ptr; break;
+      case DT_SYMENT: syment = (unsigned long)d.d_un.d_val; break;
+      case DT_STRSZ: strsz = (unsigned long)d.d_un.d_val; break;
+      case DT_HASH: hash_v = (unsigned long)d.d_un.d_ptr; break;
+      default: break;
+    }
+  }
+  if (symtab_v == 0 || strtab_v == 0 || syment < sizeof(Elf64_Sym) ||
+      strsz == 0 || strsz > load_max) {
+    if (out) out->diagnostic = STACKABLE_LINUX_PATCH_VDSO_NO_SYMBOL_TABLE;
+    return STACKABLE_LINUX_PATCH_VDSO_NO_SYMBOL_TABLE;
+  }
+
+  unsigned long symtab_p =
+      stackable_linux_vdso_ptr_value(symtab_v, base_addr, load_max);
+  unsigned long strtab_p =
+      stackable_linux_vdso_ptr_value(strtab_v, base_addr, load_max);
+  if (!stackable_linux_range_contains(base_addr, load_max, strtab_p, strsz) ||
+      !stackable_linux_range_contains(base_addr, load_max, symtab_p,
+                                      sizeof(Elf64_Sym))) {
+    if (out) out->diagnostic = STACKABLE_LINUX_PATCH_VDSO_NO_SYMBOL_TABLE;
+    return STACKABLE_LINUX_PATCH_VDSO_NO_SYMBOL_TABLE;
+  }
+
+  unsigned long symcount = 256;
+  if (hash_v != 0) {
+    unsigned long hash_p =
+        stackable_linux_vdso_ptr_value(hash_v, base_addr, load_max);
+    if (stackable_linux_range_contains(base_addr, load_max, hash_p,
+                                       2 * sizeof(uint32_t))) {
+      uint32_t nchain = 0;
+      memcpy(&nchain, (void *)(uintptr_t)(hash_p + sizeof(uint32_t)),
+             sizeof(nchain));
+      if (nchain > 0) symcount = nchain;
+    }
+  } else if (strtab_p > symtab_p && ((strtab_p - symtab_p) % syment) == 0) {
+    symcount = (strtab_p - symtab_p) / syment;
+  }
+  unsigned long max_by_range = (base_addr + load_max - symtab_p) / syment;
+  if (symcount > max_by_range) symcount = max_by_range;
+  if (symcount == 0 || symcount > 4096) {
+    if (out) out->diagnostic = STACKABLE_LINUX_PATCH_VDSO_NO_SYMBOL_TABLE;
+    return STACKABLE_LINUX_PATCH_VDSO_NO_SYMBOL_TABLE;
+  }
+
+  if (out) {
+    out->diagnostic = STACKABLE_LINUX_PATCH_OK;
+    out->dynamic_address = base_addr + dyn_off;
+    out->symbol_table = symtab_p;
+    out->string_table = strtab_p;
+    out->symbol_entry_size = syment;
+    out->symbol_count = symcount;
+    out->string_table_size = strsz;
+  }
+  return STACKABLE_LINUX_PATCH_OK;
+}
+
+int stackable_linux_locate_vdso_image(struct stackable_linux_vdso_image *out) {
+  stackable_linux_init_vdso_image(out);
+  unsigned long base = (unsigned long)getauxval(AT_SYSINFO_EHDR);
+  if (base == 0) {
+    if (out) out->diagnostic = STACKABLE_LINUX_PATCH_VDSO_NOT_FOUND;
+    return STACKABLE_LINUX_PATCH_VDSO_NOT_FOUND;
+  }
+  return stackable_linux_parse_vdso_image(base, out);
+}
+
+int stackable_linux_parse_vdso_image_at(
+    unsigned long base, struct stackable_linux_vdso_image *out) {
+  return stackable_linux_parse_vdso_image(base, out);
+}
+
+int stackable_linux_resolve_vdso_symbol(
+    struct stackable_linux_vdso_image *image, char *name,
+    struct stackable_linux_vdso_symbol *out) {
+  if (out) memset(out, 0, sizeof(*out));
+  if (image == NULL || name == NULL || name[0] == '\0') {
+    if (out) out->diagnostic = STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+    return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+  }
+  if (image->diagnostic != STACKABLE_LINUX_PATCH_OK ||
+      image->base == 0 || image->symbol_table == 0 ||
+      image->string_table == 0 || image->symbol_entry_size == 0 ||
+      image->string_table_size == 0) {
+    if (out) out->diagnostic = STACKABLE_LINUX_PATCH_VDSO_NO_SYMBOL_TABLE;
+    return STACKABLE_LINUX_PATCH_VDSO_NO_SYMBOL_TABLE;
+  }
+
+  size_t nlen = strlen(name);
+  unsigned long symcount = image->symbol_count;
+  if (symcount == 0 || symcount > 4096) symcount = 256;
+  for (unsigned long i = 0; i < symcount; i++) {
+    unsigned long sym_addr = image->symbol_table + i * image->symbol_entry_size;
+    if (!stackable_linux_range_contains(image->base, image->length, sym_addr,
+                                        sizeof(Elf64_Sym))) break;
+    Elf64_Sym sym;
+    memcpy(&sym, (void *)(uintptr_t)sym_addr, sizeof(sym));
+    if (sym.st_name == 0 || sym.st_name >= image->string_table_size) continue;
+    const char *sname = (const char *)(uintptr_t)(image->string_table + sym.st_name);
+    size_t maxlen = image->string_table_size - sym.st_name;
+    if (strnlen(sname, maxlen) >= maxlen) continue;
+    if (strlen(sname) != nlen) continue;
+    if (memcmp(sname, name, nlen) != 0) continue;
+    unsigned long value = (unsigned long)sym.st_value;
+    unsigned long addr = stackable_linux_vdso_ptr_value(
+        value, image->base, image->load_max_address);
+    if (!stackable_linux_range_contains(image->base, image->length, addr, 1))
+      continue;
+    if (out) {
+      out->diagnostic = STACKABLE_LINUX_PATCH_OK;
+      out->address = addr;
+      out->size = (unsigned long)sym.st_size;
+      out->info = sym.st_info;
+      out->other = sym.st_other;
+      out->section_index = sym.st_shndx;
+    }
+    return STACKABLE_LINUX_PATCH_OK;
+  }
+  if (out) out->diagnostic = STACKABLE_LINUX_PATCH_VDSO_SYMBOL_NOT_FOUND;
+  return STACKABLE_LINUX_PATCH_VDSO_SYMBOL_NOT_FOUND;
+}
+
+static void stackable_linux_init_vdso_patch_result(
+    struct stackable_linux_vdso_patch_result *out,
+    struct stackable_linux_vdso_image *image,
+    void *replacement) {
+  if (out == NULL) return;
+  memset(out, 0, sizeof(*out));
+  out->diagnostic = STACKABLE_LINUX_PATCH_OK;
+  out->direct_diagnostic = STACKABLE_LINUX_PATCH_OK;
+  out->overlay_diagnostic = STACKABLE_LINUX_PATCH_OK;
+  out->image_base = image ? image->base : 0;
+  out->image_length = image ? image->length : 0;
+  out->replacement = (unsigned long)(uintptr_t)replacement;
+}
+
+int stackable_linux_vdso_overlay_patch_tx(
+    unsigned long image_base, unsigned long image_len,
+    void *target, void *replacement,
+    struct stackable_linux_vdso_patch_result *out) {
+  struct stackable_linux_vdso_image image;
+  memset(&image, 0, sizeof(image));
+  image.base = image_base;
+  image.length = image_len;
+  image.diagnostic = STACKABLE_LINUX_PATCH_OK;
+  stackable_linux_init_vdso_patch_result(out, &image, replacement);
+  if (out) out->path = 2;
+  if (image_base == 0 || image_len == 0 || target == NULL || replacement == NULL) {
+    if (out) out->diagnostic = STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+    return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+  }
+
+  uintptr_t base = (uintptr_t)image_base;
+  uintptr_t stop = base + (uintptr_t)image_len;
+  uintptr_t t = (uintptr_t)target;
+  if (stop <= base || t < base || t + 14 > stop) {
+    if (out) out->diagnostic = STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+    return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+  }
+
+  long page_size = sysconf(_SC_PAGESIZE);
+  if (page_size <= 0) page_size = 4096;
+  uintptr_t page_mask = (uintptr_t)(page_size - 1);
+  if ((base & page_mask) != 0 || (stop & page_mask) != 0) {
+    if (out) out->diagnostic = STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+    return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+  }
+  uintptr_t aligned_base = base & ~page_mask;
+  uintptr_t aligned_end = (stop + page_mask) & ~page_mask;
+  size_t span = (size_t)(aligned_end - aligned_base);
+  if (span == 0 || span > (size_t)(1024 * 1024)) {
+    if (out) out->diagnostic = STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+    return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+  }
+
+  unsigned char *snapshot = (unsigned char *)malloc(span);
+  if (snapshot == NULL) {
+    if (out) {
+      out->diagnostic = STACKABLE_LINUX_PATCH_VDSO_OVERLAY_FAILED;
+      out->overlay_diagnostic = STACKABLE_LINUX_PATCH_VDSO_OVERLAY_FAILED;
+      out->os_errno = ENOMEM;
+    }
+    return STACKABLE_LINUX_PATCH_VDSO_OVERLAY_FAILED;
+  }
+  memcpy(snapshot, (void *)aligned_base, span);
+
+  long mapped = stackable_linux_raw_mmap((void *)aligned_base, span,
+      PROT_READ | PROT_WRITE | PROT_EXEC,
+      MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (mapped < 0 || (uintptr_t)mapped != aligned_base) {
+    if (out) {
+      out->diagnostic = STACKABLE_LINUX_PATCH_VDSO_OVERLAY_FAILED;
+      out->overlay_diagnostic = STACKABLE_LINUX_PATCH_VDSO_OVERLAY_FAILED;
+      out->os_errno = mapped < 0 ? (int)(-mapped) : EINVAL;
+    }
+    free(snapshot);
+    return STACKABLE_LINUX_PATCH_VDSO_OVERLAY_FAILED;
+  }
+
+  memcpy((void *)aligned_base, snapshot, span);
+  free(snapshot);
+  stackable_linux_write_abs_jump((unsigned char *)target, replacement);
+
+  long protect_rc = stackable_linux_raw_mprotect(aligned_base, span,
+                                                 PROT_READ | PROT_EXEC);
+  if (protect_rc < 0 && out) {
+    out->os_errno = (int)(-protect_rc);
+  }
+  if (out) {
+    out->diagnostic = STACKABLE_LINUX_PATCH_OK;
+    out->overlay_diagnostic = STACKABLE_LINUX_PATCH_OK;
+    out->path = 2;
+    out->patch_live = 1;
+    out->overlay_used = 1;
+    out->symbol_address = (unsigned long)(uintptr_t)target;
+  }
+  return STACKABLE_LINUX_PATCH_OK;
+}
+
+int stackable_linux_vdso_patch_symbol_tx(
+    struct stackable_linux_vdso_image *image, char *name,
+    void *replacement, int allow_overlay,
+    struct stackable_linux_vdso_patch_result *out) {
+  stackable_linux_init_vdso_patch_result(out, image, replacement);
+  if (image == NULL || name == NULL || name[0] == '\0' || replacement == NULL) {
+    if (out) out->diagnostic = STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+    return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+  }
+  if (image->diagnostic != STACKABLE_LINUX_PATCH_OK) {
+    if (out) out->diagnostic = image->diagnostic;
+    return image->diagnostic;
+  }
+
+  struct stackable_linux_vdso_symbol sym;
+  int rc = stackable_linux_resolve_vdso_symbol(image, name, &sym);
+  if (rc != STACKABLE_LINUX_PATCH_OK) {
+    if (out) out->diagnostic = rc;
+    return rc;
+  }
+  if (out) out->symbol_address = sym.address;
+  if (!stackable_linux_range_contains(image->base, image->length,
+                                      sym.address, 14)) {
+    if (out) out->diagnostic = STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+    return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+  }
+
+  struct stackable_linux_patch_result direct;
+  memset(&direct, 0, sizeof(direct));
+  rc = stackable_linux_patch_absolute_jump_tx(
+      (void *)(uintptr_t)sym.address, replacement, 1, &direct);
+  if (out) {
+    out->direct = direct;
+    out->direct_diagnostic = direct.diagnostic;
+  }
+  if (rc == STACKABLE_LINUX_PATCH_OK ||
+      (rc == STACKABLE_LINUX_PATCH_POST_MPROTECT_BACK_FAILED &&
+       direct.patch_live)) {
+    if (out) {
+      out->diagnostic = STACKABLE_LINUX_PATCH_OK;
+      out->path = 1;
+      out->patch_live = 1;
+      out->os_errno = direct.os_errno;
+    }
+    return STACKABLE_LINUX_PATCH_OK;
+  }
+
+  if (!allow_overlay) {
+    if (out) {
+      out->diagnostic = STACKABLE_LINUX_PATCH_VDSO_DIRECT_PATCH_FAILED;
+      out->os_errno = direct.os_errno;
+      out->patch_live = direct.patch_live;
+    }
+    return STACKABLE_LINUX_PATCH_VDSO_DIRECT_PATCH_FAILED;
+  }
+
+  struct stackable_linux_vdso_patch_result overlay;
+  memset(&overlay, 0, sizeof(overlay));
+  rc = stackable_linux_vdso_overlay_patch_tx(
+      image->base, image->length, (void *)(uintptr_t)sym.address,
+      replacement, &overlay);
+  if (out) {
+    out->overlay_diagnostic = overlay.diagnostic;
+    out->os_errno = overlay.os_errno;
+    out->path = overlay.path;
+    out->patch_live = overlay.patch_live;
+    out->overlay_used = overlay.overlay_used;
+  }
+  if (rc == STACKABLE_LINUX_PATCH_OK) {
+    if (out) out->diagnostic = STACKABLE_LINUX_PATCH_OK;
+    return STACKABLE_LINUX_PATCH_OK;
+  }
+  if (out) out->diagnostic = STACKABLE_LINUX_PATCH_VDSO_OVERLAY_FAILED;
+  return STACKABLE_LINUX_PATCH_VDSO_OVERLAY_FAILED;
+}
+
 #define STACKABLE_LINUX_PATCH_REGISTRY_CAP 256
 static unsigned long stackable_linux_patch_registry[STACKABLE_LINUX_PATCH_REGISTRY_CAP];
 static int stackable_linux_patch_registry_count = 0;
@@ -1172,6 +1719,20 @@ int stackable_linux_chain_sigtrap(int signum, void *siginfo_ptr,
     {.importc: "stackable_linux_uninstall_sigtrap_handler", cdecl.}
   proc cChainSigtrap(signum: cint; siginfo: pointer; ucontext: pointer): cint
     {.importc: "stackable_linux_chain_sigtrap", cdecl.}
+  proc cLocateVdsoImage(outImage: ptr CStackableLinuxVdsoImage): cint
+    {.importc: "stackable_linux_locate_vdso_image", cdecl.}
+  proc cParseVdsoImageAt(base: culong; outImage: ptr CStackableLinuxVdsoImage): cint
+    {.importc: "stackable_linux_parse_vdso_image_at", cdecl.}
+  proc cResolveVdsoSymbol(image: ptr CStackableLinuxVdsoImage; name: cstring;
+                          outSymbol: ptr CStackableLinuxVdsoSymbol): cint
+    {.importc: "stackable_linux_resolve_vdso_symbol", cdecl.}
+  proc cVdsoOverlayPatchTx(imageBase, imageLen: culong; target, replacement: pointer;
+                           outResult: ptr CStackableLinuxVdsoPatchResult): cint
+    {.importc: "stackable_linux_vdso_overlay_patch_tx", cdecl.}
+  proc cVdsoPatchSymbolTx(image: ptr CStackableLinuxVdsoImage; name: cstring;
+                          replacement: pointer; allowOverlay: cint;
+                          outResult: ptr CStackableLinuxVdsoPatchResult): cint
+    {.importc: "stackable_linux_vdso_patch_symbol_tx", cdecl.}
 
 proc rawSyscall6*(nr, a1, a2, a3, a4, a5, a6: int): int =
   ## Issue a Linux x86_64 raw syscall using the kernel calling convention.
@@ -1286,6 +1847,13 @@ proc toDiagnostic(rc: cint): LinuxRawSyscallDiagnostic {.used.} =
   of 14: lrsNotSyscallSite
   of 15: lrsTrapInstallFailed
   of 16: lrsTrapChainUnavailable
+  of 17: lrsVdsoNotFound
+  of 18: lrsVdsoNotElf
+  of 19: lrsVdsoNoDynamic
+  of 20: lrsVdsoNoSymbolTable
+  of 21: lrsVdsoSymbolNotFound
+  of 22: lrsVdsoDirectPatchFailed
+  of 23: lrsVdsoOverlayFailed
   else: lrsPatchWriteFailed
 
 proc toPatchStage(stage: cint): LinuxPatchStage {.used.} =
@@ -1382,6 +1950,79 @@ proc fromCCloneContinuation(cres: CStackableLinuxCloneContinuation):
   else:
     discard
 
+proc fromCVdsoImage(cres: CStackableLinuxVdsoImage): LinuxVdsoImage {.used.} =
+  when defined(linux) and defined(amd64):
+    result.base = cast[pointer](cres.base)
+    result.length = int(cres.length)
+    result.loadMaxAddress = uint(cres.loadMaxAddress)
+    result.dynamicAddress = cast[pointer](cres.dynamicAddress)
+    result.symbolTable = cast[pointer](cres.symbolTable)
+    result.stringTable = cast[pointer](cres.stringTable)
+    result.symbolEntrySize = int(cres.symbolEntrySize)
+    result.symbolCount = int(cres.symbolCount)
+    result.stringTableSize = int(cres.stringTableSize)
+    result.diagnostic = toDiagnostic(cres.diagnostic)
+    result.osErrno = cres.osErrno
+  else:
+    discard
+
+proc toCVdsoImage(image: LinuxVdsoImage): CStackableLinuxVdsoImage {.used.} =
+  when defined(linux) and defined(amd64):
+    result.diagnostic = cint(ord(image.diagnostic))
+    result.osErrno = image.osErrno
+    result.base = culong(cast[uint](image.base))
+    result.length = culong(image.length)
+    result.loadMaxAddress = culong(image.loadMaxAddress)
+    result.dynamicAddress = culong(cast[uint](image.dynamicAddress))
+    result.symbolTable = culong(cast[uint](image.symbolTable))
+    result.stringTable = culong(cast[uint](image.stringTable))
+    result.symbolEntrySize = culong(image.symbolEntrySize)
+    result.symbolCount = culong(image.symbolCount)
+    result.stringTableSize = culong(image.stringTableSize)
+  else:
+    discard
+
+proc fromCVdsoSymbol(cres: CStackableLinuxVdsoSymbol;
+                     name: cstring): LinuxVdsoSymbol {.used.} =
+  when defined(linux) and defined(amd64):
+    result.name = if name == nil: "" else: $name
+    result.address = cast[pointer](cres.address)
+    result.size = int(cres.size)
+    result.info = cres.info
+    result.other = cres.other
+    result.sectionIndex = int(cres.sectionIndex)
+    result.diagnostic = toDiagnostic(cres.diagnostic)
+  else:
+    discard
+
+proc fromCVdsoPatch(cres: CStackableLinuxVdsoPatchResult;
+                    image: LinuxVdsoImage;
+                    name: cstring): LinuxVdsoPatchTransaction {.used.} =
+  when defined(linux) and defined(amd64):
+    result.image = image
+    result.symbol = LinuxVdsoSymbol(
+      name: if name == nil: "" else: $name,
+      address: cast[pointer](cres.symbolAddress),
+      diagnostic: if cres.symbolAddress == 0:
+        toDiagnostic(cres.diagnostic)
+      else:
+        lrsOk)
+    result.replacement = cast[pointer](cres.replacement)
+    result.path =
+      case int(cres.path)
+      of 1: lvppDirect
+      of 2: lvppOverlay
+      else: lvppNone
+    result.diagnostic = toDiagnostic(cres.diagnostic)
+    result.directDiagnostic = toDiagnostic(cres.directDiagnostic)
+    result.overlayDiagnostic = toDiagnostic(cres.overlayDiagnostic)
+    result.osErrno = cres.osErrno
+    result.patchLive = cres.patchLive != 0
+    result.overlayUsed = cres.overlayUsed != 0
+    result.direct = fromCTransaction(cres.direct)
+  else:
+    discard
+
 proc installAbsoluteJumpPatchTransaction*(target, replacement: pointer;
                                           captureRestoreBytes = true): LinuxPatchTransaction =
   ## Install a 14-byte absolute jump and return stage-aware diagnostics. If the
@@ -1401,6 +2042,108 @@ proc installAbsoluteJumpPatchTransaction*(target, replacement: pointer;
   else:
     result.diagnostic = support
     result.handle.diagnostic = support
+
+proc locateLinuxVdsoImage*(): LinuxVdsoImage =
+  ## Locate and parse the live Linux x86_64 vDSO image via AT_SYSINFO_EHDR.
+  ## The returned image is only a description; no patching or target selection
+  ## occurs here.
+  let support = linuxRawSyscallSupported()
+  if support != lrsOk:
+    result.diagnostic = support
+    return
+  when defined(linux) and defined(amd64):
+    var cimage: CStackableLinuxVdsoImage
+    discard cLocateVdsoImage(addr cimage)
+    result = fromCVdsoImage(cimage)
+  else:
+    result.diagnostic = support
+
+proc parseLinuxVdsoImageAt*(base: pointer): LinuxVdsoImage =
+  ## Parse a vDSO-shaped ELF64 image at `base`. Exposed for deterministic
+  ## fixtures and for consumers that already found the image through another
+  ## mechanism. The helper does not verify that the pointer is the process vDSO.
+  let support = linuxRawSyscallSupported()
+  if support != lrsOk:
+    result.diagnostic = support
+    return
+  if base == nil:
+    result.diagnostic = lrsVdsoNotFound
+    return
+  when defined(linux) and defined(amd64):
+    var cimage: CStackableLinuxVdsoImage
+    discard cParseVdsoImageAt(culong(cast[uint](base)), addr cimage)
+    result = fromCVdsoImage(cimage)
+  else:
+    result.diagnostic = support
+
+proc resolveLinuxVdsoSymbol*(image: LinuxVdsoImage;
+                             name: cstring): LinuxVdsoSymbol =
+  ## Resolve one caller-supplied exported symbol name from a parsed vDSO image.
+  ## No MCR target list or trampoline policy is embedded in this lookup.
+  let support = linuxRawSyscallSupported()
+  if support != lrsOk:
+    result.diagnostic = support
+    result.name = if name == nil: "" else: $name
+    return
+  if name == nil:
+    result.diagnostic = lrsInvalidArgument
+    return
+  when defined(linux) and defined(amd64):
+    var cimage = toCVdsoImage(image)
+    var csym: CStackableLinuxVdsoSymbol
+    discard cResolveVdsoSymbol(addr cimage, name, addr csym)
+    result = fromCVdsoSymbol(csym, name)
+  else:
+    result.diagnostic = support
+
+proc installLinuxVdsoOverlayPatchTransaction*(imageBase: pointer;
+                                              imageLength: int;
+                                              target, replacement: pointer):
+    LinuxVdsoPatchTransaction =
+  ## Overlay-patch a caller-supplied vDSO-shaped image range with MAP_FIXED.
+  ## This is explicit because MAP_FIXED replaces a mapping. Tests and consumers
+  ## should use it only for a known vDSO range or a disposable controlled range.
+  let support = linuxRawSyscallSupported()
+  if support != lrsOk:
+    result.diagnostic = support
+    result.overlayDiagnostic = support
+    return
+  when defined(linux) and defined(amd64):
+    var cres: CStackableLinuxVdsoPatchResult
+    discard cVdsoOverlayPatchTx(culong(cast[uint](imageBase)),
+                                culong(imageLength), target, replacement,
+                                addr cres)
+    result = fromCVdsoPatch(cres, LinuxVdsoImage(
+      base: imageBase,
+      length: imageLength,
+      diagnostic: lrsOk), nil)
+  else:
+    result.diagnostic = support
+    result.overlayDiagnostic = support
+
+proc installLinuxVdsoSymbolPatchTransaction*(image: LinuxVdsoImage;
+                                             name: cstring;
+                                             replacement: pointer;
+                                             allowOverlay = false):
+    LinuxVdsoPatchTransaction =
+  ## Resolve `name` in `image`, then patch the symbol to `replacement`.
+  ## The direct path uses the ordinary absolute-jump transaction. If that
+  ## fails and `allowOverlay` is true, the helper may replace the image range
+  ## with a MAP_FIXED anonymous copy and patch that copy. Consumers must opt in
+  ## to overlay because it is intentionally invasive.
+  let support = linuxRawSyscallSupported()
+  if support != lrsOk:
+    result.diagnostic = support
+    return
+  when defined(linux) and defined(amd64):
+    var cimage = toCVdsoImage(image)
+    var cres: CStackableLinuxVdsoPatchResult
+    discard cVdsoPatchSymbolTx(addr cimage, name, replacement,
+                               if allowOverlay: 1 else: 0,
+                               addr cres)
+    result = fromCVdsoPatch(cres, image, name)
+  else:
+    result.diagnostic = support
 
 proc measureOriginalCallTrampoline*(target: pointer;
                                     minPatchLen = linuxAbsoluteJumpPatchSize;

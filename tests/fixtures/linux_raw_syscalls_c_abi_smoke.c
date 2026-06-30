@@ -61,6 +61,44 @@ struct stackable_linux_clone_continuation {
   unsigned long child_resume_rip;
 };
 
+struct stackable_linux_vdso_image {
+  int diagnostic;
+  int os_errno;
+  unsigned long base;
+  unsigned long length;
+  unsigned long load_max_address;
+  unsigned long dynamic_address;
+  unsigned long symbol_table;
+  unsigned long string_table;
+  unsigned long symbol_entry_size;
+  unsigned long symbol_count;
+  unsigned long string_table_size;
+};
+
+struct stackable_linux_vdso_symbol {
+  int diagnostic;
+  unsigned long address;
+  unsigned long size;
+  unsigned char info;
+  unsigned char other;
+  unsigned short section_index;
+};
+
+struct stackable_linux_vdso_patch_result {
+  int diagnostic;
+  int path;
+  int direct_diagnostic;
+  int overlay_diagnostic;
+  int os_errno;
+  int patch_live;
+  int overlay_used;
+  unsigned long image_base;
+  unsigned long image_length;
+  unsigned long symbol_address;
+  unsigned long replacement;
+  struct stackable_linux_patch_result direct;
+};
+
 extern long stackable_linux_static_raw_syscall6(
     long nr, long a1, long a2, long a3, long a4, long a5, long a6);
 extern void stackable_linux_rt_sigreturn_restorer(void);
@@ -99,6 +137,21 @@ extern int stackable_linux_install_sigtrap_handler(void *handler, int extra_flag
 extern int stackable_linux_uninstall_sigtrap_handler(void);
 extern int stackable_linux_chain_sigtrap(int signum, void *siginfo_ptr,
                                          void *ucontext_ptr);
+extern int stackable_linux_locate_vdso_image(
+    struct stackable_linux_vdso_image *out);
+extern int stackable_linux_parse_vdso_image_at(
+    unsigned long base, struct stackable_linux_vdso_image *out);
+extern int stackable_linux_resolve_vdso_symbol(
+    struct stackable_linux_vdso_image *image, char *name,
+    struct stackable_linux_vdso_symbol *out);
+extern int stackable_linux_vdso_overlay_patch_tx(
+    unsigned long image_base, unsigned long image_len,
+    void *target, void *replacement,
+    struct stackable_linux_vdso_patch_result *out);
+extern int stackable_linux_vdso_patch_symbol_tx(
+    struct stackable_linux_vdso_image *image, char *name,
+    void *replacement, int allow_overlay,
+    struct stackable_linux_vdso_patch_result *out);
 
 static int stackable_c_fixture_function(void) {
   return 17;
@@ -174,6 +227,20 @@ int stackable_test_c_abi_link_smoke(void) {
   if (continuation.parent_result != 777 || continuation.child_result != 0) return -16;
   if (continuation.parent_resume_rip != 0x5012UL ||
       continuation.child_resume_rip != 0x5012UL) return -17;
+  struct stackable_linux_vdso_image image;
+  struct stackable_linux_vdso_symbol sym;
+  struct stackable_linux_vdso_patch_result vdso_patch;
+  rc = stackable_linux_parse_vdso_image_at(0, &image);
+  if (rc != 17 || image.diagnostic != 17) return -19;
+  rc = stackable_linux_resolve_vdso_symbol(NULL, "__vdso_missing", &sym);
+  if (rc != 3 || sym.diagnostic != 3) return -20;
+  rc = stackable_linux_vdso_overlay_patch_tx(
+      0, 0, NULL, (void *)&stackable_c_fixture_function, &vdso_patch);
+  if (rc != 3 || vdso_patch.diagnostic != 3) return -21;
+  rc = stackable_linux_vdso_patch_symbol_tx(
+      NULL, "__vdso_missing", (void *)&stackable_c_fixture_function, 0,
+      &vdso_patch);
+  if (rc != 3 || vdso_patch.diagnostic != 3) return -22;
   return 0;
 }
 

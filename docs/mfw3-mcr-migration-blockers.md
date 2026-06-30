@@ -209,19 +209,29 @@ Current MCR dependencies:
 - per-symbol trampoline bodies for time/getcpu APIs;
 - record/replay dispatch and recursion guards.
 
-Missing stackable-hooks APIs:
+Previously missing stackable-hooks APIs addressed by M-FW-3E:
 
 - policy-free vDSO image and symbol resolver;
 - vDSO-specific patch transaction that supports direct patch and MAP_FIXED
   overlay fallback;
-- per-symbol trampoline/original-call helper construction;
 - structured vDSO diagnostics.
+
+Still missing after M-FW-3E:
+
+- MCR-owned per-symbol trampoline bodies for time/getcpu wrappers;
+- MCR-owned target symbol list, record/replay dispatch, recursion guards, and
+  install lifecycle;
+- live MCR migration of `recording/vdso_patch.nim` to the helper APIs.
 
 Why migration now would change behavior:
 
-The current absolute-jump patch primitive does not implement the MAP_FIXED
-overlay fallback that MCR relies on for hardened-kernel compatibility. Replacing
-only the direct patch path would weaken existing vDSO coverage.
+M-FW-3E covers image discovery from `AT_SYSINFO_EHDR`, bounded ELF
+dynamic-section symbol resolution, direct vDSO symbol patching, explicit
+page-aligned MAP_FIXED anonymous overlay fallback, and structured diagnostics.
+MCR migration still requires mapping MCR's time/getcpu trampoline bodies,
+event/replay semantics, recursion guard, target-list policy, and
+constructor/status lifecycle onto those helpers without changing the event
+stream or install behavior.
 
 ### POSIX Atomic and JIT Callsite Patching
 
@@ -292,7 +302,8 @@ path on private symbols.
 1. Map MCR's program syscall scanner to the new INT3/continuation/static-helper
    symbols without changing its mapping selection, event conversion, or signal
    lifecycle behavior.
-2. Add vDSO ELF resolver and direct-or-overlay patch transaction helpers.
+2. Migrate MCR vDSO patching onto the helper APIs while preserving MCR-owned
+   target lists, trampoline bodies, event/replay policy, and diagnostics.
 3. Add generic executable-range/JIT bookkeeping and near-trampoline allocation
    helpers for POSIX code patching.
 4. Export and test Windows no-suspend and noreturn no-suspend inline install

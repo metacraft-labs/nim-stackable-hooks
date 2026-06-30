@@ -100,8 +100,12 @@ helpers for consumers that need to close direct syscall bypasses:
   and fence instruction windows; the strategy helper chooses `JMP rel32` only
   when the trampoline is reachable and the instruction can host a 5-byte patch,
   otherwise it reports the INT3 fallback shape. Near trampoline allocation
-  returns caller-writable memory and reachability diagnostics; JIT range
-  helpers only merge, subtract, and deregister executable ranges.
+  returns caller-writable memory and reachability diagnostics; when no nearby
+  mapping is available it may return a far mapping so consumers can use an
+  INT3-based fallback instead of failing the whole patch set. JIT range
+  helpers only merge, subtract, and deregister executable ranges. Matching
+  `stackable_linux_*` C ABI symbols are exported for C consumers such as MCR's
+  POSIX atomic/JIT translation units.
 - `installLinuxSigtrapHandler`, `chainLinuxSigtrap`, and
   `uninstallLinuxSigtrapHandler` as a low-level SIGTRAP install/chaining
   substrate. The install helper rejects double installation in the same

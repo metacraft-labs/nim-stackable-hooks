@@ -5,9 +5,11 @@ Status: partial after the first parent M-FW-3 implementation pass on
 subsequent M-FW-3A..G helper slices closed the missing primitive gaps. The
 first MCR migration pass moved the behavior-preserving Windows inline-hook
 install surfaces onto `stackable_hooks/inline_hook/windows_inline_hook`, while
-leaving MCR policy and stage0 composition in MCR. Linux syscall-wrapper,
-program-text syscall-scan, vDSO, and POSIX atomic/JIT MCR migration remain
-open.
+leaving MCR policy and stage0 composition in MCR. Subsequent migration passes
+moved Linux syscall-wrapper, program-text syscall-scan, and vDSO low-level
+helpers. M-FW-3K is complete after independent review for POSIX atomic/JIT
+helpers. Parent M-FW-3 is ready for final review, but not done until that
+parent-level review confirms the complete migrated helper set.
 
 M-FW-3A update 2026-06-30: the Linux patch transaction / C ABI / resolver
 slice is implemented and independently reviewed in
@@ -282,10 +284,27 @@ Previously missing stackable-hooks APIs addressed by M-FW-3F:
   trampoline reachability;
 - generic JIT executable-range registry with merge/subtract/deregister
   lifecycle bookkeeping;
-- neutral C ABI symbols for classifier, strategy selection, and near
-  allocation/freeing.
+- neutral C ABI symbols for classifier, strategy selection, near
+  allocation/freeing, and JIT range merge/subtract/deregister bookkeeping.
 
-Still missing after M-FW-3F:
+M-FW-3K accepted review:
+
+`atomic_callsite_patch_posix.c` now delegates per-image near trampoline page
+allocation and JMP-rel32 versus INT3 reachability decisions to neutral
+`stackable_linux_*` helpers. The shared allocator preserves MCR's historical
+fallback shape by returning a far writable mapping when no rel32-reachable
+mapping is available, allowing MCR's existing INT3 demotion path to remain
+local. MCR still owns instruction scanning, register-saving trampoline
+emission, permission transition policy for making those trampolines executable,
+SIGTRAP dispatch, reverse patching, counters, and diagnostics.
+
+`atomic_jit_patch_posix.c` now delegates sorted executable-range
+merge/subtract/deregister bookkeeping to neutral `stackable_linux_*` helpers.
+MCR still owns `CT_INSTRUMENT_ATOMICS` gating, locking, `mmap`/`mprotect`
+integration, scan calls, patch installation, reverse-patching lifecycle,
+counters, and diagnostic output.
+
+Still MCR-owned after M-FW-3K:
 
 - MCR's register-saving atomic event trampoline emitter;
 - full decoder/relocator parity for every instruction form MCR currently
@@ -297,10 +316,10 @@ Why migration now would change behavior:
 
 M-FW-3F supplies the generic classification, near-allocation, strategy, and JIT
 range bookkeeping pieces needed to remove the broad atomic/JIT helper blocker.
-It intentionally does not emit MCR's recorder-aware trampolines or move atomic
-event/replay policy into the shared library. A behavior-preserving MCR
-migration still needs to wire these primitives into MCR-owned scanner,
-trampoline, event, and lifecycle code.
+M-FW-3K wires the behavior-preserving low-level portions into MCR without
+moving recorder-aware trampolines or atomic event/replay policy into the shared
+library. Independent review verified this remains mechanism-only and that
+MCR's scanner, trampoline, event, and lifecycle behavior stays local.
 
 ### Windows Inline and No-Suspend Hooks
 
@@ -416,12 +435,9 @@ What remains MCR-owned:
 
 ## Required API Additions Before Reattempt
 
-1. Migrate MCR vDSO patching onto the helper APIs while preserving MCR-owned
-   target lists, trampoline bodies, event/replay policy, and diagnostics.
-2. Wire M-FW-3F's POSIX atomic/JIT helper slice into MCR-owned
-   scanner/trampoline/event lifecycle code without changing MCR behavior.
-3. Run independent review and live Windows validation for the parent M-FW-3
-   Windows migration pass.
+1. Run final parent M-FW-3 review for the full set of migrated helper families.
+2. Perform live Windows validation for the parent M-FW-3 Windows migration pass
+   when a Windows host is available.
 
 ## M-FW-3 Status
 
@@ -434,5 +450,10 @@ wrapper and clone3 callsite low-level patch/resolver/bookkeeping helpers onto
 wrappers. M-FW-3I then moved the program-text syscall scanner's low-level INT3,
 register continuation, raw replay, restorer, and clone-continuation mechanics
 onto the same stackable helper surface while keeping MCR's scan, signal,
-event, and static-shim policies local. vDSO and POSIX atomic/JIT migrations
-remain open.
+event, and static-shim policies local. M-FW-3J moved vDSO image discovery,
+symbol lookup, direct patch transactions, and explicit overlay fallback while
+keeping MCR target lists, trampolines, record/replay schemas, recursion guards,
+and overlay policy local. M-FW-3K is complete after independent review for
+POSIX atomic/JIT near-allocation, patch-strategy, and JIT range bookkeeping.
+Parent M-FW-3 is ready for final review rather than still blocked by known
+missing helper migrations.

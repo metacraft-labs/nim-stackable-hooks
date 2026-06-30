@@ -72,6 +72,56 @@ suite "linux raw syscall primitives":
     else:
       check resolveDefaultSymbol(cstring("syscall")) == nil
 
+  test "clone continuation classifier is policy-extensible":
+    when defined(linux) and defined(amd64):
+      check isLinuxX8664DefaultCloneContinuationSyscall(linuxX8664SysClone)
+      check isLinuxX8664DefaultCloneContinuationSyscall(linuxX8664SysFork)
+      check isLinuxX8664DefaultCloneContinuationSyscall(linuxX8664SysVfork)
+      check isLinuxX8664DefaultCloneContinuationSyscall(linuxX8664SysClone3)
+      check not isLinuxX8664DefaultCloneContinuationSyscall(39)
+    else:
+      check not isLinuxX8664DefaultCloneContinuationSyscall(linuxX8664SysClone)
+      check not isLinuxX8664DefaultCloneContinuationSyscall(linuxX8664SysFork)
+      check not isLinuxX8664DefaultCloneContinuationSyscall(linuxX8664SysVfork)
+      check not isLinuxX8664DefaultCloneContinuationSyscall(linuxX8664SysClone3)
+    check isLinuxX8664CloneContinuationSyscall(39, [39])
+    check not isLinuxX8664CloneContinuationSyscall(39, [1, 2, 3])
+
+  test "INT3 resume-RIP helper describes Linux x86_64 trap shape":
+    check computeLinuxX8664Int3ResumeRip(0'u) == 0'u
+    check computeLinuxX8664Int3ResumeRip(0x401001'u) == 0x401002'u
+
+  test "clone continuation state is computed from synthetic registers":
+    var regs = LinuxX8664SyscallRegisters(
+      syscallNumber: linuxX8664SysClone,
+      trapRip: 0x7011'u,
+      syscallAddress: 0x7010'u,
+      resumeRip: 0x7012'u)
+    let computed = computeLinuxX8664CloneContinuation(regs, parentResult = 12345)
+    when defined(linux) and defined(amd64):
+      check computed.diagnostic == lrsOk
+      check computed.state.cloneLike
+      check computed.state.syscallNumber == linuxX8664SysClone
+      check computed.state.syscallAddress == 0x7010'u
+      check computed.state.trapRip == 0x7011'u
+      check computed.state.resumeRip == 0x7012'u
+      check computed.state.parentResult == 12345
+      check computed.state.parentResumeRip == 0x7012'u
+      check computed.state.childResult == 0
+      check computed.state.childResumeRip == 0x7012'u
+    elif defined(linux):
+      check computed.diagnostic == lrsUnsupportedArchitecture
+    else:
+      check computed.diagnostic == lrsUnsupportedPlatform
+
+    when defined(linux) and defined(amd64):
+      regs.syscallNumber = 39
+      let nonClone = computeLinuxX8664CloneContinuation(
+        regs, parentResult = 99, cloneLike = false)
+      check nonClone.diagnostic == lrsOk
+      check not nonClone.state.cloneLike
+      check nonClone.state.parentResult == 99
+
 when defined(linux) and defined(amd64):
   {.compile: "fixtures/linux_raw_syscalls_c_abi_smoke.c".}
   {.emit: """
@@ -371,6 +421,9 @@ int stackable_test_replacement_value(void) {
     test "ucontext register helpers and raw register replay are exported through C ABI":
       check ucontextHelpersSmoke() == 0
       check replayGetpid() > 0
+      check staticRawSyscall6(39, 0, 0, 0, 0, 0, 0) > 0
+      check rtSigreturnRestorerAddress() != nil
+      check cloneContinuationTrampolineAddress() != nil
 
     test "SIGTRAP install/uninstall substrate restores process handler without raising trap":
       check sigtrapInstallUninstallSmoke() == 0

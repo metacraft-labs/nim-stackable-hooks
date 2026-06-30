@@ -250,20 +250,34 @@ Current MCR dependencies:
 - JIT range registration/deregistration after `mmap`/`mprotect` transitions;
 - MCR atomic event and replay semantics.
 
-Missing stackable-hooks APIs:
+Previously missing stackable-hooks APIs addressed by M-FW-3F:
 
-- instruction-window classification helpers;
-- near trampoline page allocator;
-- architecture-specific trampoline emitter;
-- patch strategy chooser for JMP-rel32 vs INT3;
-- generic JIT executable-range registry;
-- reusable trap dispatch substrate shared with raw syscall callsites.
+- bounded instruction-window classification helpers for LOCK-prefixed memory
+  RMW instructions, implicit-lock memory XCHG, and MFENCE/SFENCE/LFENCE;
+- caller-writable near trampoline allocation with rel32 reachability reporting;
+- patch strategy chooser for JMP-rel32 vs INT3 based on instruction length and
+  trampoline reachability;
+- generic JIT executable-range registry with merge/subtract/deregister
+  lifecycle bookkeeping;
+- neutral C ABI symbols for classifier, strategy selection, and near
+  allocation/freeing.
+
+Still missing after M-FW-3F:
+
+- MCR's register-saving atomic event trampoline emitter;
+- full decoder/relocator parity for every instruction form MCR currently
+  accepts in `atomic_common.c`;
+- MCR atomic event, sync-id, replay, recursion-guard, and diagnostics policy;
+- MCR integration with `mmap`/`mprotect` hooks and reverse-patching lifecycle.
 
 Why migration now would change behavior:
 
-The current stackable Linux API has no instruction decoder, trampoline emitter,
-or INT3 fallback. MCR's atomic instrumentation depends on all three for event
-ordering and for avoiding masked-SIGTRAP windows.
+M-FW-3F supplies the generic classification, near-allocation, strategy, and JIT
+range bookkeeping pieces needed to remove the broad atomic/JIT helper blocker.
+It intentionally does not emit MCR's recorder-aware trampolines or move atomic
+event/replay policy into the shared library. A behavior-preserving MCR
+migration still needs to wire these primitives into MCR-owned scanner,
+trampoline, event, and lifecycle code.
 
 ### Windows Inline and No-Suspend Hooks
 
@@ -304,13 +318,15 @@ path on private symbols.
    lifecycle behavior.
 2. Migrate MCR vDSO patching onto the helper APIs while preserving MCR-owned
    target lists, trampoline bodies, event/replay policy, and diagnostics.
-3. Add generic executable-range/JIT bookkeeping and near-trampoline allocation
-   helpers for POSIX code patching.
+3. Independently review M-FW-3F's POSIX atomic/JIT helper slice, then wire it
+   into MCR-owned scanner/trampoline/event lifecycle code without changing MCR
+   behavior.
 4. Export and test Windows no-suspend and noreturn no-suspend inline install
    primitives with precondition documentation.
 
 ## M-FW-3 Status
 
-M-FW-3 is blocked, not done. The current implementation pass intentionally
-leaves MCR source unchanged rather than claiming a migration that would not
-preserve MCR behavior or event stream shape.
+M-FW-3 is blocked, not done. M-FW-3F has implemented and passed independent
+review for the bounded POSIX atomic/JIT helper slice. MCR source remains
+unchanged rather than claiming a migration that would not preserve MCR behavior
+or event stream shape.

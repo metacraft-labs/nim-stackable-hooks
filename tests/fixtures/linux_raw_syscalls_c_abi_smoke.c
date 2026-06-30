@@ -99,6 +99,37 @@ struct stackable_linux_vdso_patch_result {
   struct stackable_linux_patch_result direct;
 };
 
+struct stackable_linux_atomic_window {
+  int diagnostic;
+  int kind;
+  unsigned long length;
+  int lock_prefixed;
+  int memory_operand;
+  long modrm_offset;
+  long opcode_offset;
+  unsigned char opcode0;
+  unsigned char opcode1;
+};
+
+struct stackable_linux_atomic_patch_decision {
+  int diagnostic;
+  int strategy;
+  unsigned long target;
+  unsigned long trampoline;
+  unsigned long instruction_length;
+  unsigned long patch_size;
+  long long rel32_displacement;
+};
+
+struct stackable_linux_near_allocation {
+  int diagnostic;
+  int os_errno;
+  unsigned long anchor;
+  unsigned long address;
+  unsigned long length;
+  int within_rel32;
+};
+
 extern long stackable_linux_static_raw_syscall6(
     long nr, long a1, long a2, long a3, long a4, long a5, long a6);
 extern void stackable_linux_rt_sigreturn_restorer(void);
@@ -152,6 +183,17 @@ extern int stackable_linux_vdso_patch_symbol_tx(
     struct stackable_linux_vdso_image *image, char *name,
     void *replacement, int allow_overlay,
     struct stackable_linux_vdso_patch_result *out);
+extern int stackable_linux_classify_atomic_window(
+    unsigned char *bytes, unsigned long len,
+    struct stackable_linux_atomic_window *out);
+extern int stackable_linux_select_atomic_patch_strategy(
+    unsigned long target, unsigned long trampoline, unsigned long instruction_len,
+    struct stackable_linux_atomic_patch_decision *out);
+extern int stackable_linux_allocate_near_trampoline(
+    unsigned long anchor, unsigned long length,
+    struct stackable_linux_near_allocation *out);
+extern int stackable_linux_free_near_trampoline(
+    unsigned long address, unsigned long length);
 
 static int stackable_c_fixture_function(void) {
   return 17;
@@ -241,6 +283,37 @@ int stackable_test_c_abi_link_smoke(void) {
       NULL, "__vdso_missing", (void *)&stackable_c_fixture_function, 0,
       &vdso_patch);
   if (rc != 3 || vdso_patch.diagnostic != 3) return -22;
+
+  unsigned char lock_add[4] = {0xf0, 0x01, 0x18, 0x90};
+  struct stackable_linux_atomic_window atomic;
+  rc = stackable_linux_classify_atomic_window(lock_add, sizeof(lock_add), &atomic);
+  if (rc != 0 || atomic.kind != 1 || atomic.length != 3 ||
+      atomic.lock_prefixed != 1 || atomic.memory_operand != 1) return -23;
+  unsigned char mfence[3] = {0x0f, 0xae, 0xf0};
+  rc = stackable_linux_classify_atomic_window(mfence, sizeof(mfence), &atomic);
+  if (rc != 0 || atomic.kind != 3 || atomic.length != 3) return -24;
+
+  struct stackable_linux_atomic_patch_decision decision;
+  rc = stackable_linux_select_atomic_patch_strategy(
+      0x10000000UL, 0x10001000UL, 5, &decision);
+  if (rc != 0 || decision.strategy != 1 || decision.patch_size != 5) return -25;
+  rc = stackable_linux_select_atomic_patch_strategy(
+      0x10000000UL, 0x9000000000UL, 5, &decision);
+  if (rc != 0 || decision.strategy != 2 || decision.patch_size != 1) return -26;
+
+  struct stackable_linux_near_allocation near_alloc;
+  rc = stackable_linux_allocate_near_trampoline(
+      (unsigned long)(uintptr_t)&stackable_c_fixture_function, 64, &near_alloc);
+  if (rc == 0) {
+    if (near_alloc.address == 0 || near_alloc.length < 64 ||
+        near_alloc.within_rel32 != 1) return -27;
+    ((unsigned char *)(uintptr_t)near_alloc.address)[0] = 0xc3;
+    if (((unsigned char *)(uintptr_t)near_alloc.address)[0] != 0xc3) return -28;
+    if (stackable_linux_free_near_trampoline(
+            near_alloc.address, near_alloc.length) != 0) return -30;
+  } else if (rc != 12) {
+    return -29;
+  }
   return 0;
 }
 

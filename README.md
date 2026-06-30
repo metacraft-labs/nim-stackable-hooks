@@ -90,6 +90,15 @@ helpers for consumers that need to close direct syscall bypasses:
   `stackable_linux_*` C ABI symbols, for static-runtime/no-libc-oriented
   consumers that need raw syscall, signal-restorer, and clone-continuation
   building blocks without calling libc's `syscall(2)` wrapper.
+- `classifyLinuxX8664AtomicWindow`, `selectLinuxAtomicPatchStrategy`,
+  `allocateLinuxNearTrampoline`, `freeLinuxNearTrampoline`, and
+  `LinuxJitRangeRegistry` helpers for bounded POSIX atomic/JIT patching
+  primitives. The classifier recognizes conservative LOCK RMW, memory XCHG,
+  and fence instruction windows; the strategy helper chooses `JMP rel32` only
+  when the trampoline is reachable and the instruction can host a 5-byte patch,
+  otherwise it reports the INT3 fallback shape. Near trampoline allocation
+  returns caller-writable memory and reachability diagnostics; JIT range
+  helpers only merge, subtract, and deregister executable ranges.
 - `installLinuxSigtrapHandler`, `chainLinuxSigtrap`, and
   `uninstallLinuxSigtrapHandler` as a low-level SIGTRAP install/chaining
   substrate. The install helper rejects double installation in the same
@@ -126,6 +135,13 @@ decide which syscalls are mission-relevant, or own process lifecycle policy.
 Handlers built on this substrate must explicitly dispatch known callsites and
 chain or escalate unrelated SIGTRAPs; the helper returns
 `lrsTrapChainUnavailable` when the saved predecessor cannot be invoked.
+
+The POSIX atomic/JIT helpers follow the same boundary. They provide
+instruction-window classification, near allocation, patch-shape selection, and
+JIT executable-range lifecycle bookkeeping. They do not emit MCR's
+register-saving atomic event trampolines, allocate sync ids, perform replay
+matching, install atomic SIGTRAP dispatch policy, or decide which `mprotect`
+transitions should trigger scanning.
 
 `installAbsoluteJumpPatchTransaction` exposes the lower-level install contract
 needed by C translation units and behavior-preserving migrations: it

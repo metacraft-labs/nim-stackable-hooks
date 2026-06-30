@@ -1,15 +1,13 @@
 # M-FW-3 MCR Migration Blockers
 
-Status: partial after the first parent M-FW-3 implementation pass on
-2026-06-30. The original blocked audit was independently reviewed and accepted;
-subsequent M-FW-3A..G helper slices closed the missing primitive gaps. The
-first MCR migration pass moved the behavior-preserving Windows inline-hook
-install surfaces onto `stackable_hooks/inline_hook/windows_inline_hook`, while
-leaving MCR policy and stage0 composition in MCR. Subsequent migration passes
-moved Linux syscall-wrapper, program-text syscall-scan, and vDSO low-level
-helpers. M-FW-3K is complete after independent review for POSIX atomic/JIT
-helpers. Parent M-FW-3 is ready for final review, but not done until that
-parent-level review confirms the complete migrated helper set.
+Status: DONE after final parent-level review on 2026-06-30. The original
+blocked audit was independently reviewed and accepted; subsequent M-FW-3A..G
+helper slices closed the missing primitive gaps. The MCR migration passes then
+moved the behavior-preserving Windows inline-hook install surfaces, Linux
+`syscall(2)` wrapper helpers, program-text syscall-scan helpers, vDSO helpers,
+and POSIX atomic/JIT low-level helpers onto `nim-stackable-hooks` primitives.
+MCR policy, record/replay behavior, event schemas, target lists, diagnostics,
+and stage0 composition remain MCR-owned.
 
 M-FW-3A update 2026-06-30: the Linux patch transaction / C ABI / resolver
 slice is implemented and independently reviewed in
@@ -433,27 +431,38 @@ What remains MCR-owned:
   swapping, reentrancy guard policy, event conversion, and record/replay event
   stream shape.
 
-## Required API Additions Before Reattempt
+## Remaining Validation
 
-1. Run final parent M-FW-3 review for the full set of migrated helper families.
-2. Perform live Windows validation for the parent M-FW-3 Windows migration pass
-   when a Windows host is available.
+The parent M-FW-3 source migration is complete, but several validation tasks
+remain outside what this Linux host can prove:
+
+1. Perform live Windows validation for the migrated NT-detour, `LdrLoadDll`,
+   `GetProcAddress`, graphics-capture, and stage0 no-suspend install paths when
+   a Windows host is available.
+2. Perform live vDSO and POSIX atomic/JIT runtime scenarios under representative
+   traced workloads. The Linux-host review exercised controlled stackable
+   fixtures and targeted compile/object checks, not those full runtime paths.
+3. Keep tracking the known broad Windows `library_init_windows.nim` host
+   limitation: from this Linux host, `nim check --os:windows -d:vcc` still
+   fails because Nim converts unrelated C compile pragmas to Windows-style
+   absolute paths for graphics/OpenGL/Vulkan C files. The migrated Windows
+   modules pass targeted cross-checks.
 
 ## M-FW-3 Status
 
-M-FW-3 is partial, not done. The first parent migration pass moved the
-behavior-preserving Windows inline-hook install users onto
+M-FW-3 is DONE after final parent-level review. The first parent migration pass
+moved the behavior-preserving Windows inline-hook install users onto
 `stackable_hooks/inline_hook/windows_inline_hook` while preserving MCR-owned
-stage0 composition and diagnostics. M-FW-3H then moved Linux `syscall(2)`
-wrapper and clone3 callsite low-level patch/resolver/bookkeeping helpers onto
+stage0 composition and diagnostics. M-FW-3H moved Linux `syscall(2)` wrapper
+and clone3 callsite low-level patch/resolver/bookkeeping helpers onto
 `stackable_hooks/platform/linux_raw_syscalls` through MCR compatibility
-wrappers. M-FW-3I then moved the program-text syscall scanner's low-level INT3,
+wrappers. M-FW-3I moved the program-text syscall scanner's low-level INT3,
 register continuation, raw replay, restorer, and clone-continuation mechanics
 onto the same stackable helper surface while keeping MCR's scan, signal,
 event, and static-shim policies local. M-FW-3J moved vDSO image discovery,
 symbol lookup, direct patch transactions, and explicit overlay fallback while
 keeping MCR target lists, trampolines, record/replay schemas, recursion guards,
-and overlay policy local. M-FW-3K is complete after independent review for
-POSIX atomic/JIT near-allocation, patch-strategy, and JIT range bookkeeping.
-Parent M-FW-3 is ready for final review rather than still blocked by known
-missing helper migrations.
+and overlay policy local. M-FW-3K moved POSIX atomic/JIT near-allocation,
+patch-strategy, and JIT range bookkeeping. Final review confirmed every helper
+family named in this document is either migrated to stackable primitives or
+explicitly retained as MCR-owned policy/event/lifecycle code.

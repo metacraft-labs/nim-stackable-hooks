@@ -168,18 +168,31 @@ Previously missing stackable-hooks APIs addressed by M-FW-3C:
 - an architecture-specific register-state continuation contract;
 - raw syscall replay from captured register state;
 
-Still missing after M-FW-3C:
+Previously missing stackable-hooks APIs addressed by M-FW-3D:
 
-- clone/fork/vfork continuation helpers with explicit child-resume semantics;
-- static-runtime/no-libc compatible C ABI variants.
+- default Linux x86_64 clone/fork/vfork/clone3 syscall-number classifiers with
+  caller-extensible classification hooks;
+- synthetic continuation-state helpers that compute parent result/RIP writeback
+  and child resume-RIP semantics from captured INT3 register snapshots;
+- neutral static-runtime-oriented C ABI symbols for raw syscall forwarding,
+  `rt_sigreturn` restorer address exposure, and the low-level clone
+  continuation trampoline used by consumers that cannot return through an
+  ordinary C raw-syscall wrapper in the child.
+
+Still missing after M-FW-3D:
+
+- consumer-owned mapping/self-exclusion policy and MCR event conversion;
+- static-shim lifecycle integration around raw `rt_sigaction` install policy;
+- live migration of MCR's program syscall scanner to the new helper symbols.
 
 Why migration now would change behavior:
 
-M-FW-3C now covers the generic trap installation, callsite table, register
-state, and raw replay substrate. MCR migration is still not behavior-preserving
-until the consumer-owned mapping/self-exclusion policy, event conversion,
-clone/fork/vfork child continuation, and static-runtime/no-libc restorer
-contracts are mapped explicitly.
+M-FW-3D covers the generic trap installation, callsite table, register state,
+raw replay substrate, clone-family continuation calculation, and exported
+low-level static-runtime helper symbols. MCR migration is still not
+behavior-preserving until the consumer-owned mapping/self-exclusion policy,
+event conversion, raw `rt_sigaction` lifecycle, and existing static-shim
+installation behavior are mapped explicitly and tested in MCR.
 
 ### Linux vDSO Patching
 
@@ -276,14 +289,13 @@ path on private symbols.
 
 ## Required API Additions Before Reattempt
 
-1. Add clone/fork/vfork continuation helpers as explicit policy hooks on top of
-   the reusable INT3/SIGTRAP callsite substrate.
-2. Add static-runtime compatible C ABI variants for raw syscall/trap helpers
-   that do not require libc.
-3. Add vDSO ELF resolver and direct-or-overlay patch transaction helpers.
-4. Add generic executable-range/JIT bookkeeping and near-trampoline allocation
+1. Map MCR's program syscall scanner to the new INT3/continuation/static-helper
+   symbols without changing its mapping selection, event conversion, or signal
+   lifecycle behavior.
+2. Add vDSO ELF resolver and direct-or-overlay patch transaction helpers.
+3. Add generic executable-range/JIT bookkeeping and near-trampoline allocation
    helpers for POSIX code patching.
-5. Export and test Windows no-suspend and noreturn no-suspend inline install
+4. Export and test Windows no-suspend and noreturn no-suspend inline install
    primitives with precondition documentation.
 
 ## M-FW-3 Status

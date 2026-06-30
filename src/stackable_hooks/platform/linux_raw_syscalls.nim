@@ -118,6 +118,21 @@ type
     syscallAddress*: uint
     resumeRip*: uint
 
+  LinuxX8664CloneContinuation* = object
+    ## Policy-free continuation calculation for clone/fork/vfork-like raw
+    ## syscalls trapped through INT3. Consumers decide whether a syscall number
+    ## should use this path; the helper only describes parent/child register
+    ## and RIP outcomes.
+    cloneLike*: bool
+    syscallNumber*: int
+    syscallAddress*: uint
+    trapRip*: uint
+    resumeRip*: uint
+    parentResult*: int
+    parentResumeRip*: uint
+    childResult*: int
+    childResumeRip*: uint
+
   LinuxSymbolResolverKind* = enum
     lsrDefault = "rtld-default"
     lsrHandle = "handle"
@@ -184,12 +199,29 @@ type CStackableLinuxSyscallRegs {.importc: "struct stackable_linux_syscall_regs"
   syscallAddress {.importc: "syscall_address".}: culong
   resumeRip {.importc: "resume_rip".}: culong
 
+type CStackableLinuxCloneContinuation {.importc: "struct stackable_linux_clone_continuation",
+                                        bycopy.} = object
+  cloneLike {.importc: "clone_like".}: cint
+  nr {.importc: "nr".}: clong
+  syscallAddress {.importc: "syscall_address".}: culong
+  trapRip {.importc: "trap_rip".}: culong
+  resumeRip {.importc: "resume_rip".}: culong
+  parentResult {.importc: "parent_result".}: clong
+  parentResumeRip {.importc: "parent_resume_rip".}: culong
+  childResult {.importc: "child_result".}: clong
+  childResumeRip {.importc: "child_resume_rip".}: culong
+
 const
   linuxSyscallOpcode0* = byte 0x0f
   linuxSyscallOpcode1* = byte 0x05
   linuxInt3Opcode* = byte 0xcc
   linuxAbsoluteJumpPatchSize* = 14
   linuxTrampolineJumpBackSize* = linuxAbsoluteJumpPatchSize
+  linuxX8664SysClone* = 56
+  linuxX8664SysFork* = 57
+  linuxX8664SysVfork* = 58
+  linuxX8664SysClone3* = 435
+  linuxX8664SysRtSigreturn* = 15
 
 proc linuxRawSyscallSupported*(): LinuxRawSyscallDiagnostic =
   when defined(linux):
@@ -290,6 +322,29 @@ struct stackable_linux_syscall_regs {
   unsigned long resume_rip;
 };
 
+struct stackable_linux_clone_continuation {
+  int clone_like;
+  long nr;
+  unsigned long syscall_address;
+  unsigned long trap_rip;
+  unsigned long resume_rip;
+  long parent_result;
+  unsigned long parent_resume_rip;
+  long child_result;
+  unsigned long child_resume_rip;
+};
+
+void stackable_linux_rt_sigreturn_restorer(void);
+__asm__(
+  ".text\n"
+  ".globl stackable_linux_rt_sigreturn_restorer\n"
+  ".type  stackable_linux_rt_sigreturn_restorer, @function\n"
+  "stackable_linux_rt_sigreturn_restorer:\n"
+  "    movq $15, %rax\n"
+  "    syscall\n"
+  ".size stackable_linux_rt_sigreturn_restorer, .-stackable_linux_rt_sigreturn_restorer\n"
+);
+
 long stackable_linux_raw_syscall6(long nr, long a1, long a2, long a3,
                                   long a4, long a5, long a6) {
   long ret;
@@ -303,6 +358,77 @@ long stackable_linux_raw_syscall6(long nr, long a1, long a2, long a3,
     : "rcx", "r11", "memory"
   );
   return ret;
+}
+
+long stackable_linux_static_raw_syscall6(long nr, long a1, long a2, long a3,
+                                         long a4, long a5, long a6) {
+  return stackable_linux_raw_syscall6(nr, a1, a2, a3, a4, a5, a6);
+}
+
+long stackable_linux_clone_continuation_trampoline(
+    long nr, long a0, long a1, long a2, long a3, long a4, long a5,
+    void *resume_rip, long *user_gregs);
+__asm__(
+  ".text\n"
+  ".globl stackable_linux_clone_continuation_trampoline\n"
+  ".type  stackable_linux_clone_continuation_trampoline, @function\n"
+  "stackable_linux_clone_continuation_trampoline:\n"
+  "    pushq %rbx\n"
+  "    pushq %r12\n"
+  "    pushq %r13\n"
+  "    pushq %r14\n"
+  "    pushq %r15\n"
+  "    pushq %rbp\n"
+  "    movq  %rdi, %rax\n"
+  "    movq  %rsi, %rdi\n"
+  "    movq  %rdx, %rsi\n"
+  "    movq  %rcx, %rdx\n"
+  "    movq  %r8,  %r10\n"
+  "    movq  %r9,  %r8\n"
+  "    movq  56(%rsp), %r9\n"
+  "    movq  72(%rsp), %rcx\n"
+  "    testq %rcx, %rcx\n"
+  "    je    .Lstackable_clone_skip_restore\n"
+  "    movq  32(%rcx), %r12\n"
+  "    movq  40(%rcx), %r13\n"
+  "    movq  48(%rcx), %r14\n"
+  "    movq  56(%rcx), %r15\n"
+  "    movq  80(%rcx), %rbp\n"
+  ".Lstackable_clone_skip_restore:\n"
+  "    movq  64(%rsp), %rbx\n"
+  "    syscall\n"
+  "    testq %rax, %rax\n"
+  "    je    .Lstackable_clone_child\n"
+  "    popq  %rbp\n"
+  "    popq  %r15\n"
+  "    popq  %r14\n"
+  "    popq  %r13\n"
+  "    popq  %r12\n"
+  "    popq  %rbx\n"
+  "    ret\n"
+  ".Lstackable_clone_child:\n"
+  "    jmp   *%rbx\n"
+  ".size stackable_linux_clone_continuation_trampoline, .-stackable_linux_clone_continuation_trampoline\n"
+);
+
+int stackable_linux_is_default_clone_continuation_syscall(long nr) {
+  return nr == 56 || nr == 57 || nr == 58 || nr == 435;
+}
+
+int stackable_linux_compute_clone_continuation(
+    struct stackable_linux_syscall_regs *regs, long parent_result,
+    int clone_like, struct stackable_linux_clone_continuation *out) {
+  if (regs == NULL || out == NULL) return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+  out->clone_like = clone_like ? 1 : 0;
+  out->nr = regs->nr;
+  out->syscall_address = regs->syscall_address;
+  out->trap_rip = regs->trap_rip;
+  out->resume_rip = regs->resume_rip;
+  out->parent_result = parent_result;
+  out->parent_resume_rip = regs->resume_rip;
+  out->child_result = 0;
+  out->child_resume_rip = regs->resume_rip;
+  return STACKABLE_LINUX_PATCH_OK;
 }
 
 void *stackable_linux_resolve_default_symbol(char *name) {
@@ -987,6 +1113,19 @@ int stackable_linux_chain_sigtrap(int signum, void *siginfo_ptr,
 
   proc cRawSyscall6(nr, a1, a2, a3, a4, a5, a6: clong): clong
     {.importc: "stackable_linux_raw_syscall6", cdecl.}
+  proc cStaticRawSyscall6(nr, a1, a2, a3, a4, a5, a6: clong): clong
+    {.importc: "stackable_linux_static_raw_syscall6", cdecl.}
+  proc cRtSigreturnRestorer()
+    {.importc: "stackable_linux_rt_sigreturn_restorer", cdecl.}
+  proc cCloneContinuationTrampoline(nr, a1, a2, a3, a4, a5, a6: clong;
+                                    resumeRip: pointer; userGregs: ptr clong): clong
+    {.importc: "stackable_linux_clone_continuation_trampoline", cdecl.}
+  proc cIsDefaultCloneContinuationSyscall(nr: clong): cint
+    {.importc: "stackable_linux_is_default_clone_continuation_syscall", cdecl.}
+  proc cComputeCloneContinuation(regs: ptr CStackableLinuxSyscallRegs;
+                                 parentResult: clong; cloneLike: cint;
+                                 outState: ptr CStackableLinuxCloneContinuation): cint
+    {.importc: "stackable_linux_compute_clone_continuation", cdecl.}
   proc cResolveDefaultSymbol(name: cstring): pointer
     {.importc: "stackable_linux_resolve_default_symbol", cdecl.}
   proc cOpenLibraryNoLoad(soname: cstring): pointer
@@ -1043,6 +1182,34 @@ proc rawSyscall6*(nr, a1, a2, a3, a4, a5, a6: int): int =
                      clong(a5), clong(a6)))
   else:
     -38
+
+proc staticRawSyscall6*(nr, a1, a2, a3, a4, a5, a6: int): int =
+  ## C ABI raw syscall entry intended for static-runtime/no-libc helper code.
+  ## It has the same raw-kernel-result contract as `rawSyscall6`; the separate
+  ## symbol lets C consumers avoid linking against libc's `syscall` wrapper.
+  when defined(linux) and defined(amd64):
+    int(cStaticRawSyscall6(clong(nr), clong(a1), clong(a2), clong(a3),
+                           clong(a4), clong(a5), clong(a6)))
+  else:
+    -38
+
+proc rtSigreturnRestorerAddress*(): pointer =
+  ## Address of the x86_64 `rt_sigreturn` restorer stub exported for consumers
+  ## that install signal handlers via raw `rt_sigaction`. Do not call it
+  ## directly; it is only meaningful as a kernel signal-restorer address.
+  when defined(linux) and defined(amd64):
+    cast[pointer](cRtSigreturnRestorer)
+  else:
+    nil
+
+proc cloneContinuationTrampolineAddress*(): pointer =
+  ## Address of the low-level clone/fork/vfork continuation trampoline. It is
+  ## exported for C/static-runtime consumers; normal Nim code should use the
+  ## continuation-state helpers to decide when such a trampoline is required.
+  when defined(linux) and defined(amd64):
+    cast[pointer](cCloneContinuationTrampoline)
+  else:
+    nil
 
 proc resolveDefaultSymbol*(name: cstring): pointer =
   ## Resolve an exported process symbol with `dlsym(RTLD_DEFAULT, name)`.
@@ -1185,6 +1352,33 @@ proc fromCSyscallRegs(cres: CStackableLinuxSyscallRegs): LinuxX8664SyscallRegist
     result.trapRip = uint(cres.trapRip)
     result.syscallAddress = uint(cres.syscallAddress)
     result.resumeRip = uint(cres.resumeRip)
+  else:
+    discard
+
+proc toCSyscallRegs(regs: LinuxX8664SyscallRegisters): CStackableLinuxSyscallRegs {.used.} =
+  when defined(linux) and defined(amd64):
+    result.nr = clong(regs.syscallNumber)
+    for i in 0 ..< 6:
+      result.args[i] = clong(regs.args[i])
+    result.result = clong(regs.result)
+    result.trapRip = culong(regs.trapRip)
+    result.syscallAddress = culong(regs.syscallAddress)
+    result.resumeRip = culong(regs.resumeRip)
+  else:
+    discard
+
+proc fromCCloneContinuation(cres: CStackableLinuxCloneContinuation):
+    LinuxX8664CloneContinuation {.used.} =
+  when defined(linux) and defined(amd64):
+    result.cloneLike = cres.cloneLike != 0
+    result.syscallNumber = int(cres.nr)
+    result.syscallAddress = uint(cres.syscallAddress)
+    result.trapRip = uint(cres.trapRip)
+    result.resumeRip = uint(cres.resumeRip)
+    result.parentResult = int(cres.parentResult)
+    result.parentResumeRip = uint(cres.parentResumeRip)
+    result.childResult = int(cres.childResult)
+    result.childResumeRip = uint(cres.childResumeRip)
   else:
     discard
 
@@ -1455,6 +1649,72 @@ proc replayLinuxX8664SyscallRegisters*(regs: LinuxX8664SyscallRegisters): int =
     int(cReplaySyscallRegs(addr cregs))
   else:
     -38
+
+proc isLinuxX8664DefaultCloneContinuationSyscall*(syscallNumber: int): bool =
+  ## Return true for the Linux x86_64 clone-family syscall numbers that cannot
+  ## safely be replayed through an ordinary C raw-syscall wrapper when trapped
+  ## from program text. This is only the default classifier; consumers may add
+  ## narrower or broader policy on top.
+  when defined(linux) and defined(amd64):
+    cIsDefaultCloneContinuationSyscall(clong(syscallNumber)) != 0
+  else:
+    false
+
+proc isLinuxX8664CloneContinuationSyscall*(syscallNumber: int;
+                                           extraCloneLike: openArray[int]): bool =
+  ## Classify with the framework default clone-family set plus
+  ## caller-supplied numbers. The supplied list is a mechanism hook, not a
+  ## policy decision by this module.
+  if isLinuxX8664DefaultCloneContinuationSyscall(syscallNumber):
+    return true
+  for nr in extraCloneLike:
+    if nr == syscallNumber:
+      return true
+  false
+
+proc isLinuxX8664CloneContinuationSyscall*(syscallNumber: int): bool =
+  isLinuxX8664DefaultCloneContinuationSyscall(syscallNumber)
+
+proc computeLinuxX8664Int3ResumeRip*(trapRip: uint): uint =
+  ## Linux x86_64 INT3 reports saved RIP after the one-byte INT3. For a
+  ## patched `0f 05`, the original syscall starts at `trapRip - 1` and normal
+  ## user-code continuation is `trapRip + 1`.
+  if trapRip == 0:
+    0
+  else:
+    trapRip + 1
+
+proc computeLinuxX8664CloneContinuation*(regs: LinuxX8664SyscallRegisters;
+                                         parentResult: int;
+                                         cloneLike: bool):
+    tuple[diagnostic: LinuxRawSyscallDiagnostic,
+          state: LinuxX8664CloneContinuation] =
+  ## Compute parent/child continuation facts for a clone/fork/vfork-like raw
+  ## syscall trapped by INT3. This does not issue the syscall, record events, or
+  ## decide whether the clone path should be used. Parent handling writes
+  ## `parentResult` into RAX and resumes at `regs.resumeRip`; child handling
+  ## must arrange RAX=0 and jump directly to the same user-code resume RIP.
+  let support = linuxRawSyscallSupported()
+  if support != lrsOk:
+    return (support, LinuxX8664CloneContinuation())
+  when defined(linux) and defined(amd64):
+    var cregs = toCSyscallRegs(regs)
+    var cstate: CStackableLinuxCloneContinuation
+    let rc = cComputeCloneContinuation(addr cregs, clong(parentResult),
+                                       if cloneLike: 1 else: 0, addr cstate)
+    (toDiagnostic(rc), fromCCloneContinuation(cstate))
+  else:
+    (support, LinuxX8664CloneContinuation())
+
+proc computeLinuxX8664CloneContinuation*(regs: LinuxX8664SyscallRegisters;
+                                         parentResult: int):
+    tuple[diagnostic: LinuxRawSyscallDiagnostic,
+          state: LinuxX8664CloneContinuation] =
+  ## Convenience overload using the default Linux x86_64 clone-family syscall
+  ## classifier.
+  computeLinuxX8664CloneContinuation(
+    regs, parentResult,
+    isLinuxX8664DefaultCloneContinuationSyscall(regs.syscallNumber))
 
 proc installLinuxSigtrapHandler*(handler: pointer; extraFlags: cint = 0):
     LinuxRawSyscallDiagnostic =

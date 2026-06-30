@@ -200,6 +200,7 @@ Source files:
 
 - `io-mon-hardening-work/src/io_mon/hooks/macos_bodypatch.nim`
 - `io-mon-hardening-work/src/io_mon/shim/macos_interpose.nim`
+- `nim-stackable-hooks/src/stackable_hooks/platform/macos_bodypatch.nim`
 
 Framework-safe helper candidates:
 
@@ -224,9 +225,22 @@ io-mon-owned adapters and policy:
 
 Expected future consumers:
 
-- io-mon: immediate M-FW-1 consumer after extraction.
+- io-mon: current M-FW-1 consumer after extraction.
 - MCR: potential future macOS consumer only if it needs the same bodypatch
   primitive; MCR-specific composition remains in MCR.
+
+M-FW-1 implementation note:
+
+- `nim-stackable-hooks/src/stackable_hooks/platform/macos_bodypatch.nim` now owns
+  the reusable macOS bodypatch install, Mach-O symbol resolution with
+  caller-supplied image exclusion, idempotent target tracking, and trampoline
+  construction helpers. io-mon supplies the symbol list, hook bodies, debug
+  toggles, diagnostics banner, and degradation policy.
+- `nim-stackable-hooks/tests/test_macos_bodypatch_minimal_consumer.nim`
+  exercises a standalone consumer that installs named plain and trampoline
+  hooks through the public API. On non-macOS hosts it is intentionally a no-op;
+  macOS-target `nim check --os:macosx --cpu:arm64` verifies the realistic
+  consumer shape until live Darwin runtime coverage is available.
 
 ## Acceptance Checklist
 

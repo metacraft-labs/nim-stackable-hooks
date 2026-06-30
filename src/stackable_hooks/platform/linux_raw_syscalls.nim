@@ -389,6 +389,11 @@ type CStackableLinuxNearAllocation {.importc: "struct stackable_linux_near_alloc
   length {.importc: "length".}: culong
   withinRel32 {.importc: "within_rel32".}: cint
 
+type CStackableLinuxJitRange {.importc: "struct stackable_linux_jit_range",
+                               bycopy.} = object
+  start {.importc: "start".}: culong
+  stop {.importc: "stop".}: culong
+
 const
   linuxSyscallOpcode0* = byte 0x0f
   linuxSyscallOpcode1* = byte 0x05
@@ -589,6 +594,11 @@ struct stackable_linux_near_allocation {
   unsigned long address;
   unsigned long length;
   int within_rel32;
+};
+
+struct stackable_linux_jit_range {
+  unsigned long start;
+  unsigned long stop;
 };
 
 void stackable_linux_rt_sigreturn_restorer(void);
@@ -2123,6 +2133,18 @@ int stackable_linux_allocate_near_trampoline(
       return STACKABLE_LINUX_PATCH_OK;
     }
   }
+  mapped = stackable_linux_raw_mmap(NULL, span, PROT_READ | PROT_WRITE,
+                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (mapped >= 0) {
+    if (out) {
+      out->diagnostic = STACKABLE_LINUX_PATCH_OK;
+      out->address = (unsigned long)mapped;
+      out->length = (unsigned long)span;
+      out->within_rel32 = stackable_linux_rel32_reachable(
+          anchor + 5U, (uintptr_t)mapped, NULL);
+    }
+    return STACKABLE_LINUX_PATCH_OK;
+  }
   if (out) out->diagnostic = STACKABLE_LINUX_PATCH_TRAMPOLINE_ALLOC_FAILED;
   return STACKABLE_LINUX_PATCH_TRAMPOLINE_ALLOC_FAILED;
 }
@@ -2134,6 +2156,122 @@ int stackable_linux_free_near_trampoline(unsigned long address,
                                        (size_t)length);
   if (rc < 0) return STACKABLE_LINUX_PATCH_RESTORE_FAILED;
   return STACKABLE_LINUX_PATCH_OK;
+}
+
+int stackable_linux_jit_range_add(struct stackable_linux_jit_range *ranges,
+                                  unsigned int *count, unsigned int cap,
+                                  unsigned long start, unsigned long stop) {
+  if (ranges == NULL || count == NULL) return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+  if (start >= stop) return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+  unsigned int n = *count;
+  unsigned int first = n;
+  unsigned int last = n;
+  unsigned long merged_start = start;
+  unsigned long merged_stop = stop;
+  for (unsigned int i = 0; i < n; i++) {
+    unsigned long rs = ranges[i].start;
+    unsigned long re = ranges[i].stop;
+    if (re < start) continue;
+    if (rs > stop) {
+      if (last == n) last = i;
+      break;
+    }
+    if (first == n) first = i;
+    last = i + 1;
+    if (rs < merged_start) merged_start = rs;
+    if (re > merged_stop) merged_stop = re;
+  }
+  if (first == n) {
+    if (n >= cap) return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+    unsigned int ins = 0;
+    while (ins < n && ranges[ins].stop < start) ins++;
+    for (unsigned int j = n; j > ins; j--) ranges[j] = ranges[j - 1];
+    ranges[ins].start = start;
+    ranges[ins].stop = stop;
+    *count = n + 1;
+    return STACKABLE_LINUX_PATCH_OK;
+  }
+  ranges[first].start = merged_start;
+  ranges[first].stop = merged_stop;
+  unsigned int collapse = last - first - 1;
+  if (collapse > 0) {
+    for (unsigned int j = first + 1; j + collapse < n; j++) {
+      ranges[j] = ranges[j + collapse];
+    }
+    *count = n - collapse;
+  }
+  return STACKABLE_LINUX_PATCH_OK;
+}
+
+int stackable_linux_jit_range_remove(struct stackable_linux_jit_range *ranges,
+                                     unsigned int *count, unsigned int cap,
+                                     unsigned long start, unsigned long stop) {
+  if (ranges == NULL || count == NULL) return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+  if (start >= stop) return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+  unsigned int n = *count;
+  unsigned int i = 0;
+  while (i < n) {
+    unsigned long rs = ranges[i].start;
+    unsigned long re = ranges[i].stop;
+    if (re <= start) { i++; continue; }
+    if (rs >= stop) break;
+    if (rs >= start && re <= stop) {
+      for (unsigned int j = i; j + 1 < n; j++) ranges[j] = ranges[j + 1];
+      n--;
+      continue;
+    }
+    if (rs < start && re > stop) {
+      if (n >= cap) {
+        ranges[i].stop = start;
+        i++;
+        continue;
+      }
+      for (unsigned int j = n; j > i + 1; j--) ranges[j] = ranges[j - 1];
+      ranges[i].stop = start;
+      ranges[i + 1].start = stop;
+      ranges[i + 1].stop = re;
+      n++;
+      i += 2;
+      continue;
+    }
+    if (rs < start) {
+      ranges[i].stop = start;
+      i++;
+      continue;
+    }
+    ranges[i].start = stop;
+    i++;
+  }
+  *count = n;
+  return STACKABLE_LINUX_PATCH_OK;
+}
+
+unsigned int stackable_linux_jit_range_untracked(
+    const struct stackable_linux_jit_range *ranges, unsigned int count,
+    unsigned long start, unsigned long stop,
+    struct stackable_linux_jit_range *out, unsigned int out_cap) {
+  if (start >= stop || out == NULL || out_cap == 0) return 0;
+  unsigned int n = 0;
+  unsigned long cursor = start;
+  for (unsigned int i = 0; i < count && cursor < stop; i++) {
+    unsigned long rs = ranges[i].start;
+    unsigned long re = ranges[i].stop;
+    if (re <= cursor) continue;
+    if (rs >= stop) break;
+    if (rs > cursor) {
+      out[n].start = cursor;
+      out[n].stop = rs < stop ? rs : stop;
+      n++;
+      if (n >= out_cap) return n;
+    }
+    if (re > cursor) cursor = re;
+  }
+  if (cursor < stop && n < out_cap) {
+    out[n].start = cursor;
+    out[n].stop = stop;
+    n++;
+  }
+  return n;
 }
 """.}
 
@@ -2226,6 +2364,17 @@ int stackable_linux_free_near_trampoline(unsigned long address,
     {.importc: "stackable_linux_allocate_near_trampoline", cdecl.}
   proc cFreeNearTrampoline(address, length: culong): cint
     {.importc: "stackable_linux_free_near_trampoline", cdecl.}
+  proc cJitRangeAdd(ranges: ptr CStackableLinuxJitRange; count: ptr cuint;
+                    cap: cuint; start, stop: culong): cint
+    {.importc: "stackable_linux_jit_range_add", cdecl.}
+  proc cJitRangeRemove(ranges: ptr CStackableLinuxJitRange; count: ptr cuint;
+                       cap: cuint; start, stop: culong): cint
+    {.importc: "stackable_linux_jit_range_remove", cdecl.}
+  proc cJitRangeUntracked(ranges: ptr CStackableLinuxJitRange; count: cuint;
+                          start, stop: culong;
+                          outRanges: ptr CStackableLinuxJitRange;
+                          outCap: cuint): cuint
+    {.importc: "stackable_linux_jit_range_untracked", cdecl.}
 
 proc rawSyscall6*(nr, a1, a2, a3, a4, a5, a6: int): int =
   ## Issue a Linux x86_64 raw syscall using the kernel calling convention.

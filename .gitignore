@@ -20,3 +20,6 @@ tests/test_reentrancy_guard_prevents_recursion
 
 # Direnv environment cache
 .direnv/
+
+# Reprobuild environment cache
+.repro/

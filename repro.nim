@@ -51,12 +51,6 @@
 ##     compiles ``install_windows.c`` and runs real C-ABI ``doAssert``s). Both
 ##     therefore keep a runnable edge on Linux; their OS-specific bodies are
 ##     the file's own concern.
-##
-## **Tool provisioning.** ``defaultToolProvisioning "path"`` matches the
-## canonical recipes: the nix dev shell (and Windows ``env.ps1``) put
-## ``nim`` + ``gcc`` on ``PATH``, so the weak-local PATH resolver is the
-## right default. Without it ``repro build`` refuses to run with "typed tool
-## provisioning is required for uses declarations".
 
 import repro_project_dsl
 
@@ -139,8 +133,6 @@ const windowsOnlyTestSpecs: seq[StackableTestSpec] = @[
 ]
 
 package stackable_hooks:
-  defaultToolProvisioning "path"
-
   uses:
     # Toolchain floor — the PATH-resolvable binaries the build needs.
     # ``nim`` compiles every test binary (the ``buildNimUnittest.build``

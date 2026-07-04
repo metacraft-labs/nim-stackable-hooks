@@ -89,6 +89,8 @@ jobs:
             runs-on: ubuntu-latest
           - env: nix
             runs-on: macos-latest
+          - env: reprobuild
+            runs-on: ubuntu-latest
     steps:
       - name: Generate CI token
         id: app-token

@@ -1,6 +1,6 @@
 # nim-stackable-hooks
 
-`nim-stackable-hooks` is a cross-platform stackable hooks framework for Nim, It provides high-performance interposition and hook orchestration primitives for macOS, Linux, FreeBSD, and Windows shims.
+`nim-stackable-hooks` is a cross-platform stackable hooks framework for Nim. It provides high-performance interposition and hook orchestration primitives for macOS, Linux, FreeBSD, and Windows shims.
 
 ## Key Features
 

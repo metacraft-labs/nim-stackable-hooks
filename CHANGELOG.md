@@ -2,8 +2,8 @@
 
 ## v0.1.0 — 2026-06-14
 
-Initial release. Nim port of `agent-harbor`'s `crates/stackable-hooks/`
-Rust library, extracted from `codetracer-native-recorder/ct_interpose/`
+Initial release. Cross-platform stackable hooks framework for Nim,
+extracted from `codetracer-native-recorder/ct_interpose/`
 to clean up the entanglement between reprobuild (simpler monitor-only
 shim) and ct_interpose (sophisticated MCR record/replay layer).
 

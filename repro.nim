@@ -150,6 +150,9 @@ package stackable_hooks:
   # ``src/stackable_hooks/`` directly.
   library stackable_hooks
 
+  devEnv:
+    task "bump-version", command = "nim r scripts/bump_version.nim", description = "Bump version number"
+
   build:
     # Two-edge test template (Package-Model.md §"The test template"): one
     # compile-only BUILD edge + one EXECUTE edge per test file. BUILD halves

@@ -1,5 +1,6 @@
 # Package
-version       = "0.1.0"
+import std/strutils
+version       = readFile("version.txt").strip()
 author        = "Metacraft Labs"
 description   = "Cross-platform stackable hooks framework for Nim."
 license       = "Apache-2.0"

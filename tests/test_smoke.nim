@@ -2,7 +2,7 @@
 ## the consumer-facing examples in the README reference. Run with:
 ##   nim c -r tests/test_smoke.nim
 
-import std/unittest
+import std/[os, unittest]
 
 import stackable_hooks
 
@@ -38,3 +38,30 @@ suite "smoke":
       sandbox & "/tmp/scratch"
     # An empty sandbox dir is a no-op (defensive).
     check unrewriteSipPath("/bin/sh", "") == "/bin/sh"
+
+  test "rewriteExecPathForSip uses Apple utility drop-ins only when seeded":
+    ## Apple tools such as iconutil/hdiutil are SIP-protected just like
+    ## /bin/sh, but unlike bash we cannot assume a buildable non-Apple
+    ## replacement exists. Propagation must therefore be availability-gated:
+    ## no seeded sandbox tool means leave the original path alone; a seeded
+    ## drop-in means rewrite to it.
+    const appleTool = "/usr/bin/iconutil"
+    check isSipProtected(appleTool)
+
+    let oldSandbox = getEnv("CT_SANDBOX_TOOLS_DIR")
+    let sandbox = getTempDir() / "stackable-hooks-sip-apple-tools-test"
+    removeDir(sandbox)
+    createDir(sandbox / "usr" / "bin")
+    putEnv("CT_SANDBOX_TOOLS_DIR", sandbox)
+    try:
+      check rewriteExecPathForSip(appleTool) == appleTool
+
+      let dropIn = sandbox / "usr" / "bin" / "iconutil"
+      writeFile(dropIn, "#!/bin/sh\nexit 0\n")
+      check rewriteExecPathForSip(appleTool) == dropIn
+    finally:
+      if oldSandbox.len > 0:
+        putEnv("CT_SANDBOX_TOOLS_DIR", oldSandbox)
+      else:
+        delEnv("CT_SANDBOX_TOOLS_DIR")
+      removeDir(sandbox)

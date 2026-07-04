@@ -1,0 +1,9 @@
+schema = "reprobuild.solved-graph-lock.v2"
+
+[lock]
+platform = "amd64-linux"
+optimal = false
+inputs_digest = "fnv1a64:5014cdf7955f888b"
+variants = []
+packages = [{ name = "gcc", version = "12.0.0", source = "gcc" }, { name = "nim", version = "2.2.0", source = "nim" }, { name = "stackable_hooks", version = "0.1.0", source = "stackable_hooks" }]
+deps = [{ name = "nim-stackable-hooks", path = ".", coord_kind = "vcs", url = "https://github.com/metacraft-labs/nim-stackable-hooks", ref = "main", revision = "c6cf6ad1ac95201288825970b6ca53f630ea8996", integrity = "git-sha1:c6cf6ad1ac95201288825970b6ca53f630ea8996", version = "", visibility = "public", participation = "", depends = "", groups = "" }]

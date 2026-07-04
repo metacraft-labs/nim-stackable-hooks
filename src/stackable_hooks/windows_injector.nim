@@ -9,9 +9,51 @@ when not defined(windows):
 # we optionally invoke an init entry point in the loaded DLL (also via
 # CreateRemoteThread), then resume the original main thread.
 
-{.push raises: [OSError].}
-
 import std/[os, strutils]
+
+proc toWideCStringSeq(s: string): seq[uint16] =
+  result = newSeq[uint16](s.len + 1)
+  for i, c in s:
+    result[i] = uint16(ord(c))
+  result[s.len] = 0
+
+proc extendedPath(path: string): string =
+  if path.len == 0 or path.startsWith("\\\\"):
+    path
+  else:
+    var canonical = absolutePath(path).replace('/', '\\')
+    while "\\\\" in canonical:
+      canonical = canonical.replace("\\\\", "\\")
+    "\\\\?\\" & canonical
+
+proc quoteWindowsArg(s: string): string =
+  if s.len > 0 and s.allCharsInSet(IdentChars + {'/', '-', ':', '.', '_', '\\'}):
+    return s
+  result = "\""
+  var backslashes = 0
+  for ch in s:
+    if ch == '\\':
+      inc(backslashes)
+    elif ch == '"':
+      for _ in 0 ..< (backslashes * 2):
+        result.add('\\')
+      backslashes = 0
+      result.add('\\')
+      result.add('"')
+    else:
+      backslashes = 0
+      result.add(ch)
+  for _ in 0 ..< backslashes:
+    result.add('\\')
+  result.add('"')
+
+proc buildCommandLine(argv: openArray[string]): string =
+  var parts: seq[string] = @[]
+  for i, a in argv:
+    parts.add(quoteWindowsArg(a))
+  result = parts.join(" ")
+
+{.push raises: [OSError].}
 
 type
   HANDLE = pointer
@@ -179,48 +221,6 @@ const
   EXTENDED_STARTUPINFO_PRESENT = 0x00080000'u32
   PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002'u32
 
-proc toWideCStringSeq(s: string): seq[uint16] =
-  result = newSeq[uint16](s.len + 1)
-  for i, c in s:
-    result[i] = uint16(ord(c))
-  result[s.len] = 0
-
-proc quoteWindowsArg(s: string): string =
-  if s.len > 0 and s.allCharsInSet(IdentChars + {'/', '-', ':', '.', '_', '\\'}):
-    return s
-  result = "\""
-  var backslashes = 0
-  for ch in s:
-    if ch == '\\':
-      inc(backslashes)
-    elif ch == '"':
-      for _ in 0 ..< (backslashes * 2):
-        result.add('\\')
-      backslashes = 0
-      result.add('\\')
-      result.add('"')
-    else:
-      backslashes = 0
-      result.add(ch)
-  for _ in 0 ..< backslashes:
-    result.add('\\')
-  result.add('"')
-
-proc buildCommandLine(argv: openArray[string]): string =
-  var parts: seq[string] = @[]
-  for i, a in argv:
-    parts.add(quoteWindowsArg(a))
-  result = parts.join(" ")
-
-proc extendedPath(path: string): string =
-  if path.len == 0 or path.startsWith("\\\\"):
-    path
-  else:
-    var canonical = absolutePath(path).replace('/', '\\')
-    while "\\\\" in canonical:
-      canonical = canonical.replace("\\\\", "\\")
-    "\\\\?\\" & canonical
-
 type
   WindowsInjectionResult* = object
     exitCode*: int
@@ -342,7 +342,7 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
       "no valid stdio handle to pass to child")
   if UpdateProcThreadAttribute(attrList, 0'u32,
                                 PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-                                addr handleVec[0],
+                                unsafeAddr handleVec[0],
                                 SIZE_T(handleVec.len * sizeof(HANDLE)),
                                 nil, nil) == 0:
     DeleteProcThreadAttributeList(attrList)
@@ -557,7 +557,7 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
     var exit: DWORD = 0
     discard GetExitCodeProcess(pi.hProcess, addr exit)
     result.exitCode = int(exit)
-  except OSError:
+  except OSError as e:
     discard TerminateProcess(pi.hProcess, 1'u32)
     safeClose(pi.hThread)
     safeClose(pi.hProcess)
@@ -569,7 +569,7 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
       stdoutReadPipe = nil
     DeleteProcThreadAttributeList(attrList)
     discard HeapFree(processHeap, 0'u32, attrList)
-    raise
+    raise e
   safeClose(pi.hThread)
   safeClose(pi.hProcess)
   if stdoutWritePipe != nil:

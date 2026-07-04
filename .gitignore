@@ -17,3 +17,6 @@ test-logs/
 tests/test_smoke
 tests/test_hook_registry_priority_order
 tests/test_reentrancy_guard_prevents_recursion
+
+# Direnv environment cache
+.direnv/

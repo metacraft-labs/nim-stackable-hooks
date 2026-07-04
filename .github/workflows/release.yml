@@ -11,7 +11,7 @@ env:
 jobs:
   build:
     name: Package Library Archive
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,7 +31,7 @@ jobs:
   release:
     name: Publish Github Release
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     steps:
       - name: Checkout
         uses: actions/checkout@v4

@@ -2,7 +2,7 @@
 version       = "0.1.0"
 author        = "Metacraft Labs"
 description   = "Cross-platform stackable hooks framework for Nim."
-license       = "MIT"
+license       = "Apache-2.0"
 srcDir        = "src"
 skipDirs      = @["tests"]
 

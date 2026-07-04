@@ -1,6 +1,8 @@
 # nim-stackable-hooks
 
-`nim-stackable-hooks` is a cross-platform stackable hooks framework for Nim. It provides high-performance interposition and hook orchestration primitives for macOS, Linux, FreeBSD, and Windows shims.
+`nim-stackable-hooks` is a cross-platform stackable hooks framework for Nim, providing high-performance interposition and hook orchestration primitives for macOS, Linux, FreeBSD, and Windows shims.
+
+As an alternative to traditional, isolated platform-specific hooking libraries, `nim-stackable-hooks` is built with a primary motivation to enable hooks developed by different software teams to interoperate seamlessly. As long as shim libraries are based on the stackable hooks framework, their hooks can run concurrently, cooperate, and cleanly chain execution without conflicting or clobbering each other.
 
 ## Key Features
 
@@ -43,4 +45,4 @@ If you want to contribute or understand the library's internals:
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the Apache License, Version 2.0 - see the [LICENSE](LICENSE) file for details.

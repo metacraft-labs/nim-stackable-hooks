@@ -399,6 +399,19 @@ const
   linuxSyscallOpcode1* = byte 0x05
   linuxInt3Opcode* = byte 0xcc
   linuxAbsoluteJumpPatchSize* = 14
+  # A `call rel32` (0xe8) / `jmp rel32` (0xe9) is a 5-byte instruction whose
+  # last four bytes are a signed displacement. When that displacement happens
+  # to contain the two bytes `0f 05`, a naive opcode scan mistakes them for a
+  # `syscall` instruction. Overwriting byte 0 of that pair with `INT3`
+  # (0xcc) to plant a trap corrupts the enclosing branch's displacement — a
+  # 100%-deterministic SIGILL (observed: glibc/Nim `removeDir` whose
+  # `call rmdir@plt` displacement is `e8 0f 05 fa ff`). The `0f 05` sits at
+  # offset+1 of the branch, so guarding against a preceding 0xe8/0xe9 rejects
+  # this class of false positive. The guard is conservative: at worst it skips
+  # trapping a genuine `syscall` that is preceded by a literal 0xe8/0xe9 data
+  # byte (leaving that one call untraced), and never patches a non-syscall.
+  linuxCallRel32Opcode* = byte 0xe8
+  linuxJmpRel32Opcode* = byte 0xe9
   linuxTrampolineJumpBackSize* = linuxAbsoluteJumpPatchSize
   linuxX8664SysClone* = 56
   linuxX8664SysFork* = 57
@@ -3389,11 +3402,22 @@ proc chainLinuxSigtrap*(signum: cint; siginfo: pointer; ucontext: pointer):
   else:
     support
 
+proc precededByRel32Branch(prevByte: byte): bool {.inline.} =
+  ## True when the byte immediately before a `0f 05` candidate is the opcode of
+  ## a `call rel32` (0xe8) or `jmp rel32` (0xe9). In that case the `0f 05` is
+  ## the first two bytes of the branch's 4-byte displacement, not a real
+  ## `syscall` instruction — see the `linuxCallRel32Opcode` comment.
+  prevByte == linuxCallRel32Opcode or prevByte == linuxJmpRel32Opcode
+
 proc looksLikeLinuxX8664Syscall*(bytes: openArray[byte]; offset: int): bool =
-  ## Conservative byte-level syscall-site predicate. This follows MCR's current
-  ## false-positive guard: a `0f 05` followed by `00` is likely an embedded
-  ## immediate in generated code, not an instruction boundary.
+  ## Conservative byte-level syscall-site predicate. Two false-positive guards:
+  ## (1) a `0f 05` followed by `00` is likely an embedded immediate in
+  ## generated code, not an instruction boundary; (2) a `0f 05` immediately
+  ## preceded by a `call`/`jmp rel32` opcode (0xe8/0xe9) is the displacement of
+  ## that branch, not a `syscall` — patching it corrupts the branch target.
   if offset < 0 or offset + 2 >= bytes.len:
+    return false
+  if offset >= 1 and precededByRel32Branch(bytes[offset - 1]):
     return false
   bytes[offset] == linuxSyscallOpcode0 and
     bytes[offset + 1] == linuxSyscallOpcode1 and
@@ -3450,7 +3474,8 @@ proc visitLinuxX8664SyscallMemory*(start: pointer; length: int;
     var i = 0
     while i + 2 < length:
       if p[i] == linuxSyscallOpcode0 and p[i + 1] == linuxSyscallOpcode1 and
-          p[i + 2] != byte 0x00:
+          (p[i + 2] != byte 0x00) and
+          not (i >= 1 and precededByRel32Branch(p[i - 1])):
         let keepGoing = visitor LinuxSyscallSite(
           address: base + uint(i),
           offset: i,

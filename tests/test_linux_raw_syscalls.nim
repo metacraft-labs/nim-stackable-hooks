@@ -36,6 +36,25 @@ suite "linux raw syscall primitives":
     )
     check visited == @[1, 11]
 
+  test "byte scanner rejects 0f 05 inside a call/jmp rel32 displacement":
+    # `e8 0f 05 fa ff` is `call rel32` whose displacement embeds `0f 05`.
+    # A naive scan would mistake it for a `syscall` at offset 1 and patch an
+    # INT3 over the branch displacement -> deterministic SIGILL. The
+    # preceding-0xe8/0xe9 guard must reject it. A genuine `0f 05` elsewhere in
+    # the same slice is still detected.
+    let callBytes = [
+      byte 0x90,
+      byte 0xe8, byte 0x0f, byte 0x05, byte 0xfa, byte 0xff, # call rel32
+      byte 0xe9, byte 0x0f, byte 0x05, byte 0x11, byte 0x22, # jmp rel32
+      byte 0x0f, byte 0x05, byte 0xc3]                       # real syscall
+    check not looksLikeLinuxX8664Syscall(callBytes, 2)  # inside call
+    check not looksLikeLinuxX8664Syscall(callBytes, 7)  # inside jmp
+    check looksLikeLinuxX8664Syscall(callBytes, 11)     # real syscall
+    let callSites = scanLinuxX8664SyscallBytes(callBytes, baseAddress = 0x2000'u)
+    check callSites.len == 1
+    check callSites[0].offset == 11
+    check callSites[0].address == 0x200b'u
+
   test "maps parser exposes executable mappings without policy filtering":
     let line = "7f0000001000-7f0000002000 r-xp 00000000 00:00 0 /tmp/libx.so"
     let parsed = parseLinuxMapsLine(line)

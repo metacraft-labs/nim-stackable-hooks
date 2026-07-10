@@ -3461,11 +3461,39 @@ proc visitLinuxX8664SyscallBytes*(bytes: openArray[byte];
     else:
       inc i
 
+when defined(linux) and defined(amd64):
+  # FUP-H — reuse the (portable, length-only) x86-64 instruction-length
+  # decoder from the inline-hook backend to give the LIVE syscall-site
+  # scanner true instruction-boundary awareness. A byte-level `0f 05` scan
+  # cannot tell a real `syscall` instruction from the SAME two bytes
+  # appearing MID-INSTRUCTION (e.g. as the SIB byte + disp8 of a
+  # `movzx r, byte ptr [...]`: `... 0f b6 74 0f 05 44 ...`) or embedded in
+  # data. int3-patching such a false positive rewrites the byte of the REAL
+  # containing instruction and corrupts the monitored program — this is the
+  # class that crashed live-Vulkan replay (the visual-replay test binary has
+  # exactly one such `0f 05` inside a `movzx`), and the same class the cc1
+  # `/nix/store` exclusion was a partial band-aid for. Forward-decoding from
+  # the mapping start consumes each real instruction whole, so a
+  # mid-instruction `0f 05` is never presented as a candidate boundary.
+  {.compile: "../inline_hook/windows/length_decoder.c".}
+  proc ctIldDecode(code: pointer; maxLen: csize_t): cint
+    {.importc: "ct_ild_decode", cdecl.}
+
 proc visitLinuxX8664SyscallMemory*(start: pointer; length: int;
                                    visitor: proc(site: LinuxSyscallSite): bool
                                      {.closure, raises: [].}) {.raises: [].} =
   ## Scan an already-readable memory range for raw syscall callsites. The
   ## caller owns mapping selection and exclusion policy.
+  ##
+  ## FUP-H — the scan is instruction-boundary aware: it walks forward one
+  ## decoded instruction at a time and only reports a `0f 05` that begins a
+  ## complete 2-byte instruction. A `0f 05` that falls inside a longer
+  ## instruction is consumed by that instruction's decode and never
+  ## reported, so it is never int3-patched. When a byte cannot be decoded
+  ## (data/padding in the executable mapping, or an opcode outside the
+  ## decoder's subset) the scan resyncs by a single byte and, crucially,
+  ## reports NOTHING for that byte — the safe bias is monitor event-loss
+  ## over corrupting a mid-instruction patch.
   if start == nil or length < 3 or visitor == nil:
     return
   when defined(linux) and defined(amd64):
@@ -3473,8 +3501,13 @@ proc visitLinuxX8664SyscallMemory*(start: pointer; length: int;
     let base = cast[uint](start)
     var i = 0
     while i + 2 < length:
-      if p[i] == linuxSyscallOpcode0 and p[i + 1] == linuxSyscallOpcode1 and
-          (p[i + 2] != byte 0x00) and
+      let avail = length - i
+      let ilen = int(ctIldDecode(addr p[i], csize_t(min(avail, 15))))
+      if ilen <= 0:
+        inc i
+        continue
+      if ilen == 2 and p[i] == linuxSyscallOpcode0 and
+          p[i + 1] == linuxSyscallOpcode1 and (p[i + 2] != byte 0x00) and
           not (i >= 1 and precededByRel32Branch(p[i - 1])):
         let keepGoing = visitor LinuxSyscallSite(
           address: base + uint(i),
@@ -3482,9 +3515,7 @@ proc visitLinuxX8664SyscallMemory*(start: pointer; length: int;
           nextByte: p[i + 2])
         if not keepGoing:
           return
-        inc i, 2
-      else:
-        inc i
+      inc i, ilen
 
 proc visitLinuxExecutableMappingSyscalls*(mapping: LinuxExecutableMapping;
                                           visitor: proc(site: LinuxSyscallSite): bool

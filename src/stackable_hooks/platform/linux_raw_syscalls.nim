@@ -1006,10 +1006,26 @@ static int stackable_linux_decode_one_x86_64(const unsigned char *p,
     *out_len = i;
     return STACKABLE_LINUX_PATCH_OK;
   }
+  /* `e8 <rel32>` (call), `e9 <rel32>` (near jmp), `eb <rel8>` (short jmp) and
+   * the short `70..7f <rel8>` jcc carry a relative displacement that can be
+   * rebased when the byte range is copied to a new address. Decode them to
+   * their true length here so a trampoline window can span them; the builder
+   * rewrites the displacement (see stackable_linux_relocate_window). */
+  if (op == 0xe8 || op == 0xe9) {
+    if (i + 4 > max_len) return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+    *out_len = i + 4;
+    return STACKABLE_LINUX_PATCH_OK;
+  }
+  if (op == 0xeb || (op >= 0x70 && op <= 0x7f)) {
+    if (i + 1 > max_len) return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+    *out_len = i + 1;
+    return STACKABLE_LINUX_PATCH_OK;
+  }
+  /* Non-relocatable control flow (returns / int3 / far transfers) stays
+   * rejected: it carries no rebaseable relative displacement or ends the
+   * instruction stream mid-window. */
   if (op == 0xcc ||
-      op == 0xc3 || op == 0xcb || op == 0xc2 || op == 0xca ||
-      op == 0xe8 || op == 0xe9 || op == 0xeb ||
-      (op >= 0x70 && op <= 0x7f)) {
+      op == 0xc3 || op == 0xcb || op == 0xc2 || op == 0xca) {
     return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
   }
 
@@ -1023,10 +1039,16 @@ static int stackable_linux_decode_one_x86_64(const unsigned char *p,
   if (op == 0x0f) {
     if (i >= max_len) return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
     unsigned char op2 = p[i++];
-    if (op2 == 0x05 || op2 == 0x34 || op2 == 0x35 ||
-        (op2 >= 0x80 && op2 <= 0x8f)) {
-      return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+    /* `0f 8x <rel32>` near jcc is relocatable: decode its length so the window
+     * can span it; the builder rebases the disp32. */
+    if (op2 >= 0x80 && op2 <= 0x8f) {
+      if (i + 4 > max_len) return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+      *out_len = i + 4;
+      return STACKABLE_LINUX_PATCH_OK;
     }
+    /* `0f 05` syscall / `0f 34` sysenter / `0f 35` sysexit and every other
+     * two-byte opcode stay rejected: the raw syscall is deliberately kept
+     * non-relocatable, and the rest are outside this decoder's subset. */
     return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
   }
 
@@ -1120,6 +1142,84 @@ static int stackable_linux_measure_relocatable_prefix(
   return STACKABLE_LINUX_PATCH_OK;
 }
 
+/* Walk the `copied` bytes that a trampoline copies from `orig_addr` into
+ * `tramp` (mapped at `tramp_addr`) and rebase every relative control-flow
+ * instruction (`e8`/`e9` rel32 call/jmp, `0f 8x` rel32 jcc, `eb`/`70..7f` rel8
+ * short jmp/jcc) so the copy reaches the SAME absolute target the original
+ * would have. Rebasing a relative branch is new_disp = old_disp + delta, with
+ * delta = orig_addr - tramp_addr. Returns STACKABLE_LINUX_PATCH_OK, or
+ * STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION if a rebased displacement no
+ * longer fits its int32/int8 field (fail loudly rather than emit a silently
+ * wrong branch). */
+static int stackable_linux_relocate_window(unsigned char *tramp,
+                                           uintptr_t orig_addr,
+                                           uintptr_t tramp_addr,
+                                           size_t copied) {
+  const unsigned char *op_src = (const unsigned char *)orig_addr;
+  size_t off = 0;
+  while (off < copied) {
+    size_t insn_len = 0;
+    int rc = stackable_linux_decode_one_x86_64(op_src + off, copied - off,
+                                               &insn_len);
+    if (rc != STACKABLE_LINUX_PATCH_OK || insn_len == 0) {
+      /* measure_relocatable_prefix already validated this window; refuse
+       * rather than mis-relocate a byte range we cannot decode. */
+      return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+    }
+
+    /* Re-walk the prefixes to locate the opcode within this instruction. */
+    size_t k = off;
+    for (;;) {
+      unsigned char b = op_src[k];
+      if (b == 0x66 || b == 0x67 || b == 0xf2 || b == 0xf3 ||
+          (b >= 0x40 && b <= 0x4f)) { k++; continue; }
+      break;
+    }
+    unsigned char op = op_src[k];
+
+    size_t disp_off = 0;    /* byte offset of the displacement in the insn */
+    int disp_is_rel32 = 0;  /* 1 = 4-byte disp, 0 = 1-byte disp */
+    int have_disp = 0;
+
+    if (op == 0xe8 || op == 0xe9) {          /* call/jmp rel32 */
+      disp_off = k + 1; disp_is_rel32 = 1; have_disp = 1;
+    } else if (op == 0xeb || (op >= 0x70 && op <= 0x7f)) { /* short jmp/jcc */
+      disp_off = k + 1; disp_is_rel32 = 0; have_disp = 1;
+    } else if (op == 0x0f) {
+      unsigned char op2 = op_src[k + 1];
+      if (op2 >= 0x80 && op2 <= 0x8f) {      /* jcc rel32 */
+        disp_off = k + 2; disp_is_rel32 = 1; have_disp = 1;
+      }
+    }
+
+    if (have_disp) {
+      int64_t delta = (int64_t)orig_addr - (int64_t)tramp_addr;
+      if (disp_is_rel32) {
+        int32_t old_disp;
+        memcpy(&old_disp, op_src + disp_off, 4);
+        int64_t nd = (int64_t)old_disp + delta;
+        if (nd < (int64_t)(-2147483647 - 1) || nd > (int64_t)2147483647) {
+          return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+        }
+        int32_t ndn = (int32_t)nd;
+        memcpy(tramp + disp_off, &ndn, 4);
+      } else {
+        signed char old_disp = (signed char)op_src[disp_off];
+        int64_t nd = (int64_t)old_disp + delta;
+        if (nd < -128 || nd > 127) {
+          /* A rel8 target that moved out of range cannot be widened in place
+           * without changing the instruction length. Fail loudly. */
+          return STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION;
+        }
+        tramp[disp_off] = (unsigned char)(signed char)nd;
+      }
+    }
+
+    off += insn_len;
+  }
+  return STACKABLE_LINUX_PATCH_OK;
+}
+
 static void stackable_linux_init_trampoline_result(
     struct stackable_linux_trampoline_result *out, void *target,
     size_t min_patch_len) {
@@ -1192,6 +1292,18 @@ int stackable_linux_build_original_trampoline(void *target,
 
   unsigned char *tramp = (unsigned char *)(uintptr_t)mapped;
   memcpy(tramp, target, copied);
+  /* Rebase any relative control-flow (call/jmp/jcc) copied into the trampoline
+   * so it reaches the same absolute target from its new address. A window with
+   * no relative branch is left byte-for-byte identical by this call. */
+  {
+    int reloc_rc = stackable_linux_relocate_window(
+        tramp, (uintptr_t)target, (uintptr_t)tramp, copied);
+    if (reloc_rc != STACKABLE_LINUX_PATCH_OK) {
+      (void)stackable_linux_raw_munmap(tramp, total);
+      if (out) out->diagnostic = reloc_rc;
+      return reloc_rc;
+    }
+  }
   stackable_linux_write_abs_jump(tramp + copied,
       (void *)((uintptr_t)target + copied));
 

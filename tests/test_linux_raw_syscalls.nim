@@ -305,6 +305,45 @@ void *stackable_test_alloc_original_trampoline_target(void) {
   return p;
 }
 
+/* A musl-syscall-stub-shaped prologue whose relocatable window spans a
+ * `call <rel32>` to a nearby helper, exercising rel32 relocation in the
+ * instruction-aware trampoline builder. Layout on the page:
+ *   +0x000  helper:  mov $101,%eax; ret        (call target)
+ *   +0x040  stub:    mov $7,%eax;               (imm32, decodable)
+ *                    call helper                (e8 <rel32>, relocatable)
+ *                    add $5,%eax; nop; ...; ret
+ * The 14-byte patch window is mov(5)+call(5)+add(3)+nop(1); the trailing
+ * `ret` sits past the window so it is never decoded. The point under test is
+ * that the COPIED call in the trampoline still points at `helper`. */
+void *stackable_test_alloc_call_rel32_target(void **out_call_dest) {
+  long page_size = sysconf(_SC_PAGESIZE);
+  if (page_size <= 0) page_size = 4096;
+  unsigned char *p = (unsigned char *)mmap(NULL, (size_t)page_size,
+      PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (p == MAP_FAILED) return NULL;
+  memset(p, 0x90, (size_t)page_size);
+
+  unsigned char *helper = p + 0x000;
+  unsigned char *stub = p + 0x040;
+
+  /* helper: mov $101,%eax ; ret */
+  unsigned char helper_code[6] = {0xb8, 0x65, 0x00, 0x00, 0x00, 0xc3};
+  memcpy(helper, helper_code, sizeof(helper_code));
+
+  /* stub prologue: mov $7,%eax (5) ; call helper (5) ; add $5,%eax (3) ;
+   * nop (1) — 14 bytes, exactly the patch window; ret is left past it. */
+  stub[0] = 0xb8; stub[1] = 0x07; stub[2] = 0x00; stub[3] = 0x00; stub[4] = 0x00;
+  stub[5] = 0xe8;                 /* call rel32 */
+  int32_t disp = (int32_t)((intptr_t)helper - (intptr_t)(stub + 5 + 5));
+  memcpy(stub + 6, &disp, 4);
+  stub[10] = 0x83; stub[11] = 0xc0; stub[12] = 0x05;  /* add $5,%eax */
+  stub[13] = 0x90;                                    /* nop (window end) */
+  stub[14] = 0xc3;                                    /* ret (past window) */
+
+  if (out_call_dest) *out_call_dest = helper;
+  return stub;
+}
+
 void *stackable_test_alloc_rip_relative_target(void) {
   long page_size = sysconf(_SC_PAGESIZE);
   if (page_size <= 0) page_size = 4096;
@@ -427,6 +466,8 @@ int stackable_test_replacement_value(void) {
     {.importc: "stackable_test_alloc_original_trampoline_target", cdecl.}
   proc allocRipRelativeTarget(): pointer
     {.importc: "stackable_test_alloc_rip_relative_target", cdecl.}
+  proc allocCallRel32Target(outCallDest: ptr pointer): pointer
+    {.importc: "stackable_test_alloc_call_rel32_target", cdecl.}
   proc replacementValue(): cint
     {.importc: "stackable_test_replacement_value", cdecl.}
   proc allocSyscallScanBuffer(): pointer
@@ -534,6 +575,34 @@ int stackable_test_replacement_value(void) {
       check built.diagnostic == lrsUnsupportedInstruction
       check built.entry == nil
       check built.unsupportedOffset == 0
+
+    test "original-call trampoline relocates a rel32 call in the copied prologue":
+      var callDest: pointer = nil
+      let target = allocCallRel32Target(addr callDest)
+      check target != nil
+      check callDest != nil
+
+      # The prologue spans `call <rel32>`, which the decoder previously
+      # rejected; measuring/building must now succeed over the 14-byte window.
+      let measured = measureOriginalCallTrampoline(target)
+      check measured.diagnostic == lrsOk
+      check measured.copiedLen == linuxAbsoluteJumpPatchSize
+      check measured.unsupportedOffset == -1
+
+      let built = buildOriginalCallTrampoline(target)
+      check built.diagnostic == lrsOk
+      check built.entry != nil
+      check built.copiedLen == linuxAbsoluteJumpPatchSize
+
+      # The copied `call` (e8 <rel32>) sits at entry+5; its rebased displacement
+      # must resolve to the SAME absolute helper as the original would.
+      let entry = cast[uint](built.entry)
+      let callInsn = cast[ptr UncheckedArray[byte]](built.entry)
+      check callInsn[5] == 0xe8'u8
+      var disp: int32
+      copyMem(addr disp, cast[pointer](entry + 6), 4)
+      let copiedCallTarget = cast[uint](int64(entry) + 10 + int64(disp))
+      check copiedCallTarget == cast[uint](callDest)
 
     test "transaction reports invalid target at validation stage":
       let tx = installAbsoluteJumpPatchTransaction(nil, cast[pointer](replacementValue))

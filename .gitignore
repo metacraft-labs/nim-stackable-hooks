@@ -17,6 +17,7 @@ test-logs/
 tests/test_smoke
 tests/test_hook_registry_priority_order
 tests/test_reentrancy_guard_prevents_recursion
+tests/test_linux_raw_syscalls
 
 # Direnv environment cache
 .direnv/

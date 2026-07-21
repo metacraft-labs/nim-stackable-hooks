@@ -44,3 +44,14 @@ suite "reentrancy_guard":
     check hookDepth == currentHookDepth()
     exitHook()
     check currentHookDepth() == 0
+
+  when defined(windows):
+    test "explicit suppression remains distinguishable from transient depth":
+      initReentrancyTls()
+      check not hooksExplicitlySuppressedForCurrentThread()
+      suppressHooksForCurrentThread()
+      check hooksExplicitlySuppressedForCurrentThread()
+      check not hooksAllowed()
+      enterHook()
+      exitHook()
+      check hooksExplicitlySuppressedForCurrentThread()

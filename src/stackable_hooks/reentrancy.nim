@@ -55,6 +55,9 @@
 ## `test_reentrancy.nim` (which uses `hookDepth == N` assertions
 ## directly) compiles unmodified.
 
+when defined(windows) and defined(ctStackableHooksExternalTls):
+  {.passC: "/DCT_STACKABLE_HOOKS_EXTERNAL_TLS".}
+
 {.emit: """
 /* MW17 (MCR-Windows-CtMcr-Port, 2026-05-28) -- per-thread hook
    reentrancy counter.
@@ -92,11 +95,23 @@
    a PLT round-trip.  POSIX does not have the Windows-loader issue
    (LD_PRELOAD'd libraries' TLS is in the PT_TLS segment which the
    dynamic linker handles uniformly per-thread). */
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && defined(CT_STACKABLE_HOOKS_EXTERNAL_TLS)
+int _ct_hook_depth_get(void);
+void _ct_hook_depth_set(int v);
+int _ct_hook_depth_inc_and_get(void);
+int _ct_hook_depth_dec_and_get(void);
+void *_ct_hook_depth_outer_caller(void);
+void _ct_depth_trace_push(char *name);
+void _ct_depth_trace_pop(void);
+int _ct_depth_trace_get_depth(void);
+int _ct_depth_trace_snapshot(char *buf, int cap);
+#elif defined(_MSC_VER)
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
+#  include <intrin.h>
 
 static DWORD volatile g_ct_hook_depth_tls = TLS_OUT_OF_INDEXES;
+static DWORD volatile g_ct_hook_outer_caller_tls = TLS_OUT_OF_INDEXES;
 
 static DWORD _ct_hook_depth_ensure_index(void) {
   /* One-shot lazy allocation via CAS.  Safe to call from any thread,
@@ -118,6 +133,31 @@ static DWORD _ct_hook_depth_ensure_index(void) {
   return fresh;
 }
 
+static DWORD _ct_hook_outer_caller_ensure_index(void) {
+  DWORD idx = g_ct_hook_outer_caller_tls;
+  if (idx != TLS_OUT_OF_INDEXES) return idx;
+  DWORD fresh = TlsAlloc();
+  if (fresh == TLS_OUT_OF_INDEXES) return TLS_OUT_OF_INDEXES;
+  DWORD prev = (DWORD)InterlockedCompareExchange(
+      (LONG volatile *)&g_ct_hook_outer_caller_tls,
+      (LONG)fresh, (LONG)TLS_OUT_OF_INDEXES);
+  if (prev != TLS_OUT_OF_INDEXES) {
+    TlsFree(fresh);
+    return prev;
+  }
+  return fresh;
+}
+
+static void _ct_hook_outer_caller_set(void *caller) {
+  DWORD idx = _ct_hook_outer_caller_ensure_index();
+  if (idx != TLS_OUT_OF_INDEXES) TlsSetValue(idx, caller);
+}
+
+void *_ct_hook_depth_outer_caller(void) {
+  DWORD idx = g_ct_hook_outer_caller_tls;
+  return idx == TLS_OUT_OF_INDEXES ? NULL : TlsGetValue(idx);
+}
+
 int _ct_hook_depth_get(void) {
   DWORD idx = g_ct_hook_depth_tls;
   if (idx == TLS_OUT_OF_INDEXES) return 0;  /* never written = 0 */
@@ -136,6 +176,9 @@ int _ct_hook_depth_inc_and_get(void) {
   DWORD idx = _ct_hook_depth_ensure_index();
   if (idx == TLS_OUT_OF_INDEXES) return 1;  /* defensive */
   int cur = (int)(intptr_t)TlsGetValue(idx);
+  if (cur == 0) {
+    _ct_hook_outer_caller_set(_ReturnAddress());
+  }
   cur++;
   TlsSetValue(idx, (LPVOID)(intptr_t)cur);
   return cur;
@@ -147,6 +190,7 @@ int _ct_hook_depth_dec_and_get(void) {
   int cur = (int)(intptr_t)TlsGetValue(idx);
   if (cur > 0) cur--;
   TlsSetValue(idx, (LPVOID)(intptr_t)cur);
+  if (cur == 0) _ct_hook_outer_caller_set(NULL);
   return cur;
 }
 #else
@@ -171,6 +215,10 @@ int _ct_hook_depth_dec_and_get(void) {
     _ct_hook_depth_storage--;
   }
   return _ct_hook_depth_storage;
+}
+
+void *_ct_hook_depth_outer_caller(void) {
+  return (void *)0;
 }
 #endif
 
@@ -211,7 +259,9 @@ int _ct_hook_depth_dec_and_get(void) {
    frames lose their name).  No allocation on the hot path. */
 #define CT_DEPTH_ANCESTOR_CAP 16
 
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && defined(CT_STACKABLE_HOOKS_EXTERNAL_TLS)
+/* Depth-trace accessors are supplied by the host's external TLS backend. */
+#elif defined(_MSC_VER)
 /* Slot 0: depth counter (stored as ``intptr_t`` masquerading as
    ``void*`` -- the TLS slot is a pointer slot but TlsSetValue
    accepts any uintptr_t-wide value).  Slots 1..CT_DEPTH_ANCESTOR_CAP:
@@ -291,6 +341,7 @@ static void _ct_depth_trace_write_name(int frame, char* name) {
 }
 #endif
 
+#if !(defined(_MSC_VER) && defined(CT_STACKABLE_HOOKS_EXTERNAL_TLS))
 void _ct_depth_trace_push(char* name) {
   /* The ``name`` slot is treated as read-only (we never mutate the
      pointed-to bytes), but we declare the parameter as ``char*`` to
@@ -349,6 +400,7 @@ int _ct_depth_trace_snapshot(char* buf, int cap) {
   buf[pos] = '\0';
   return pos;
 }
+#endif
 """.}
 
 proc ctHookDepthGet*(): cint
@@ -382,45 +434,70 @@ template `hookDepth=`*(v: int) =
   ctHookDepthSet(cint(v))
 
 when defined(windows):
-  type DWORD = uint32
+  when defined(ctStackableHooksExternalTls):
+    proc ctHookSuppressedGet(): cint
+      {.importc: "_ct_hook_suppressed_get", cdecl.}
+    proc ctHookSuppressedSet(v: cint)
+      {.importc: "_ct_hook_suppressed_set", cdecl.}
 
-  const TlsOutOfIndexes = 0xFFFFFFFF'u32
+    proc initReentrancyTls*() = discard
 
-  proc TlsAlloc(): DWORD
-    {.importc, stdcall, dynlib: "kernel32".}
-  proc TlsGetValue(dwTlsIndex: DWORD): pointer
-    {.importc, stdcall, dynlib: "kernel32".}
-  proc TlsSetValue(dwTlsIndex: DWORD, lpTlsValue: pointer): int32
-    {.importc, stdcall, dynlib: "kernel32".}
+    proc hooksExplicitlySuppressedForCurrentThread*(): bool {.inline.} =
+      ctHookSuppressedGet() != 0
 
-  var gHookSuppressTlsIndex {.global.}: DWORD = TlsOutOfIndexes
+    proc suppressHooksForCurrentThread*() =
+      ctHookDepthSet(1)
+      ctHookSuppressedSet(1)
+  else:
+    type DWORD = uint32
 
-  proc initReentrancyTls*() =
-    if gHookSuppressTlsIndex == TlsOutOfIndexes:
-      let idx = TlsAlloc()
-      if idx != TlsOutOfIndexes:
-        gHookSuppressTlsIndex = idx
+    const TlsOutOfIndexes = 0xFFFFFFFF'u32
 
-  proc hooksSuppressedForCurrentThread(): bool {.inline.} =
-    gHookSuppressTlsIndex != TlsOutOfIndexes and
-      TlsGetValue(gHookSuppressTlsIndex) != nil
+    proc TlsAlloc(): DWORD
+      {.importc, stdcall, dynlib: "kernel32".}
+    proc TlsGetValue(dwTlsIndex: DWORD): pointer
+      {.importc, stdcall, dynlib: "kernel32".}
+    proc TlsSetValue(dwTlsIndex: DWORD, lpTlsValue: pointer): int32
+      {.importc, stdcall, dynlib: "kernel32".}
 
-  proc suppressHooksForCurrentThread*() =
-    ctHookDepthSet(1)
-    if gHookSuppressTlsIndex != TlsOutOfIndexes:
-      discard TlsSetValue(gHookSuppressTlsIndex, cast[pointer](1))
+    var gHookSuppressTlsIndex {.global.}: DWORD = TlsOutOfIndexes
+
+    proc initReentrancyTls*() =
+      if gHookSuppressTlsIndex == TlsOutOfIndexes:
+        let idx = TlsAlloc()
+        if idx != TlsOutOfIndexes:
+          gHookSuppressTlsIndex = idx
+
+    proc hooksExplicitlySuppressedForCurrentThread*(): bool {.inline.} =
+      ## True after `suppressHooksForCurrentThread` permanently retires this
+      ## thread from hook dispatch. Unlike hook depth, this remains true while
+      ## Windows runs thread-teardown code after the recorded worker returns.
+      gHookSuppressTlsIndex != TlsOutOfIndexes and
+        TlsGetValue(gHookSuppressTlsIndex) != nil
+
+    proc suppressHooksForCurrentThread*() =
+      ctHookDepthSet(1)
+      if gHookSuppressTlsIndex != TlsOutOfIndexes:
+        discard TlsSetValue(gHookSuppressTlsIndex, cast[pointer](1))
 else:
   proc initReentrancyTls*() = discard
 
-  proc hooksSuppressedForCurrentThread(): bool {.inline.} =
+  proc hooksExplicitlySuppressedForCurrentThread*(): bool {.inline.} =
+    ## POSIX represents permanent suppression through hook depth alone.
     false
 
   proc suppressHooksForCurrentThread*() =
     ctHookDepthSet(1)
 
+proc ctHooksExplicitlySuppressedForCurrentThread*(): cint
+    {.exportc: "_ct_hooks_explicitly_suppressed_for_current_thread", cdecl.} =
+  ## C instrumentation needs to distinguish temporary recorder recursion from
+  ## the permanent post-entrypoint state of a retiring program thread.
+  if hooksExplicitlySuppressedForCurrentThread(): 1.cint else: 0.cint
+
 proc hooksAllowed*(): bool =
   ## Returns true when no hook is currently executing on this thread.
-  ctHookDepthGet() == 0 and not hooksSuppressedForCurrentThread()
+  ctHookDepthGet() == 0 and not hooksExplicitlySuppressedForCurrentThread()
 
 proc currentHookDepth*(): int {.inline.} =
   ## MW39 (MCR-Windows-CtMcr-Port) -- public accessor for the per-thread

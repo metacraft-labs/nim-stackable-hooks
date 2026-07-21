@@ -55,7 +55,8 @@
 ## `test_reentrancy.nim` (which uses `hookDepth == N` assertions
 ## directly) compiles unmodified.
 
-when defined(windows) and defined(ctStackableHooksExternalTls):
+when defined(windows) and defined(vcc) and
+    defined(ctStackableHooksExternalTls):
   {.passC: "/DCT_STACKABLE_HOOKS_EXTERNAL_TLS".}
 
 {.emit: """
@@ -434,7 +435,7 @@ template `hookDepth=`*(v: int) =
   ctHookDepthSet(cint(v))
 
 when defined(windows):
-  when defined(ctStackableHooksExternalTls):
+  when defined(ctStackableHooksExternalTls) and defined(vcc):
     proc ctHookSuppressedGet(): cint
       {.importc: "_ct_hook_suppressed_get", cdecl.}
     proc ctHookSuppressedSet(v: cint)

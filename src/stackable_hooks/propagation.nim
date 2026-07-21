@@ -79,12 +79,14 @@ proc rewriteSipPath*(binaryPath: string, sandboxToolsDir: string): string =
   ##   => "/usr/local/bin/python3"  (not SIP-protected)
   for prefix in sipProtectedPrefixes:
     if binaryPath.startsWith(prefix):
-      # Strip leading slash so we can join with sandboxToolsDir
+      # Preserve the sandbox root's path style. This keeps the helper usable
+      # by cross-platform tooling that prepares a macOS sandbox remotely.
       let stripped = binaryPath.strip(leading = true, trailing = false, chars = {'/'})
-      if sandboxToolsDir.endsWith("/"):
-        return sandboxToolsDir & stripped
-      else:
-        return sandboxToolsDir & "/" & stripped
+      let separator = if '\\' in sandboxToolsDir: '\\' else: '/'
+      let tail = if separator == '\\': stripped.replace('/', '\\') else: stripped
+      if sandboxToolsDir.endsWith($separator):
+        return sandboxToolsDir & tail
+      return sandboxToolsDir & $separator & tail
   result = binaryPath
 
 proc isSipProtected*(binaryPath: string): bool =
@@ -115,14 +117,19 @@ proc unrewriteSipPath*(binaryPath: string, sandboxToolsDir: string): string =
   if sandboxToolsDir.len == 0:
     return binaryPath
   var root = sandboxToolsDir
-  # Normalise a single trailing slash so the prefix comparison is exact.
-  while root.len > 1 and root[^1] == '/':
+  let separator = if '\\' in root: '\\' else: '/'
+  # Normalise trailing separators so the prefix comparison is exact.
+  while root.len > 1 and root[^1] == separator:
     root.setLen(root.len - 1)
-  let prefix = root & "/"
+  let prefix = root & $separator
   if not binaryPath.startsWith(prefix):
     return binaryPath
   # Restore the original absolute path: leading slash + the mirrored remainder.
-  let original = "/" & binaryPath[prefix.len .. ^1]
+  let remainder = if separator == '\\':
+                    binaryPath[prefix.len .. ^1].replace('\\', '/')
+                  else:
+                    binaryPath[prefix.len .. ^1]
+  let original = "/" & remainder
   # Only treat it as a sandbox copy if the restored path is genuinely SIP-
   # protected; otherwise leave the input untouched (defensive — never invent a
   # system path for an unrelated sandbox-rooted file).

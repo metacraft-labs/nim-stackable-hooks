@@ -12,6 +12,7 @@ requires "nim >= 2.0.0"
 
 proc selectedTests(): seq[string] =
   result = @[
+    "tests/test_explicit_hook_suppression.nim",
     "tests/test_hook_registry_priority_order.nim",
     "tests/test_linux_raw_syscalls.nim",
     "tests/test_per_library_enable_disable.nim",

@@ -14,10 +14,14 @@ test-logs/
 
 # Compiled Nim test executables (the `.nim` sources are tracked; the binaries
 # `nim c -r` drops next to them are build artifacts).
-tests/test_smoke
-tests/test_hook_registry_priority_order
-tests/test_reentrancy_guard_prevents_recursion
-tests/test_linux_raw_syscalls
+#
+# Matched by pattern rather than listed one-by-one: the per-file list went
+# stale as soon as tests were added, leaving six untracked binaries in a
+# tree that the workspace pre-push hook requires to be clean.  The pattern
+# subsumes every entry the old per-file list carried, including the
+# `tests/test_linux_raw_syscalls` line added on `dev`.
+tests/test_*
+!tests/test_*.nim
 
 # Direnv environment cache
 .direnv/

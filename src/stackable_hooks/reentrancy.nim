@@ -198,6 +198,34 @@ int _ct_hook_depth_dec_and_get(void) {
 static _Thread_local __attribute__((tls_model("initial-exec")))
     int _ct_hook_depth_storage = 0;
 
+/* Explicit-suppression flag -- the POSIX counterpart of the Windows
+   ``gHookSuppressTlsIndex`` TLS slot.  This is DISTINCT storage from
+   the depth counter above: the depth counter says "a hook is running
+   on this thread right now", while this flag says "this thread was
+   deliberately and permanently retired from hook dispatch by a call
+   to ``suppressHooksForCurrentThread``".  ``hooksAllowed`` gates on
+   both; ``hooksExplicitlySuppressedForCurrentThread`` gates on this
+   flag alone, which is what a caller that is legitimately reentrant
+   (and brackets its own body with enterHook/exitHook) needs.
+
+   Before this existed the POSIX predicate was a hardcoded ``false``,
+   so on POSIX a thread that had asked to be suppressed still reported
+   "not suppressed" -- a guard that compiles, reads correctly, and
+   gates nothing.  Same storage model and rationale as the depth
+   counter: ``initial-exec`` so the read is a single fs/tpidr-relative
+   load with no ``__tls_get_addr`` PLT round-trip on the hook hot
+   path. */
+static _Thread_local __attribute__((tls_model("initial-exec")))
+    int _ct_hook_explicit_suppress_storage = 0;
+
+int _ct_hook_explicit_suppress_get(void) {
+  return _ct_hook_explicit_suppress_storage;
+}
+
+void _ct_hook_explicit_suppress_set(int v) {
+  _ct_hook_explicit_suppress_storage = (v != 0);
+}
+
 int _ct_hook_depth_get(void) {
   return _ct_hook_depth_storage;
 }
@@ -470,25 +498,46 @@ when defined(windows):
           gHookSuppressTlsIndex = idx
 
     proc hooksExplicitlySuppressedForCurrentThread*(): bool {.inline.} =
-      ## True after `suppressHooksForCurrentThread` permanently retires this
-      ## thread from hook dispatch. Unlike hook depth, this remains true while
-      ## Windows runs thread-teardown code after the recorded worker returns.
+      ## True when this thread was permanently retired from hook dispatch
+      ## by ``suppressHooksForCurrentThread``.  Reads the dedicated TLS
+      ## flag ONLY -- it is deliberately blind to the reentrancy depth
+      ## counter.  A thread merely nested inside an outer hook therefore
+      ## reads FALSE here even though ``hooksAllowed`` reads false for it;
+      ## that disagreement is the whole point of this predicate.  It also
+      ## stays true while Windows runs thread-teardown code after the
+      ## recorded worker has returned.
       gHookSuppressTlsIndex != TlsOutOfIndexes and
         TlsGetValue(gHookSuppressTlsIndex) != nil
 
     proc suppressHooksForCurrentThread*() =
       ctHookDepthSet(1)
+      # Re-run the (idempotent) allocation rather than assuming an earlier
+      # initReentrancyTls call already succeeded.  Without this, a
+      # suppression request that arrives before -- or after a failed --
+      # initReentrancyTls sets the depth counter but silently drops the
+      # flag, and the thread then reports "not explicitly suppressed"
+      # forever.
+      initReentrancyTls()
       if gHookSuppressTlsIndex != TlsOutOfIndexes:
         discard TlsSetValue(gHookSuppressTlsIndex, cast[pointer](1))
 else:
+  proc ctHookExplicitSuppressGet(): cint
+      {.importc: "_ct_hook_explicit_suppress_get", cdecl.}
+  proc ctHookExplicitSuppressSet(v: cint)
+      {.importc: "_ct_hook_explicit_suppress_set", cdecl.}
+
   proc initReentrancyTls*() = discard
 
   proc hooksExplicitlySuppressedForCurrentThread*(): bool {.inline.} =
-    ## POSIX represents permanent suppression through hook depth alone.
-    false
+    ## True when this thread was permanently retired from hook dispatch
+    ## by ``suppressHooksForCurrentThread``.  Reads the dedicated
+    ## per-thread flag ONLY -- deliberately blind to the reentrancy
+    ## depth counter.  See the Windows branch for the full contract.
+    ctHookExplicitSuppressGet() != 0
 
   proc suppressHooksForCurrentThread*() =
     ctHookDepthSet(1)
+    ctHookExplicitSuppressSet(1)
 
 proc ctHooksExplicitlySuppressedForCurrentThread*(): cint
     {.exportc: "_ct_hooks_explicitly_suppressed_for_current_thread", cdecl.} =
@@ -497,7 +546,23 @@ proc ctHooksExplicitlySuppressedForCurrentThread*(): cint
   if hooksExplicitlySuppressedForCurrentThread(): 1.cint else: 0.cint
 
 proc hooksAllowed*(): bool =
-  ## Returns true when no hook is currently executing on this thread.
+  ## Returns true when no hook is currently executing on this thread
+  ## AND the thread has not been explicitly retired from hook dispatch.
+  ##
+  ## Two independent gates, deliberately kept separate:
+  ##
+  ## * ``ctHookDepthGet() == 0`` -- the reentrancy gate.  Transient:
+  ##   raised by ``enterHook`` and lowered by the matching ``exitHook``.
+  ## * ``hooksExplicitlySuppressedForCurrentThread()`` -- the explicit
+  ##   gate.  Permanent for the thread's remaining lifetime; set only
+  ##   by ``suppressHooksForCurrentThread``, never by hook nesting.
+  ##
+  ## A caller that is legitimately running inside an outer hook and
+  ## brackets its own body with ``enterHook`` / ``exitHook`` wants the
+  ## explicit gate ALONE, and must call
+  ## ``hooksExplicitlySuppressedForCurrentThread`` directly rather than
+  ## ``hooksAllowed``, which would also reject it for the depth it
+  ## legitimately holds.
   ctHookDepthGet() == 0 and not hooksExplicitlySuppressedForCurrentThread()
 
 proc currentHookDepth*(): int {.inline.} =

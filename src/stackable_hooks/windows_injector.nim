@@ -53,6 +53,28 @@ proc buildCommandLine(argv: openArray[string]): string =
     parts.add(quoteWindowsArg(a))
   result = parts.join(" ")
 
+proc resolveWindowsExecutable(executable, cwd: string): string =
+  let (head, _, ext) = splitFile(executable)
+  if head.len > 0 or isAbsolute(executable):
+    let candidate =
+      if isAbsolute(executable) or cwd.len == 0: executable
+      else: cwd / executable
+    if fileExists(candidate):
+      return absolutePath(candidate)
+    if ext.len == 0 and fileExists(candidate & ExeExt):
+      return absolutePath(candidate & ExeExt)
+  result = findExe(executable)
+
+proc windowsForkRuntimeForExecutable*(executable: string; cwd = ""): string =
+  ## Return the adjacent MSYS2/Cygwin runtime used by ``executable``.
+  ## Their fork emulation cannot tolerate a pre-main remote thread.
+  let executablePath = resolveWindowsExecutable(executable, cwd)
+  if executablePath.len == 0:
+    return ""
+  for runtime in ["msys-2.0.dll", "cygwin1.dll"]:
+    if fileExists(parentDir(executablePath) / runtime):
+      return runtime
+
 {.push raises: [OSError].}
 
 type
@@ -224,6 +246,8 @@ const
 type
   WindowsInjectionResult* = object
     exitCode*: int
+    monitoringSkipped*: bool
+    skipReason*: string
 
 proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
     cwd = ""; captureStdio = false;
@@ -246,6 +270,15 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
     except ValueError: false
   if not dllExists:
     raise newException(OSError, "shim DLL not found: " & dllPath)
+
+  let forkRuntime =
+    try: windowsForkRuntimeForExecutable(argv[0], cwd)
+    except ValueError: ""
+  let skipInjection = forkRuntime.len > 0
+  if skipInjection:
+    result.monitoringSkipped = true
+    result.skipReason = "target uses " & forkRuntime &
+      ", whose fork emulation is incompatible with pre-main remote threads"
 
   let commandLine = buildCommandLine(argv)
   var cmdLineW = toWideCStringSeq(commandLine)
@@ -409,18 +442,22 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
       raise newException(OSError,
         "GetProcAddress(LoadLibraryW) returned NULL")
 
-    # 4. CreateRemoteThread(LoadLibraryW, remoteBuf).
-    let llThread = CreateRemoteThread(pi.hProcess, nil, 0,
-      loadLibraryW, remoteBuf, 0, nil)
-    if llThread == nil:
-      discard VirtualFreeEx(pi.hProcess, remoteBuf, 0, MEM_RELEASE)
-      raise newException(OSError,
-        "CreateRemoteThread(LoadLibraryW) failed (err=" & $GetLastError() & ")")
+    # 4. MSYS2/Cygwin fork emulation cannot tolerate a remote thread before
+    # the runtime initializes. Resume those targets without injection and let
+    # the caller mark the observation incomplete and noncacheable.
+    var llExit: DWORD = 1
+    if not skipInjection:
+      let llThread = CreateRemoteThread(pi.hProcess, nil, 0,
+        loadLibraryW, remoteBuf, 0, nil)
+      if llThread == nil:
+        discard VirtualFreeEx(pi.hProcess, remoteBuf, 0, MEM_RELEASE)
+        raise newException(OSError,
+          "CreateRemoteThread(LoadLibraryW) failed (err=" & $GetLastError() & ")")
 
-    discard WaitForSingleObject(llThread, INFINITE)
-    var llExit: DWORD = 0
-    discard GetExitCodeThread(llThread, addr llExit)
-    discard CloseHandle(llThread)
+      discard WaitForSingleObject(llThread, INFINITE)
+      llExit = 0
+      discard GetExitCodeThread(llThread, addr llExit)
+      discard CloseHandle(llThread)
     discard VirtualFreeEx(pi.hProcess, remoteBuf, 0, MEM_RELEASE)
 
     if llExit == 0:
@@ -442,7 +479,8 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
       tail
     var childMods: array[1024, HANDLE]
     var modCb: DWORD = 0
-    if EnumProcessModulesEx(pi.hProcess, cast[ptr pointer](addr childMods[0]),
+    if not skipInjection and
+        EnumProcessModulesEx(pi.hProcess, cast[ptr pointer](addr childMods[0]),
         DWORD(sizeof(childMods)), addr modCb, 0x3'u32) != 0:
       let modCount = int(modCb) div sizeof(HANDLE)
       for i in 0 ..< min(modCount, 1024):

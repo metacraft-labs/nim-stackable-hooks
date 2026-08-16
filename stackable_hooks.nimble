@@ -27,6 +27,7 @@ proc selectedTests(): seq[string] =
   when defined(linux):
     result.add "tests/test_linux_preload_helpers.nim"
   when defined(windows):
+    result.add "tests/test_windows_injector_fork_runtime.nim"
     result.add "tests/test_propagation_windows_edge_cases.nim"
     result.add "tests/test_propagation_windows_fork_bomb.nim"
     result.add "tests/test_propagation_windows_smoke.nim"

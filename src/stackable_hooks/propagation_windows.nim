@@ -44,10 +44,11 @@ when not defined(windows):
 
 {.push raises: [].}
 
-import std/[atomics, locks, os, strutils]
+import std/[atomics, locks, strutils, widestrs]
 
 import ./hook_registry
 import ./propagation
+import ./windows_fork_runtime
 
 # ---------------------------------------------------------------------------
 # Win32 typedefs and imports
@@ -64,17 +65,6 @@ type
   LPSECURITY_ATTRIBUTES = pointer
   SIZE_T = uint
 
-  STARTUPINFOW {.bycopy.} = object
-    cb: DWORD
-    lpReserved: LPWSTR
-    lpDesktop: LPWSTR
-    lpTitle: LPWSTR
-    dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars: DWORD
-    dwFillAttribute, dwFlags: DWORD
-    wShowWindow, cbReserved2: uint16
-    lpReserved2: ptr byte
-    hStdInput, hStdOutput, hStdError: HANDLE
-
   PROCESS_INFORMATION {.bycopy.} = object
     hProcess, hThread: HANDLE
     dwProcessId, dwThreadId: DWORD
@@ -90,8 +80,6 @@ const
   GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS = 0x00000004'u32
   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT = 0x00000002'u32
 
-proc GetCurrentProcessId(): DWORD
-  {.importc, stdcall, dynlib: "kernel32".}
 proc GetLastError(): DWORD
   {.importc, stdcall, dynlib: "kernel32".}
 proc SetLastError(dwErrCode: DWORD)
@@ -135,6 +123,25 @@ proc ResumeThread(hThread: HANDLE): DWORD
   {.importc, stdcall, dynlib: "kernel32".}
 proc CloseHandle(hObject: HANDLE): BOOL
   {.importc, stdcall, dynlib: "kernel32".}
+proc QueryFullProcessImageNameW(hProcess: HANDLE, dwFlags: DWORD,
+                                lpExeName: LPWSTR,
+                                lpdwSize: ptr DWORD): BOOL
+  {.importc, stdcall, dynlib: "kernel32".}
+
+proc windowsProcessImagePath*(hProcess: pointer): string =
+  ## Resolve a child image after CreateProcessW has created it suspended.
+  ## Querying the process avoids reparsing Windows command-line quoting.
+  if hProcess == nil:
+    return ""
+  var pathBuffer: array[32768, uint16]
+  var pathChars = DWORD(pathBuffer.len)
+  if QueryFullProcessImageNameW(hProcess, 0'u32,
+      cast[LPWSTR](addr pathBuffer[0]), addr pathChars) == 0:
+    return ""
+  `$`(cast[WideCString](addr pathBuffer[0]), int(pathChars))
+
+proc windowsForkRuntimeForProcess*(hProcess: pointer): string =
+  windowsForkRuntimeForImagePath(windowsProcessImagePath(hProcess))
 
 # ---------------------------------------------------------------------------
 # Configuration + outcome types
@@ -325,7 +332,7 @@ proc injectShimIntoChild*(hProcess: HANDLE;
   if GetModuleHandleExW(
       GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS or
         GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-      cast[LPCWSTR](cast[ByteAddress](injectShimIntoChild)),
+      cast[LPCWSTR](cast[uint](injectShimIntoChild)),
       addr ourMod) == 0 or ourMod == nil:
     return ioInjected
   let ourInit = GetProcAddress(ourMod, initSymbol.cstring)
@@ -395,14 +402,19 @@ proc autoPropagateCreateProcessW*(ctx: var HookContext) {.raises: [].} =
     SetLastError(savedLastError)
     return
 
-  let cfg = defaultInjectionConfig()
-  for node in propagationNodes():
-    if not node.enabled.load():
-      continue
-    if node.libraryPath.len == 0:
-      continue
-    discard injectShimIntoChild(pi[].hProcess, node.libraryPath,
-      node.initSymbol, cfg)
+  # A native launcher such as make.exe can spawn MSYS2/Cygwin workers.
+  # Injecting a remote thread before their fork runtime initializes wedges the
+  # child. Leave that subtree uninstrumented; consumers conservatively mark the
+  # unmatched process subtree incomplete.
+  if windowsForkRuntimeForProcess(pi[].hProcess).len == 0:
+    let cfg = defaultInjectionConfig()
+    for node in propagationNodes():
+      if not node.enabled.load():
+        continue
+      if node.libraryPath.len == 0:
+        continue
+      discard injectShimIntoChild(pi[].hProcess, node.libraryPath,
+        node.initSymbol, cfg)
 
   if not callerAskedSuspended:
     discard ResumeThread(pi[].hThread)
@@ -421,7 +433,7 @@ proc resolveSelfImagePath*(addressInside: pointer): string =
   if GetModuleHandleExW(
       GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS or
         GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-      cast[LPCWSTR](cast[ByteAddress](addressInside)),
+      cast[LPCWSTR](cast[uint](addressInside)),
       addr h) == 0 or h == nil:
     return ""
   var buf: array[1024, uint16]

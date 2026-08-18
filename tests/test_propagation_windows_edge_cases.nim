@@ -17,9 +17,23 @@ when not defined(windows):
   echo "[skip] propagation_windows_edge_cases is Windows-only"
   quit(0)
 
-import std/unittest
+import std/[os, osproc, strutils, unittest]
 
 import stackable_hooks/propagation_windows
+import stackable_hooks/windows_fork_runtime
+
+type
+  HANDLE = pointer
+  DWORD = uint32
+  BOOL = int32
+
+const ProcessQueryLimitedInformation = 0x1000'u32
+
+proc OpenProcess(dwDesiredAccess: DWORD, bInheritHandle: BOOL,
+                 dwProcessId: DWORD): HANDLE
+  {.importc, stdcall, dynlib: "kernel32".}
+proc CloseHandle(hObject: HANDLE): BOOL
+  {.importc, stdcall, dynlib: "kernel32".}
 
 suite "propagation_windows_edge_cases":
   test "injectShimIntoChild: nil hProcess with non-empty path falls through":
@@ -77,3 +91,24 @@ suite "propagation_windows_edge_cases":
     # crash. A NULL address-inside is a programming error and the OS
     # will reject it; we want a string surface, not an AV.
     check p.len >= 0
+
+  test "live MSYS child is excluded from recursive injection":
+    let shell = findExe("sh")
+    let expectedRuntime = windowsForkRuntimeForExecutable(shell)
+    if shell.len == 0 or expectedRuntime.len == 0:
+      checkpoint("MSYS2/Cygwin shell is not installed; integration probe skipped")
+    else:
+      let child = startProcess(shell, args = @["-c", "read ignored"],
+        options = {poStdErrToStdOut})
+      defer:
+        terminate(child)
+        discard waitForExit(child, 5000)
+        close(child)
+      let handle = OpenProcess(ProcessQueryLimitedInformation, BOOL(0),
+        DWORD(processID(child)))
+      require handle != nil
+      defer: discard CloseHandle(handle)
+
+      check windowsProcessImagePath(handle).extractFilename().cmpIgnoreCase(
+        shell.extractFilename()) == 0
+      check windowsForkRuntimeForProcess(handle) == expectedRuntime

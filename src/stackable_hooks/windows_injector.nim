@@ -11,6 +11,10 @@ when not defined(windows):
 
 import std/[os, strutils]
 
+import ./windows_fork_runtime
+
+export windows_fork_runtime
+
 proc toWideCStringSeq(s: string): seq[uint16] =
   result = newSeq[uint16](s.len + 1)
   for i, c in s:
@@ -57,28 +61,6 @@ proc buildCommandLine(argv: openArray[string]): string =
     parts.add(quoteWindowsArg(a))
   result = parts.join(" ")
 
-proc resolveWindowsExecutable(executable, cwd: string): string =
-  let (head, _, ext) = splitFile(executable)
-  if head.len > 0 or isAbsolute(executable):
-    let candidate =
-      if isAbsolute(executable) or cwd.len == 0: executable
-      else: cwd / executable
-    if fileExists(candidate):
-      return absolutePath(candidate)
-    if ext.len == 0 and fileExists(candidate & ExeExt):
-      return absolutePath(candidate & ExeExt)
-  result = findExe(executable)
-
-proc windowsForkRuntimeForExecutable*(executable: string; cwd = ""): string =
-  ## Return the adjacent MSYS2/Cygwin runtime used by ``executable``.
-  ## Their fork emulation cannot tolerate a pre-main remote thread.
-  let executablePath = resolveWindowsExecutable(executable, cwd)
-  if executablePath.len == 0:
-    return ""
-  for runtime in ["msys-2.0.dll", "cygwin1.dll"]:
-    if fileExists(parentDir(executablePath) / runtime):
-      return runtime
-
 {.push raises: [OSError].}
 
 type
@@ -89,8 +71,6 @@ type
   SIZE_T = uint
   LPVOID = pointer
   LPCVOID = pointer
-  LPCSTR = cstring
-  LPSTR = cstring
   LPCWSTR = ptr uint16
   LPWSTR = ptr uint16
   LPSECURITY_ATTRIBUTES = pointer
@@ -123,7 +103,6 @@ type
 
 const
   CREATE_SUSPENDED = 0x00000004'u32
-  CREATE_UNICODE_ENVIRONMENT = 0x00000400'u32
   STARTF_USESTDHANDLES = 0x00000100'u32
   MEM_COMMIT = 0x00001000'u32
   MEM_RESERVE = 0x00002000'u32

@@ -35,15 +35,19 @@ proc quoteWindowsArg(s: string): string =
     if ch == '\\':
       inc(backslashes)
     elif ch == '"':
-      for _ in 0 ..< (backslashes * 2):
+      # Backslashes before a quote are doubled; one more escapes the quote.
+      for _ in 0 ..< (backslashes * 2 + 1):
         result.add('\\')
       backslashes = 0
-      result.add('\\')
       result.add('"')
     else:
+      for _ in 0 ..< backslashes:
+        result.add('\\')
       backslashes = 0
       result.add(ch)
-  for _ in 0 ..< backslashes:
+  # Backslashes before the closing quote must be doubled so they are not
+  # interpreted as escaping that quote by CommandLineToArgvW-compatible CRTs.
+  for _ in 0 ..< (backslashes * 2):
     result.add('\\')
   result.add('"')
 

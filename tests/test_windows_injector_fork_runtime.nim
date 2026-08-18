@@ -3,17 +3,37 @@ import std/[os, osproc, strutils, tempfiles, unittest]
 import stackable_hooks/windows_injector
 
 const ProbeArg = "--msys-fork-probe"
+const ArgvProbeArg = "--argv-fidelity-probe"
+const ArgvProbeValues = [
+  "",
+  "space arg",
+  r"C:\path with space\zlib",
+  "format=%s\\n",
+  "caret=^left^right",
+  "quote=\"value\"",
+  "trailing path\\",
+]
+
+proc systemDllPath(): string =
+  getEnv("SystemRoot", r"C:\Windows") / "System32" / "kernel32.dll"
+
+proc runArgvFidelityProbe(): int =
+  let received = commandLineParams()
+  if received.len != ArgvProbeValues.len + 1:
+    return 10
+  for i, expected in ArgvProbeValues:
+    if received[i + 1] != expected:
+      return 20 + i
+  0
 
 proc runForkProbe(): int =
   let shell = findExe("sh")
   if shell.len == 0 or windowsForkRuntimeForExecutable(shell).len == 0:
     return 77
-  let systemRoot = getEnv("SystemRoot", r"C:\Windows")
-  let systemDll = systemRoot / "System32" / "kernel32.dll"
   let capturePath = getTempDir() / "stackable-hooks-msys-fork-probe.log"
   let injection = runWithMonitorShim(
     @[shell, "-c", "/usr/bin/true; echo stackable-hooks-msys-fork-ok"],
-    systemDll,
+    systemDllPath(),
     captureStdio = true,
     captureStdioPath = capturePath)
   if injection.exitCode != 0:
@@ -26,8 +46,17 @@ proc runForkProbe(): int =
 
 if paramCount() == 1 and paramStr(1) == ProbeArg:
   quit(runForkProbe())
+if paramCount() > 0 and paramStr(1) == ArgvProbeArg:
+  quit(runArgvFidelityProbe())
 
 suite "Windows injector fork-runtime handling":
+  test "CreateProcess command lines preserve every argument byte":
+    var argv = @[getAppFilename(), ArgvProbeArg]
+    argv.add(ArgvProbeValues)
+    let injection = runWithMonitorShim(argv, systemDllPath())
+    check injection.exitCode == 0
+    check not injection.monitoringSkipped
+
   test "detects adjacent MSYS2 and Cygwin runtimes":
     let fixture = createTempDir("stackable-hooks-", "-fork-runtime")
     defer: removeDir(fixture)

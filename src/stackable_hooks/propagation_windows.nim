@@ -49,6 +49,7 @@ import std/[atomics, locks, strutils, widestrs]
 import ./hook_registry
 import ./propagation
 import ./windows_fork_runtime
+import ./windows_injector
 
 # ---------------------------------------------------------------------------
 # Win32 typedefs and imports
@@ -91,6 +92,8 @@ proc GetModuleHandleExW(dwFlags: DWORD, lpModuleName: LPCWSTR,
   {.importc, stdcall, dynlib: "kernel32".}
 proc GetModuleFileNameW(hModule: HANDLE, lpFilename: LPWSTR,
                         nSize: DWORD): DWORD
+  {.importc, stdcall, dynlib: "kernel32".}
+proc IsWow64Process(hProcess: HANDLE, Wow64Process: ptr BOOL): BOOL
   {.importc, stdcall, dynlib: "kernel32".}
 proc GetProcAddress(hModule: HANDLE, lpProcName: cstring): pointer
   {.importc, stdcall, dynlib: "kernel32".}
@@ -277,15 +280,23 @@ proc injectShimIntoChild*(hProcess: HANDLE;
   if libraryPath.len == 0:
     return ioNothingToInject
 
+  # A 32-bit child takes the 32-bit shim, so the already-present check has
+  # to look for the shim that would actually be injected -- see
+  # docs/windows-wow64-injection.md.
+  var childIsWow64: BOOL = 0
+  discard IsWow64Process(hProcess, addr childIsWow64)
+  let effectiveLibrary =
+    if childIsWow64 != 0: wow64ShimPathFor(libraryPath) else: libraryPath
+
   if cfg.skipIfImageHasShim and
-      childHasModule(hProcess, basenameOf(libraryPath)):
+      childHasModule(hProcess, basenameOf(effectiveLibrary)):
     return ioAlreadyPresent
 
   if not tryAcquireInFlight(cfg.maxInFlight):
     return ioSkippedCap
   defer: releaseInFlight()
 
-  var wpath = wideStringFromString(libraryPath)
+  var wpath = wideStringFromString(effectiveLibrary)
   let bufSize = SIZE_T(wpath.len * sizeof(uint16))
   let remoteBuf = VirtualAllocEx(hProcess, nil, bufSize,
     MEM_COMMIT or MEM_RESERVE, PAGE_READWRITE)
@@ -298,13 +309,24 @@ proc injectShimIntoChild*(hProcess: HANDLE;
       bufSize, addr written) == 0:
     return ioInjectFailed
 
-  var kernel32Name = wideStringFromString("kernel32.dll")
-  let kernel32 = GetModuleHandleW(cast[LPCWSTR](addr kernel32Name[0]))
-  if kernel32 == nil:
-    return ioInjectFailed
-  let loadLibraryW = GetProcAddress(kernel32, "LoadLibraryW")
-  if loadLibraryW == nil:
-    return ioInjectFailed
+  # A WOW64 child's kernel32 is at a different base and this process
+  # cannot resolve that address; the 32-bit probe reports it. Refuse
+  # rather than fall back -- a wrong address starts a remote thread at a
+  # meaningless location instead of failing cleanly.
+  var loadLibraryW: pointer = nil
+  if childIsWow64 != 0:
+    let addr32 = wow64LoadLibraryWAddress(wow64ProbePathFor(libraryPath))
+    if addr32 == 0:
+      return ioInjectFailed
+    loadLibraryW = cast[pointer](uint(addr32))
+  else:
+    var kernel32Name = wideStringFromString("kernel32.dll")
+    let kernel32 = GetModuleHandleW(cast[LPCWSTR](addr kernel32Name[0]))
+    if kernel32 == nil:
+      return ioInjectFailed
+    loadLibraryW = GetProcAddress(kernel32, "LoadLibraryW")
+    if loadLibraryW == nil:
+      return ioInjectFailed
 
   let hThread = CreateRemoteThread(hProcess, nil, 0, loadLibraryW,
     remoteBuf, 0, nil)

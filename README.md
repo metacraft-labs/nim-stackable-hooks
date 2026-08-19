@@ -42,6 +42,7 @@ If you want to contribute or understand the library's internals:
 
 - [Architecture & Layout Guide](docs/contributors/architecture.md): Overview of components, directory layout, and how to run tests.
 - [Platform Primitives Details](docs/contributors/platform-primitives.md): Technical details on the low-level platform hook insertion engines (Linux raw syscalls, macOS VM remapping/interposing, Windows Detours/IAT patching).
+- [Injecting into 32-bit (WOW64) children on Windows](docs/windows-wow64-injection.md): Why a 64-bit injector cannot reach a 32-bit child, how the proc-address probe works, the shim/probe naming conventions, and the build hazards.
 
 ## License
 

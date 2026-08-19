@@ -9,7 +9,7 @@ when not defined(windows):
 # we optionally invoke an init entry point in the loaded DLL (also via
 # CreateRemoteThread), then resume the original main thread.
 
-import std/[os, strutils]
+import std/[locks, os, strutils, tables]
 
 import ./windows_fork_runtime
 
@@ -232,6 +232,153 @@ type
     monitoringSkipped*: bool
     skipReason*: string
 
+# ---------------------------------------------------------------------------
+# WOW64 (32-bit child) support
+#
+# `runWithMonitorShim` resolves `LoadLibraryW` in its OWN kernel32 and passes
+# that address to `CreateRemoteThread`. That holds only while injector and
+# child share a bitness: a 64-bit process and a WOW64 process load different
+# copies of kernel32 (System32 vs SysWOW64) at unrelated bases. A 64-bit
+# injector also cannot resolve the 32-bit address itself — LoadLibraryW of
+# SysWOW64\kernel32.dll fails on a machine-type mismatch.
+#
+# So the address is obtained from a 32-bit process instead: a tiny probe
+# executable (src/stackable_hooks/tools/wow64_proc_probe.nim) resolves the
+# proc in its own kernel32 and returns the pointer as its EXIT CODE — a
+# DWORD is exactly wide enough, needs no framing, and cannot be truncated.
+# The result is cached: kernel32's base is stable across WOW64 processes for
+# the life of a boot session, so one spawn per session is enough.
+#
+# NAMING CONVENTION (relied upon rather than configured, so callers that
+# already know the 64-bit shim path need to pass nothing extra):
+#
+#   <name>.dll                    the 64-bit shim
+#   <name>32.dll                  the 32-bit shim, same directory
+#   stackable_hooks_wow64_probe32.exe   the probe, same directory
+#
+# A caller that wants different locations can override both with
+# `setWow64ShimPath` / `setWow64ProbePath` before the first injection.
+# ---------------------------------------------------------------------------
+
+proc IsWow64Process(hProcess: HANDLE, Wow64Process: ptr BOOL): BOOL
+  {.importc, stdcall, dynlib: "kernel32".}
+
+const
+  Wow64ProbeExeName* = "stackable_hooks_wow64_probe32.exe"
+    ## Convention: the 32-bit probe sits beside the shim it serves.
+
+# The propagation path (`propagation_windows.injectShimIntoChild`) calls into
+# this state from worker threads, so every access is taken under a lock and
+# the accessors are `gcsafe`. The `cast(gcsafe)` is what the lock earns: the
+# globals are GC'd (a string and a Table), and the compiler cannot see that
+# the lock serialises them.
+
+var
+  wow64StateLock: Lock
+  wow64ShimPathOverride = ""
+  wow64ProbePathOverride = ""
+  wow64ProcAddressCache: Table[string, uint32]
+    ## Successful lookups only, keyed by "<probe><proc>".
+    ##
+    ## Successes are cached because the address is stable for the life of a
+    ## boot session, so re-spawning the probe per injection would be waste.
+    ## FAILURES are deliberately NOT cached: a probe that is missing now may
+    ## be built later in the same session, and a caller asking about a
+    ## different probe path must not be answered from an unrelated miss.
+
+proc setWow64ShimPath*(path: string) {.gcsafe.} =
+  ## Override the conventional `<name>32.dll` sibling lookup.
+  {.cast(gcsafe).}:
+    withLock wow64StateLock:
+      wow64ShimPathOverride = path
+
+proc setWow64ProbePath*(path: string) {.gcsafe.} =
+  ## Override the conventional `stackable_hooks_wow64_probe32.exe` sibling.
+  {.cast(gcsafe).}:
+    withLock wow64StateLock:
+      wow64ProbePathOverride = path
+
+proc wow64ShimPathFor*(dllPath64: string): string {.raises: [], gcsafe.} =
+  ## The 32-bit shim that pairs with `dllPath64`, by convention.
+  {.cast(gcsafe).}:
+    withLock wow64StateLock:
+      if wow64ShimPathOverride.len > 0:
+        return wow64ShimPathOverride
+  let (dir, name, ext) = splitFile(dllPath64)
+  dir / (name & "32" & ext)
+
+proc wow64ProbePathFor*(dllPath64: string): string {.raises: [], gcsafe.} =
+  ## The probe executable that pairs with `dllPath64`, by convention.
+  {.cast(gcsafe).}:
+    withLock wow64StateLock:
+      if wow64ProbePathOverride.len > 0:
+        return wow64ProbePathOverride
+  dllPath64.parentDir / Wow64ProbeExeName
+
+proc processIsWow64*(hProcess: HANDLE): bool {.raises: [], gcsafe.} =
+  ## True when `hProcess` is a 32-bit process on 64-bit Windows. On a 32-bit
+  ## host every process reports false and the ordinary same-bitness path is
+  ## already correct, so a false answer is always safe.
+  # The winapi wrappers are declared under this module's
+  # `{.push raises: [OSError].}`, so the call is wrapped to keep this proc
+  # callable from the `{.raises: [].}` propagation path. A failed query is
+  # reported as "not WOW64", which routes to the ordinary same-bitness path
+  # -- correct on 32-bit hosts and the safe answer everywhere else.
+  try:
+    var isWow: BOOL = 0
+    if IsWow64Process(hProcess, addr isWow) == 0:
+      return false
+    isWow != 0
+  except OSError:
+    false
+
+proc runProbeForExitCode(probeExe, procName: string): uint32 {.raises: [], gcsafe.} =
+  ## Spawn the 32-bit probe and return its exit code verbatim.
+  try:
+    var si: STARTUPINFOW
+    si.cb = DWORD(sizeof(STARTUPINFOW))
+    var pi: PROCESS_INFORMATION
+    var commandLine = buildCommandLine([probeExe, procName])
+    var commandLineW = toWideCStringSeq(commandLine)
+    if CreateProcessW(nil, cast[LPWSTR](addr commandLineW[0]), nil, nil, 0,
+        0, nil, nil, cast[ptr STARTUPINFOW](addr si), addr pi) == 0:
+      return 0
+    discard WaitForSingleObject(pi.hProcess, INFINITE)
+    var exitCode: DWORD = 0
+    discard GetExitCodeProcess(pi.hProcess, addr exitCode)
+    discard CloseHandle(pi.hThread)
+    discard CloseHandle(pi.hProcess)
+    uint32(exitCode)
+  except OSError, Exception:
+    0'u32
+
+proc wow64LoadLibraryWAddress*(probeExe: string): uint32 {.raises: [], gcsafe.} =
+  ## Address of `LoadLibraryW` in a WOW64 process's kernel32, obtained once
+  ## per session from the probe. Returns 0 when unavailable — the caller
+  ## must treat that as "cannot inject into 32-bit children" and say so,
+  ## rather than falling back to the 64-bit address, which would start a
+  ## remote thread at a meaningless location.
+  let cacheKey = probeExe & "" & "LoadLibraryW"
+  # `getOrDefault` rather than `[]`: the module is under
+  # `{.push raises: [OSError].}` and `[]` can raise KeyError. 0 is already
+  # the "no answer" value, so the default coincides with the miss case.
+  {.cast(gcsafe).}:
+    withLock wow64StateLock:
+      let cached = wow64ProcAddressCache.getOrDefault(cacheKey, 0'u32)
+      if cached != 0'u32:
+        return cached
+  let probeExists =
+    try: fileExists(extendedPath(probeExe))
+    except CatchableError: false
+  if not probeExists:
+    return 0
+  let resolved = runProbeForExitCode(probeExe, "LoadLibraryW")
+  if resolved != 0:
+    {.cast(gcsafe).}:
+      withLock wow64StateLock:
+        wow64ProcAddressCache[cacheKey] = resolved
+  resolved
+
 proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
     cwd = ""; captureStdio = false;
     captureStdioPath = ""): WindowsInjectionResult =
@@ -394,8 +541,25 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
       discard CloseHandle(h)
 
   try:
+    # 0. Pick the shim matching the CHILD's bitness. A 32-bit child cannot
+    #    load the 64-bit shim (LoadLibraryW returns NULL on a machine-type
+    #    mismatch), and its kernel32 is at a different base, so both the
+    #    DLL and the LoadLibraryW address have to be switched together.
+    let childIsWow64 = processIsWow64(pi.hProcess)
+    let effectiveDllPath =
+      if childIsWow64: wow64ShimPathFor(dllPath) else: dllPath
+    if childIsWow64:
+      let shim32Exists =
+        try: fileExists(extendedPath(effectiveDllPath))
+        except ValueError: false
+      if not shim32Exists:
+        raise newException(OSError,
+          "child is a 32-bit (WOW64) process but the 32-bit shim is missing: " &
+          effectiveDllPath & " — build it with `nim c --cpu:i386` and place " &
+          "it beside the 64-bit shim, or call setWow64ShimPath")
+
     # 1. Allocate a buffer in the child for the wide DLL path.
-    var dllPathW = toWideCStringSeq(dllPath)
+    var dllPathW = toWideCStringSeq(effectiveDllPath)
     let bufSize = SIZE_T(dllPathW.len * sizeof(uint16))
     let remoteBuf = VirtualAllocEx(pi.hProcess, nil, bufSize,
       MEM_COMMIT or MEM_RESERVE, PAGE_READWRITE)
@@ -411,19 +575,41 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
       raise newException(OSError,
         "WriteProcessMemory failed (err=" & $GetLastError() & ")")
 
-    # 3. Resolve LoadLibraryW in our own kernel32 — its address is identical
-    #    in the child because kernel32 is loaded at the same base.
-    var kernel32Name = toWideCStringSeq("kernel32.dll")
-    let kernel32 = GetModuleHandleW(cast[LPCWSTR](addr kernel32Name[0]))
-    if kernel32 == nil:
-      discard VirtualFreeEx(pi.hProcess, remoteBuf, 0, MEM_RELEASE)
-      raise newException(OSError,
-        "GetModuleHandleW(kernel32) returned NULL")
-    let loadLibraryW = GetProcAddress(kernel32, "LoadLibraryW")
-    if loadLibraryW == nil:
-      discard VirtualFreeEx(pi.hProcess, remoteBuf, 0, MEM_RELEASE)
-      raise newException(OSError,
-        "GetProcAddress(LoadLibraryW) returned NULL")
+    # 3. Resolve LoadLibraryW as the CHILD sees it.
+    #
+    #    Same bitness: our own kernel32 is loaded at the same base in the
+    #    child, so GetProcAddress here is the child's address too.
+    #
+    #    WOW64 child: it is NOT. The child uses SysWOW64\kernel32.dll at an
+    #    unrelated base, and this process cannot resolve that address
+    #    itself. The 32-bit probe reports it via its exit code; see the
+    #    WOW64 section above.
+    var loadLibraryW: pointer = nil
+    if childIsWow64:
+      let probeExe = wow64ProbePathFor(dllPath)
+      let addr32 = wow64LoadLibraryWAddress(probeExe)
+      if addr32 == 0:
+        discard VirtualFreeEx(pi.hProcess, remoteBuf, 0, MEM_RELEASE)
+        raise newException(OSError,
+          "cannot resolve LoadLibraryW for the 32-bit child: the WOW64 probe " &
+          "at " & probeExe & " is missing or reported no address. Build it " &
+          "with `nim c --cpu:i386 src/stackable_hooks/tools/" &
+          "wow64_proc_probe.nim`, or call setWow64ProbePath. Refusing to " &
+          "use this process's 64-bit LoadLibraryW address, which would " &
+          "start a remote thread at a meaningless location in the child.")
+      loadLibraryW = cast[pointer](uint(addr32))
+    else:
+      var kernel32Name = toWideCStringSeq("kernel32.dll")
+      let kernel32 = GetModuleHandleW(cast[LPCWSTR](addr kernel32Name[0]))
+      if kernel32 == nil:
+        discard VirtualFreeEx(pi.hProcess, remoteBuf, 0, MEM_RELEASE)
+        raise newException(OSError,
+          "GetModuleHandleW(kernel32) returned NULL")
+      loadLibraryW = GetProcAddress(kernel32, "LoadLibraryW")
+      if loadLibraryW == nil:
+        discard VirtualFreeEx(pi.hProcess, remoteBuf, 0, MEM_RELEASE)
+        raise newException(OSError,
+          "GetProcAddress(LoadLibraryW) returned NULL")
 
     # 4. MSYS2/Cygwin fork emulation cannot tolerate a remote thread before
     # the runtime initializes. Resume those targets without injection and let
@@ -444,9 +630,21 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
     discard VirtualFreeEx(pi.hProcess, remoteBuf, 0, MEM_RELEASE)
 
     if llExit == 0:
+      # Report enough to tell the three causes apart without a rebuild: a
+      # missing transitive dependency of the shim, a machine-type mismatch
+      # (the historical failure — a 64-bit shim against a 32-bit child), and
+      # a shim whose DllMain failed. The bare "check that the DLL and its
+      # dependencies are present" wording that used to stand here named none
+      # of them and sent readers hunting.
       raise newException(OSError,
-        "LoadLibraryW in child returned NULL — the shim DLL did not load. " &
-        "Check that the DLL and its dependencies are present.")
+        "LoadLibraryW in child returned NULL (err=" & $GetLastError() & "): " &
+        "the shim DLL did not load. shim=" & effectiveDllPath &
+        " child=" & (if childIsWow64: "32-bit (WOW64)" else: "64-bit") &
+        ". Causes, in order of likelihood: a transitive dependency of the " &
+        "shim is not resolvable from the child's DLL search path (check " &
+        "with `objdump -p <shim>`; the shim should link the compiler " &
+        "runtime statically); the shim's machine type does not match the " &
+        "child; or the shim's DllMain returned FALSE.")
 
     # 5. Resolve repro_runtime_init in the child's copy of the shim DLL.
     #    GetExitCodeThread truncates the 64-bit HMODULE returned by
@@ -458,7 +656,7 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
     #    is what the loader will report.
     var foundShim: HANDLE = nil
     let wantBaseName = block:
-      let (_, tail) = splitPath(dllPath)
+      let (_, tail) = splitPath(effectiveDllPath)
       tail
     var childMods: array[1024, HANDLE]
     var modCb: DWORD = 0
@@ -486,7 +684,7 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
       # compute "init proc in child" as (foundShim base + (initProc - our
       # base)) where "our base" is the LoadLibraryW result inside the
       # parent (re-LoadLibrary on the parent's side).
-      var parentDllPathW = toWideCStringSeq(dllPath)
+      var parentDllPathW = toWideCStringSeq(effectiveDllPath)
       let parentShim = LoadLibraryWRaw(cast[LPCWSTR](addr parentDllPathW[0]))
       if parentShim != nil:
         let parentInit = GetProcAddress(parentShim, "repro_runtime_init")
@@ -601,3 +799,5 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
   discard HeapFree(processHeap, 0'u32, attrList)
 
 {.pop.}
+
+initLock(wow64StateLock)

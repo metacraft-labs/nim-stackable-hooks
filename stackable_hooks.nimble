@@ -31,6 +31,7 @@ proc selectedTests(): seq[string] =
     result.add "tests/test_propagation_windows_edge_cases.nim"
     result.add "tests/test_propagation_windows_fork_bomb.nim"
     result.add "tests/test_propagation_windows_smoke.nim"
+    result.add "tests/test_windows_wow64_injection.nim"
   sort(result)
 
 task test, "Run the stackable-hooks test suite":

@@ -47,6 +47,50 @@ Contract:
 | exit code | the address of the requested proc in a 32-bit process |
 | exit code `0` | resolution failed — unambiguous, since no proc lives at address 0 |
 | `argv[1]` | proc to resolve; defaults to `LoadLibraryW` |
+| `argv[1] argv[2]` | a DLL path and a proc name — exit code is that export's **RVA** |
+
+## Getting the shim initialised once it is loaded
+
+Loading the DLL is only half of injection. The shim installs its hooks from
+`repro_runtime_init`, which the injector starts as a second remote thread at
+`(the child's module base) + (the RVA of that export)`.
+
+The same-bitness path finds the RVA by loading the shim in the injector itself
+and subtracting the base. **That is impossible for a 32-bit shim** — a 64-bit
+process cannot `LoadLibraryW` a 32-bit image, for the same machine-type reason
+the child cannot load the 64-bit one.
+
+This failure is the quietest in the whole mechanism, and worth recognising by
+its shape. `LoadLibraryW` in the child *succeeded*, so nothing errors. The shim
+is present in the child, correctly mapped, and completely inert: no hooks
+installed, not one record emitted. What it looks like from outside is a process
+with no dependencies.
+
+The probe's second mode answers it: an RVA is bitness-agnostic once something
+that *can* read the image reports it. The DLL is opened with
+`DONT_RESOLVE_DLL_REFERENCES`, so its `DllMain` does not run — resolving an
+export needs only the mapped image, and running a monitor shim's initialiser
+inside the probe would install hooks there and emit stray records into whatever
+fragment directory the environment happens to name.
+
+The same correction applies to `propagation_windows`, where a **64-bit** shim
+propagating into a WOW64 grandchild injects `<name>32.dll` — a different binary
+whose exports sit at different offsets — so its own in-module RVA does not
+transfer either. A 32-bit shim propagating into a 32-bit child needs no probe:
+it *is* the image being injected.
+
+## Export names must match across bitnesses
+
+32-bit mingw decorates stdcall exports with the callee's argument byte count.
+`repro_runtime_init` takes one pointer, so a 32-bit build exports
+`repro_runtime_init@4` while the 64-bit build — where there is no stdcall to
+decorate — exports it plain. Every lookup asks for the undecorated name, so a
+decorated export resolves to nothing and produces exactly the silent
+loaded-but-inert child described above.
+
+Build the 32-bit shim with `-Wl,--kill-at` to strip the decoration, keeping one
+export name across both bitnesses, which is what the naming convention below
+already assumes.
 
 The probe carries a `sizeof(pointer) != 4` compile-time guard: a 64-bit build
 of it would resolve the 64-bit `kernel32` and confidently report an address
@@ -91,6 +135,12 @@ Both need an i686 toolchain (`pacman -S mingw-w64-i686-gcc` under MSYS2):
 nim c --cpu:i386 --cc:gcc --passL:"-static-libgcc" \
   --out:stackable_hooks_wow64_probe32.exe \
   src/stackable_hooks/tools/wow64_proc_probe.nim
+
+# The shim additionally needs --kill-at, so that its stdcall exports carry
+# the same names as the 64-bit build's (see "Export names" above).
+nim c --cpu:i386 --cc:gcc --app:lib \
+  --passL:"-static-libgcc" --passL:"-Wl,--kill-at" \
+  --out:librepro_monitor_shim32.dll <shim source>
 ```
 
 io-mon's `scripts/build_shim.sh` builds both the 32-bit shim and the probe

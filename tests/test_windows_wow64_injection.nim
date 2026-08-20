@@ -134,3 +134,82 @@ when defined(windows):
 
         # And it is cached: a second lookup returns the same answer.
         check wow64LoadLibraryWAddress(probe) == address
+
+  suite "windows_wow64_export_rva":
+    ## The offset of an export inside the 32-bit shim. The injector needs it
+    ## to start the shim's initialiser in the child once LoadLibraryW has
+    ## run there, and it cannot compute the offset the way the same-bitness
+    ## path does -- loading the image in this 64-bit process -- because a
+    ## 64-bit process cannot load a 32-bit DLL at all.
+    ##
+    ## That failure is why this suite exists rather than being folded into
+    ## the one above: it was invisible from outside. LoadLibraryW genuinely
+    ## succeeded, so no error was raised anywhere; the shim simply sat in
+    ## the child uninitialised, installed no hooks, and the process reported
+    ## zero records while the run still graded complete.
+    setup:
+      setWow64ProbePath("")
+
+    proc locateProbe(): string =
+      for candidate in [
+          getAppDir() / Wow64ProbeExeName,
+          getAppDir().parentDir / "lib" / Wow64ProbeExeName,
+          getCurrentDir() / "build" / "lib" / Wow64ProbeExeName]:
+        if fileExists(candidate):
+          return candidate
+      ""
+
+    test "a missing probe yields 0 rather than a bogus offset":
+      let missing = getTempDir() / "stackable-hooks-no-such-probe32.exe"
+      removeFile(missing)
+      check wow64ExportRva(missing, "whatever32.dll", "repro_runtime_init") ==
+        0'u32
+
+    test "a missing DLL yields 0":
+      # The probe runs but LoadLibraryEx fails, so it reports the same
+      # unavailable signal. 0 is safe to overload here because no export
+      # can sit at RVA 0 -- that offset is the DOS header.
+      let probe = locateProbe()
+      if probe.len == 0:
+        skip()
+      else:
+        check wow64ExportRva(probe,
+          getTempDir() / "stackable-hooks-no-such-shim32.dll",
+          "repro_runtime_init") == 0'u32
+
+    test "an unknown symbol yields 0":
+      let probe = locateProbe()
+      let shim = probe.parentDir / "librepro_monitor_shim32.dll"
+      if probe.len == 0 or not fileExists(shim):
+        skip()
+      else:
+        check wow64ExportRva(probe, shim, "no_such_export_exists") == 0'u32
+
+    test "the 32-bit shim's init export resolves to a plausible offset":
+      let probe = locateProbe()
+      let shim = probe.parentDir / "librepro_monitor_shim32.dll"
+      if probe.len == 0 or not fileExists(shim):
+        skip()
+      else:
+        let rva = wow64ExportRva(probe, shim, "repro_runtime_init")
+        # Non-zero, and an offset into the image rather than an absolute
+        # address: it must be smaller than the file itself.
+        check rva != 0'u32
+        check uint64(rva) < uint64(getFileSize(shim))
+
+        # Cached on success, like the kernel32 address.
+        check wow64ExportRva(probe, shim, "repro_runtime_init") == rva
+
+    test "the init export is undecorated in the 32-bit build":
+      # 32-bit mingw decorates stdcall exports with the callee's argument
+      # byte count, so an unguarded build exports `repro_runtime_init@4`
+      # while the 64-bit build exports it plain. Every lookup asks for the
+      # undecorated name, so a decorated export resolves to nothing and the
+      # shim is never initialised. io-mon's build passes -Wl,--kill-at to
+      # keep ONE name across both bitnesses; this asserts the result.
+      let probe = locateProbe()
+      let shim = probe.parentDir / "librepro_monitor_shim32.dll"
+      if probe.len == 0 or not fileExists(shim):
+        skip()
+      else:
+        check wow64ExportRva(probe, shim, "repro_runtime_init") != 0'u32

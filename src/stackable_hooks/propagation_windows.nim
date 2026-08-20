@@ -360,7 +360,24 @@ proc injectShimIntoChild*(hProcess: HANDLE;
   let ourInit = GetProcAddress(ourMod, initSymbol.cstring)
   if ourInit == nil:
     return ioInjected
-  let rva = cast[uint](ourInit) - cast[uint](ourMod)
+  var rva = cast[uint](ourInit) - cast[uint](ourMod)
+
+  # Our own module is only a valid stand-in for the child's when the two are
+  # the same image. A 64-bit shim propagating into a WOW64 grandchild injects
+  # `<name>32.dll`, a DIFFERENT binary whose exports sit at different
+  # offsets, so this RVA would name an arbitrary address there. Ask the
+  # 32-bit probe about the image actually being injected.
+  #
+  # A 32-bit shim propagating into a 32-bit child needs none of this: it IS
+  # the image being injected, so the offset it computed above is already the
+  # right one.
+  when sizeof(pointer) == 8:
+    if childIsWow64 != 0:
+      let fromProbe = wow64ExportRva(wow64ProbePathFor(libraryPath),
+        effectiveLibrary, initSymbol)
+      if fromProbe == 0'u32:
+        return ioInjectFailed
+      rva = uint(fromProbe)
 
   # Find the child-side base for the same library basename.
   let wantBase = basenameOf(libraryPath)

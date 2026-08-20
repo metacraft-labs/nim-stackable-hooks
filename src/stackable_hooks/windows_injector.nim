@@ -231,6 +231,12 @@ type
     exitCode*: int
     monitoringSkipped*: bool
     skipReason*: string
+    rootPid*: uint64
+      ## OS pid of the process that was launched and injected. Consumers
+      ## need it to check that the root child actually reported: a child
+      ## that emits nothing is indistinguishable from one that was never
+      ## hooked, and the only party who knows which pid SHOULD have
+      ## appeared is the launcher. 0 when no process was started.
 
 # ---------------------------------------------------------------------------
 # WOW64 (32-bit child) support
@@ -332,13 +338,15 @@ proc processIsWow64*(hProcess: HANDLE): bool {.raises: [], gcsafe.} =
   except OSError:
     false
 
-proc runProbeForExitCode(probeExe, procName: string): uint32 {.raises: [], gcsafe.} =
+proc runProbeForExitCode(probeExe: string;
+                         probeArgs: openArray[string]): uint32
+                        {.raises: [], gcsafe.} =
   ## Spawn the 32-bit probe and return its exit code verbatim.
   try:
     var si: STARTUPINFOW
     si.cb = DWORD(sizeof(STARTUPINFOW))
     var pi: PROCESS_INFORMATION
-    var commandLine = buildCommandLine([probeExe, procName])
+    var commandLine = buildCommandLine(@[probeExe] & @probeArgs)
     var commandLineW = toWideCStringSeq(commandLine)
     if CreateProcessW(nil, cast[LPWSTR](addr commandLineW[0]), nil, nil, 0,
         0, nil, nil, cast[ptr STARTUPINFOW](addr si), addr pi) == 0:
@@ -372,7 +380,42 @@ proc wow64LoadLibraryWAddress*(probeExe: string): uint32 {.raises: [], gcsafe.} 
     except CatchableError: false
   if not probeExists:
     return 0
-  let resolved = runProbeForExitCode(probeExe, "LoadLibraryW")
+  let resolved = runProbeForExitCode(probeExe, ["LoadLibraryW"])
+  if resolved != 0:
+    {.cast(gcsafe).}:
+      withLock wow64StateLock:
+        wow64ProcAddressCache[cacheKey] = resolved
+  resolved
+
+proc wow64ExportRva*(probeExe, dllPath32, procName: string): uint32
+                    {.raises: [], gcsafe.} =
+  ## Offset of `procName` from the base of the 32-bit `dllPath32`, obtained
+  ## from the probe. Returns 0 when unavailable.
+  ##
+  ## The injector needs this to call the shim's initialiser in the child
+  ## after LoadLibraryW has run there. For a same-bitness shim it computes
+  ## the offset by loading the DLL in this process and subtracting the base;
+  ## for a 32-bit shim it cannot, because a 64-bit process cannot load a
+  ## 32-bit image at all. That failure used to be silent in the worst way:
+  ## the shim WAS loaded in the child, so nothing errored, but its init was
+  ## never called, so no hooks were installed and the process reported not a
+  ## single record.
+  ##
+  ## Cached on success only, like the kernel32 address: a probe that is
+  ## missing now may be built later in the same session, and the offset for
+  ## one DLL must never be answered from another's entry.
+  let cacheKey = probeExe & "\x1f" & dllPath32 & "\x1f" & procName
+  {.cast(gcsafe).}:
+    withLock wow64StateLock:
+      let cached = wow64ProcAddressCache.getOrDefault(cacheKey, 0'u32)
+      if cached != 0'u32:
+        return cached
+  let probeExists =
+    try: fileExists(extendedPath(probeExe))
+    except CatchableError: false
+  if not probeExists:
+    return 0
+  let resolved = runProbeForExitCode(probeExe, [dllPath32, procName])
   if resolved != 0:
     {.cast(gcsafe).}:
       withLock wow64StateLock:
@@ -536,6 +579,8 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
     raise newException(OSError,
       "CreateProcessW failed (err=" & $GetLastError() & "): " & commandLine)
 
+  result.rootPid = uint64(pi.dwProcessId)
+
   template safeClose(h: HANDLE) =
     if h != nil:
       discard CloseHandle(h)
@@ -679,25 +724,44 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
           break
 
     if foundShim != nil:
-      # GetProcAddress returns the offset relative to the DLL base. Both our
-      # process and the child loaded the same image, so the RVA matches. We
-      # compute "init proc in child" as (foundShim base + (initProc - our
-      # base)) where "our base" is the LoadLibraryW result inside the
-      # parent (re-LoadLibrary on the parent's side).
-      var parentDllPathW = toWideCStringSeq(effectiveDllPath)
-      let parentShim = LoadLibraryWRaw(cast[LPCWSTR](addr parentDllPathW[0]))
+      # The init proc in the child sits at (child's module base + the RVA of
+      # the export). Only the RVA has to be discovered, and how depends on
+      # whether this process can load the image at all.
+      #
+      # Same bitness: load it here and subtract the base. GetProcAddress
+      # returns an address within our own mapping, and both processes mapped
+      # the same image, so the offset transfers.
+      #
+      # WOW64: a 64-bit process cannot LoadLibraryW a 32-bit DLL -- the load
+      # fails on the machine-type check. That used to end the sequence here
+      # with no error and no init: the shim was in the child, loaded and
+      # inert, hooks never installed, not one record emitted, while
+      # LoadLibraryW had plainly succeeded so nothing looked wrong. Ask the
+      # 32-bit probe for the offset instead; an RVA is bitness-agnostic once
+      # something that CAN read the image reports it.
+      var rva: uint = 0
+      var parentShim: HANDLE = nil
+      if childIsWow64:
+        let fromProbe = wow64ExportRva(wow64ProbePathFor(dllPath),
+          effectiveDllPath, "repro_runtime_init")
+        if fromProbe != 0'u32:
+          rva = uint(fromProbe)
+      else:
+        var parentDllPathW = toWideCStringSeq(effectiveDllPath)
+        parentShim = LoadLibraryWRaw(cast[LPCWSTR](addr parentDllPathW[0]))
+        if parentShim != nil:
+          let parentInit = GetProcAddress(parentShim, "repro_runtime_init")
+          if parentInit != nil:
+            rva = cast[uint](parentInit) - cast[uint](parentShim)
+
+      if rva != 0:
+        let childInit = cast[pointer](cast[uint](foundShim) + rva)
+        let initThread = CreateRemoteThread(pi.hProcess, nil, 0,
+          childInit, nil, 0, nil)
+        if initThread != nil:
+          discard WaitForSingleObject(initThread, INFINITE)
+          discard CloseHandle(initThread)
       if parentShim != nil:
-        let parentInit = GetProcAddress(parentShim, "repro_runtime_init")
-        if parentInit != nil:
-          let parentBase = cast[uint](parentShim)
-          let parentInitU = cast[uint](parentInit)
-          let rva = parentInitU - parentBase
-          let childInit = cast[pointer](cast[uint](foundShim) + rva)
-          let initThread = CreateRemoteThread(pi.hProcess, nil, 0,
-            childInit, nil, 0, nil)
-          if initThread != nil:
-            discard WaitForSingleObject(initThread, INFINITE)
-            discard CloseHandle(initThread)
         discard FreeLibraryRaw(parentShim)
 
     # 6. Resume the suspended main thread.

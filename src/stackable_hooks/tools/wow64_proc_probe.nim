@@ -29,12 +29,40 @@
 ##
 ## ## Contract
 ##
-##   * Exit code = the address of the requested proc in *this* (32-bit)
-##     process's kernel32.
-##   * Exit code ``0`` = resolution failed. ``LoadLibraryW`` is never at
-##     address 0, so 0 is unambiguous as a failure signal.
-##   * ``argv[1]``, when present, names the proc to resolve; it defaults to
-##     ``LoadLibraryW`` so the common case needs no arguments.
+## Two modes, selected by argument count:
+##
+##   * **kernel32 address** (0 or 1 args) — exit code is the address of the
+##     requested proc in *this* (32-bit) process's kernel32. ``argv[1]``, when
+##     present, names the proc; it defaults to ``LoadLibraryW`` so the common
+##     case needs no arguments.
+##   * **export RVA** (2 args: a DLL path and a proc name) — exit code is the
+##     offset of that export from the DLL's base address.
+##
+##   * Exit code ``0`` = resolution failed, in either mode. No proc lives at
+##     address 0, and no export sits at RVA 0 (that offset is the DOS
+##     header), so 0 is unambiguous.
+##
+## ### Why the RVA mode exists
+##
+## After ``LoadLibraryW`` has run in the child, the injector needs to call
+## ``repro_runtime_init`` there, which means knowing where that export landed.
+## It used to compute the offset by loading the same DLL in ITSELF and
+## subtracting the base — sound for a same-bitness shim, and impossible for a
+## 32-bit one: a 64-bit process cannot ``LoadLibraryW`` a 32-bit image at all.
+## The load simply failed, the offset was never computed, and the shim sat in
+## the child fully loaded with its init never called — hooks uninstalled, not
+## one record emitted, and no error anywhere, because loading the DLL had
+## genuinely succeeded.
+##
+## An offset is bitness-agnostic once you can read the image's exports, and a
+## 32-bit process can. Hence the second mode: same channel, same failure
+## convention, no PE parser.
+##
+## The DLL is loaded with ``DONT_RESOLVE_DLL_REFERENCES`` so its ``DllMain``
+## does NOT run. Resolving an export needs only the mapped image, and running
+## a monitor shim's initialiser inside the probe would install hooks in the
+## probe and emit stray records into whatever fragment directory the ambient
+## environment names.
 ##
 ## The caller is expected to invoke this once per session and cache the
 ## result — the address is stable for the lifetime of a boot session
@@ -68,10 +96,15 @@ type
   HANDLE = pointer
   LPCWSTR = ptr uint16
 
+const DONT_RESOLVE_DLL_REFERENCES = 0x00000001'u32
+
 proc GetModuleHandleW(lpModuleName: LPCWSTR): HANDLE
   {.importc: "GetModuleHandleW", stdcall, dynlib: "kernel32".}
 proc GetProcAddress(hModule: HANDLE, lpProcName: cstring): pointer
   {.importc: "GetProcAddress", stdcall, dynlib: "kernel32".}
+proc LoadLibraryExW(lpLibFileName: LPCWSTR, hFile: HANDLE,
+                    dwFlags: uint32): HANDLE
+  {.importc: "LoadLibraryExW", stdcall, dynlib: "kernel32".}
 
 proc toWide(s: string): seq[uint16] =
   result = newSeq[uint16](s.len + 1)
@@ -79,22 +112,42 @@ proc toWide(s: string): seq[uint16] =
     result[i] = uint16(ord(c))
   result[s.len] = 0
 
-proc main() =
-  let procName =
-    if paramCount() >= 1 and paramStr(1).len > 0: paramStr(1)
-    else: "LoadLibraryW"
+proc exportRva(dllPath, procName: string): int =
+  ## Offset of `procName` from the base of `dllPath`, or 0 if it cannot be
+  ## resolved. DONT_RESOLVE_DLL_REFERENCES maps the image without running its
+  ## DllMain or loading its dependencies -- everything GetProcAddress needs,
+  ## and nothing that would let the mapped DLL act.
+  var pathW = toWide(dllPath)
+  let module = LoadLibraryExW(cast[LPCWSTR](addr pathW[0]), nil,
+    DONT_RESOLVE_DLL_REFERENCES)
+  if module == nil:
+    return 0
+  let resolved = GetProcAddress(module, procName.cstring)
+  if resolved == nil:
+    return 0
+  # Deliberately not FreeLibrary'd: the process is about to exit, and the
+  # offset must stay valid until it is reported.
+  int(cast[uint](resolved) - cast[uint](module))
 
+proc kernel32Address(procName: string): int =
   var moduleName = toWide("kernel32.dll")
   let kernel32 = GetModuleHandleW(cast[LPCWSTR](addr moduleName[0]))
   if kernel32 == nil:
-    quit(0)
-
+    return 0
   let resolved = GetProcAddress(kernel32, procName.cstring)
   if resolved == nil:
-    quit(0)
-
+    return 0
   # `int` is 32-bit in this build, so the cast is exact and the OS receives
   # the pointer verbatim as the process exit code.
-  quit(cast[int](resolved))
+  cast[int](resolved)
+
+proc main() =
+  if paramCount() >= 2:
+    quit(exportRva(paramStr(1), paramStr(2)))
+
+  let procName =
+    if paramCount() >= 1 and paramStr(1).len > 0: paramStr(1)
+    else: "LoadLibraryW"
+  quit(kernel32Address(procName))
 
 main()

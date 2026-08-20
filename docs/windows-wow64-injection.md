@@ -171,6 +171,30 @@ without its toolchain reachable — and it is silent in every direction, so it i
 worth recognising by shape: **a spawned toolchain binary that fails with no
 diagnostic of its own has usually not reached `main`.**
 
+## What a 32-bit child gets, and what it does not
+
+Injection and initialisation reach parity with 64-bit children. Hook coverage
+does not, and the shortfall is reported rather than hidden.
+
+Inline detours are 64-bit-only: installing one means relocating the bytes it
+overwrites, which needs an instruction length decoder, and the one in
+`inline_hook/windows/length_decoder.c` decodes 64-bit mode — it treats
+`0x40`-`0x4F` as REX prefixes where 32-bit code has ordinary `INC`/`DEC reg`.
+32-bit builds therefore use IAT patching alone.
+
+IAT patching can only hook what a loaded module *imports*. An API resolved at
+runtime through `GetProcAddress`, or called directly against `ntdll`, has no
+import-table slot to swap — which is the whole reason inline detours exist.
+In practice a monitored 32-bit `cmd /c echo hi` hooks 23 of 32 entry points;
+the 9 it misses include the `NtQuery*` path probes its 64-bit twin records.
+
+That is a real evidence gap, so the shim emits an `mrEventLoss` naming the
+unhooked entry points and the run grades `mcIncomplete`. A consumer that keys
+cache publication on completeness will decline to publish, which is the
+intended outcome: partial observation must not produce a cache entry keyed on
+inputs that were never seen. Closing the gap means teaching the length decoder
+32-bit mode.
+
 ## Why this matters beyond correctness
 
 32-bit children are not exotic on Windows. PATH trampolines are a common

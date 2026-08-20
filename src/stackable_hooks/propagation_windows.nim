@@ -51,6 +51,10 @@ import ./propagation
 import ./windows_fork_runtime
 import ./windows_injector
 
+# Re-exported so a shim's spawn hook can consult it through this module,
+# which is the one it already imports for `injectShimIntoChild`.
+export windows_injector.spawningHelperProcess
+
 # ---------------------------------------------------------------------------
 # Win32 typedefs and imports
 # ---------------------------------------------------------------------------
@@ -280,6 +284,14 @@ proc injectShimIntoChild*(hProcess: HANDLE;
   if libraryPath.len == 0:
     return ioNothingToInject
 
+  # Never inject into our own probe/helper. Those are spawned from inside
+  # this very path, so injecting them recurses: the helper exists to inject
+  # a 64-bit child, and injecting the helper needs a helper. They are also
+  # not part of the traced program -- their I/O is infrastructure, not a
+  # dependency of the action being recorded.
+  if spawningHelperProcess():
+    return ioNothingToInject
+
   # A 32-bit child takes the 32-bit shim, so the already-present check has
   # to look for the shim that would actually be injected -- see
   # docs/windows-wow64-injection.md.
@@ -287,6 +299,29 @@ proc injectShimIntoChild*(hProcess: HANDLE;
   discard IsWow64Process(hProcess, addr childIsWow64)
   let effectiveLibrary =
     if childIsWow64 != 0: wow64ShimPathFor(libraryPath) else: libraryPath
+
+  when sizeof(pointer) == 4:
+    # We are a 32-bit shim. A child that is NOT WOW64 on 64-bit Windows is a
+    # 64-bit process, and none of what follows can reach it: our
+    # VirtualAllocEx / WriteProcessMemory / CreateRemoteThread go through the
+    # WOW64 thunk layer, which does not address a 64-bit address space, and
+    # we cannot resolve the 64-bit kernel32's LoadLibraryW either.
+    #
+    # This is not a corner case. A 32-bit PATH trampoline (scoop's shims are
+    # i386) is injected as a WOW64 child and then spawns the real 64-bit
+    # tool; that grandchild is exactly this situation, and leaving it
+    # uninjected makes the subtree an unknown-scope loss that disqualifies
+    # the action from the cache.
+    #
+    # So hand the whole operation to a 64-bit helper, the mirror of what the
+    # 32-bit probe does for a 64-bit injector.
+    if childIsWow64 == 0 and hostIsWow64Capable():
+      let shim64 = shim64PathFor(libraryPath)
+      if cfg.skipIfImageHasShim and childHasModule(hProcess,
+          basenameOf(shim64)):
+        return ioAlreadyPresent
+      return (if runInject64Helper(hProcess, shim64, initSymbol): ioInjected
+              else: ioInjectFailed)
 
   if cfg.skipIfImageHasShim and
       childHasModule(hProcess, basenameOf(effectiveLibrary)):

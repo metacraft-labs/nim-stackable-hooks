@@ -833,7 +833,19 @@ static int install_locked(void *target, void *hook, void **out_trampoline)
      * bytes; we provision 64 per slot. */
     const size_t TRAMP_BODY_OFF = 16u;
 
-    /* Emit the forwarding stub. */
+    /* Emit the forwarding stub.
+     *
+     * Both modes use `FF /4` (indirect JMP through memory) so the hook can
+     * live anywhere in the address space, but the operand differs:
+     *
+     *   64-bit: mod=00 rm=101 encodes [rip+disp32]. disp32=0 puts the
+     *           pointer in the 8 bytes right after the instruction.
+     *   32-bit: there is no RIP-relative form. mod=00 rm=101 is an
+     *           ABSOLUTE disp32, so the operand is the address of the
+     *           pointer slot rather than an offset to it -- which means it
+     *           must be computed from `slot`, not hard-coded to zero.
+     */
+#if CT_ILD_MODE64
     slot[0] = 0xFFu;
     slot[1] = 0x25u;
     slot[2] = 0x00u; slot[3] = 0x00u; slot[4] = 0x00u; slot[5] = 0x00u;
@@ -843,6 +855,24 @@ static int install_locked(void *target, void *hook, void **out_trampoline)
             slot[6 + i] = (uint8_t)((u >> (i * 8)) & 0xFFu);
         }
     }
+#else
+    /* JMP DWORD PTR [slot+8] ; then the pointer itself at slot+8. Offset 8
+     * (rather than 6, immediately after the instruction) keeps the pointer
+     * 4-byte aligned and leaves the layout below unchanged. */
+    slot[0] = 0xFFu;
+    slot[1] = 0x25u;
+    {
+        uint32_t ptr_at = (uint32_t)(uintptr_t)(slot + 8);
+        for (int i = 0; i < 4; i++) {
+            slot[2 + i] = (uint8_t)((ptr_at >> (i * 8)) & 0xFFu);
+        }
+        slot[6] = 0x90u; slot[7] = 0x90u;   /* pad to the aligned pointer */
+        uint32_t u = (uint32_t)(uintptr_t)hook;
+        for (int i = 0; i < 4; i++) {
+            slot[8 + i] = (uint8_t)((u >> (i * 8)) & 0xFFu);
+        }
+    }
+#endif
 
     /* Lazy-init the page's thunk arena so rel32 fixup has somewhere
      * to stash overflow thunks. */
@@ -1078,6 +1108,23 @@ int ct_inline_hook_install_no_suspend(void *target, void *hook,
  * bytes written (must equal CT_NORETURN_STUB_BYTES). */
 #define CT_NORETURN_STUB_BYTES 30
 
+#if !CT_ILD_MODE64
+/* The noreturn entry stub below is hand-assembled x86-64 against the Win64
+ * ABI (shadow space, RCX/RDX argument registers, REX-prefixed sequences).
+ * A 32-bit port would be a different stub entirely -- cdecl/stdcall stack
+ * arguments, no shadow space, no REX -- and nothing in this tree calls the
+ * noreturn variant on 32-bit: io-mon's shim uses only the regular install.
+ *
+ * So rather than ship an untested translation, 32-bit refuses the noreturn
+ * install with a distinct error code. Failing loudly beats emitting a stub
+ * that would corrupt the stack of a thread-termination path.
+ */
+static size_t emit_noreturn_entry_stub(uint8_t *at, void *callback)
+{
+    (void)at; (void)callback;
+    return 0;   /* caller treats 0 as "cannot emit" */
+}
+#else
 static size_t emit_noreturn_entry_stub(uint8_t *at, void *callback)
 {
     uint8_t *p = at;
@@ -1101,6 +1148,7 @@ static size_t emit_noreturn_entry_stub(uint8_t *at, void *callback)
     *p++ = 0x48; *p++ = 0x83; *p++ = 0xC4; *p++ = 0x38;
     return (size_t)(p - at);
 }
+#endif  /* CT_ILD_MODE64 */
 
 /* The noreturn-mode install path.  Distinct from install_locked
  * because the trampoline layout differs (entry stub instead of

@@ -135,6 +135,68 @@ when defined(windows):
         # And it is cached: a second lookup returns the same answer.
         check wow64LoadLibraryWAddress(probe) == address
 
+  suite "windows_helper_spawn_guard":
+    ## The probe and the 64-bit injection helper are spawned from inside the
+    ## injection path itself, via CreateProcessW -- which in a shimmed
+    ## process is detoured. Without a guard the spawn hook tries to inject
+    ## the helper, and injecting a 64-bit child is what invoked the helper in
+    ## the first place: the first run of this code produced 129 helper
+    ## processes before it was killed.
+    ##
+    ## `spawningHelperProcess` is what the hook consults to pass those spawns
+    ## straight through -- no forced suspension, no injection, and no spawn
+    ## record either, since an uninjected child that IS recorded reads as an
+    ## unmonitored subtree and grades the whole run incomplete.
+
+    test "the guard is clear on an idle thread":
+      check not spawningHelperProcess()
+
+    test "the guard is clear again after a probe spawn fails":
+      # The flag is depth-counted and released via `defer`, so it must come
+      # back down even when the spawn never happens. A leaked flag would be
+      # worse than the recursion it prevents: every subsequent child on this
+      # thread would silently go uninjected.
+      let missing = getTempDir() / "stackable-hooks-no-such-probe32.exe"
+      removeFile(missing)
+      check wow64LoadLibraryWAddress(missing) == 0'u32
+      check not spawningHelperProcess()
+
+    test "the guard is clear again after a real probe spawn":
+      let probe = block:
+        var found = ""
+        for candidate in [
+            getAppDir() / Wow64ProbeExeName,
+            getAppDir().parentDir / "lib" / Wow64ProbeExeName,
+            getCurrentDir() / "build" / "lib" / Wow64ProbeExeName]:
+          if fileExists(candidate):
+            found = candidate
+            break
+        found
+      if probe.len == 0:
+        skip()
+      else:
+        discard wow64LoadLibraryWAddress(probe)
+        check not spawningHelperProcess()
+
+  suite "windows_inject64_helper_conventions":
+    test "the helper is looked up beside the shim":
+      check inject64HelperPathFor(r"C:\x\lib\librepro_monitor_shim.dll") ==
+        r"C:\x\lib\" & Inject64HelperExeName
+
+    test "a 32-bit shim finds the same helper as its 64-bit sibling":
+      # The 32-bit shim is the only caller, so the lookup has to work from
+      # the `<name>32.dll` path too -- both shims are staged side by side.
+      check inject64HelperPathFor(r"C:\x\lib\librepro_monitor_shim32.dll") ==
+        inject64HelperPathFor(r"C:\x\lib\librepro_monitor_shim.dll")
+
+    test "shim64PathFor inverts the 32-bit naming convention":
+      check shim64PathFor(r"C:\x\lib\librepro_monitor_shim32.dll") ==
+        r"C:\x\lib\librepro_monitor_shim.dll"
+
+    test "shim64PathFor leaves a path that is already 64-bit alone":
+      check shim64PathFor(r"C:\x\lib\librepro_monitor_shim.dll") ==
+        r"C:\x\lib\librepro_monitor_shim.dll"
+
   suite "windows_wow64_export_rva":
     ## The offset of an export inside the 32-bit shim. The injector needs it
     ## to start the shim's initialiser in the child once LoadLibraryW has

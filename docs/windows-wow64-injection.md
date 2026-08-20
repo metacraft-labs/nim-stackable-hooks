@@ -112,6 +112,7 @@ the 64-bit shim path passes nothing extra:
 <name>.dll                            the 64-bit shim
 <name>32.dll                          the 32-bit shim, same directory
 stackable_hooks_wow64_probe32.exe     the probe, same directory
+stackable_hooks_inject64.exe          the 64-bit injection helper, same dir
 ```
 
 `setWow64ShimPath` / `setWow64ProbePath` override both for layouts that differ.
@@ -171,29 +172,74 @@ without its toolchain reachable — and it is silent in every direction, so it i
 worth recognising by shape: **a spawned toolchain binary that fails with no
 diagnostic of its own has usually not reached `main`.**
 
-## What a 32-bit child gets, and what it does not
+## Both directions of the bitness boundary
 
-Injection and initialisation reach parity with 64-bit children. Hook coverage
-does not, and the shortfall is reported rather than hidden.
+Injection, initialisation and hook coverage now reach parity in both
+directions. Two distinct mechanisms are needed, because the boundary is not
+symmetric.
 
-Inline detours are 64-bit-only: installing one means relocating the bytes it
-overwrites, which needs an instruction length decoder, and the one in
-`inline_hook/windows/length_decoder.c` decodes 64-bit mode — it treats
-`0x40`-`0x4F` as REX prefixes where 32-bit code has ordinary `INC`/`DEC reg`.
-32-bit builds therefore use IAT patching alone.
+**64-bit injector -> 32-bit (WOW64) child.** Covered above: the 32-bit shim,
+the probe for `LoadLibraryW`'s address, and the probe's RVA mode for the
+init entry point.
 
-IAT patching can only hook what a loaded module *imports*. An API resolved at
-runtime through `GetProcAddress`, or called directly against `ntdll`, has no
-import-table slot to swap — which is the whole reason inline detours exist.
-In practice a monitored 32-bit `cmd /c echo hi` hooks 23 of 32 entry points;
-the 9 it misses include the `NtQuery*` path probes its 64-bit twin records.
+**32-bit shim -> 64-bit child.** A WOW64 process cannot do this at all. Its
+`VirtualAllocEx` / `WriteProcessMemory` / `CreateRemoteThread` go through the
+WOW64 thunk layer, which does not address a 64-bit target, and it cannot
+resolve the 64-bit `kernel32` either. Where a *value* can be fetched from a
+process of the right bitness, an *operation* cannot -- so this case delegates
+the whole injection to `stackable_hooks_inject64.exe`, a 64-bit helper found
+beside the shim by convention and addressed by pid.
 
-That is a real evidence gap, so the shim emits an `mrEventLoss` naming the
-unhooked entry points and the run grades `mcIncomplete`. A consumer that keys
-cache publication on completeness will decline to publish, which is the
-intended outcome: partial observation must not produce a cache entry keyed on
-inputs that were never seen. Closing the gap means teaching the length decoder
-32-bit mode.
+This is the chain that makes both necessary at once, and it is ordinary on
+Windows:
+
+```
+repro.exe (64-bit)
+  -> scoop\shims
+im.exe (i386 PATH trampoline)   <- needs the 32-bit shim
+       -> nim.exe (64-bit, the real tool)           <- needs the 64-bit helper
+```
+
+Before either mechanism existed the middle process was uninjectable and the
+grandchild invisible; the run graded `mcIncomplete` and the action could not
+publish. It now grades `mcComplete` with both processes monitored.
+
+### Inline detours are no longer 64-bit-only
+
+Installing a detour means relocating the prologue bytes it overwrites, which
+means decoding their lengths. The decoder used to decode 64-bit mode only, so
+against 32-bit code it consumed `0x40`-`0x4F` as REX prefixes where 32-bit has
+`INC`/`DEC reg`, mis-measured the prologue, and faulted the init thread on
+commit -- killing only that thread, so the child ran to a normal exit having
+reported nothing but its process-start.
+
+`CT_ILD_MODE64` (in `length_decoder.h`, shared by all three translation units)
+now selects the mode from the build target, which is sound because this
+machinery only ever rewrites code already mapped in its own process. Three
+things change with it: REX is not consumed, `REX.W` cannot widen an immediate,
+and the one-byte opcodes that are `OP_INVALID` *because* 64-bit mode dropped
+them (`PUSHA`, `DAA`, the segment pushes, far `CALL`/`JMP`, `AAM`/`AAD`, ...)
+are re-scored. The trampoline emitters and the rel32 fixup follow the same
+switch: `FF /4` takes an absolute operand rather than a RIP-relative one, and
+`mod=00 rm=101` is an absolute disp32 that must *not* be rewritten.
+
+Still 64-bit-only: `ct_inline_hook_install_noreturn`, whose entry stub is
+hand-assembled against the Win64 ABI. Nothing calls it on 32-bit, and the
+32-bit build refuses it rather than emitting an untested translation.
+
+### The helper must never be injected
+
+The helper is spawned from inside the injection path, through `CreateProcessW`
+-- which in a shimmed process is detoured. Left alone, the spawn hook tries to
+inject the helper, and injecting a 64-bit child is what called the helper:
+the first run produced 129 helper processes.
+
+`spawningHelperProcess()` is a depth-counted thread-local the hook consults to
+pass our own probe/helper spawns straight through: no forced suspension, no
+injection, and no spawn record either. The record matters as much as the
+injection -- an uninjected child that IS recorded reads as an unmonitored
+subtree and grades an otherwise complete run incomplete. These processes are
+infrastructure; their I/O is not a dependency of the action being recorded.
 
 ## Why this matters beyond correctness
 

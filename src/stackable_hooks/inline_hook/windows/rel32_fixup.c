@@ -157,8 +157,14 @@ static size_t skip_prefixes(const uint8_t *p, size_t len, int *out_addr_size_pfx
         if (b == 0x67u) { *out_addr_size_pfx = 1; i++; continue; }
         break;
     }
+#if CT_ILD_MODE64
     /* Consume REX chain (last REX wins). */
     while (i < len && (p[i] & 0xF0u) == 0x40u) i++;
+#else
+    /* No REX in 32-bit mode -- 0x40-0x4F are INC/DEC r32, i.e. complete
+     * instructions. Skipping them here would report the following byte as
+     * the opcode and rewrite a displacement that does not exist. */
+#endif
     return i;
 }
 
@@ -292,6 +298,21 @@ static uint8_t *arena_alloc(ct_thunk_arena_t *arena, size_t n)
     return p;
 }
 
+/* mod=00 rm=101 means [rip+disp32] in 64-bit mode and an ABSOLUTE disp32 in
+ * 32-bit mode -- the encoding is shared, the meaning is not. An absolute
+ * displacement is still correct after the instruction is copied to the
+ * trampoline, so 32-bit has nothing to fix here; rewriting it as though it
+ * were PC-relative would actively corrupt an otherwise valid instruction. */
+static int is_riprel_modrm(int has_67, unsigned mod, unsigned rm)
+{
+#if CT_ILD_MODE64
+    return (!has_67 && mod == 0u && rm == 5u);
+#else
+    (void)has_67; (void)mod; (void)rm;
+    return 0;
+#endif
+}
+
 /* Emit a 14-byte rel32-redirect thunk at `dst`:
  *
  *     FF 25 00 00 00 00       JMP qword ptr [rip+0]
@@ -304,6 +325,7 @@ static uint8_t *arena_alloc(ct_thunk_arena_t *arena, size_t n)
  * original 1999 Detours paper). */
 static void emit_jmp_indirect_thunk(uint8_t *dst, uintptr_t target)
 {
+#if CT_ILD_MODE64
     dst[0] = 0xFFu;
     dst[1] = 0x25u;
     dst[2] = 0x00u; dst[3] = 0x00u; dst[4] = 0x00u; dst[5] = 0x00u;
@@ -311,6 +333,28 @@ static void emit_jmp_indirect_thunk(uint8_t *dst, uintptr_t target)
     for (int i = 0; i < 8; i++) {
         dst[6 + i] = (uint8_t)((u >> (i * 8)) & 0xFFu);
     }
+#else
+    /* 32-bit has no [rip+disp32]; mod=00 rm=101 is an absolute disp32, so
+     * the operand is the ADDRESS of the pointer word. Same total footprint
+     * as the 64-bit thunk (callers size slots by CT_THUNK_SIZE), with the
+     * pointer placed at dst+8 so it stays 4-byte aligned. */
+    dst[0] = 0xFFu;
+    dst[1] = 0x25u;
+    {
+        uint32_t ptr_at = (uint32_t)(uintptr_t)(dst + 8);
+        for (int i = 0; i < 4; i++) {
+            dst[2 + i] = (uint8_t)((ptr_at >> (i * 8)) & 0xFFu);
+        }
+    }
+    dst[6] = 0x90u; dst[7] = 0x90u;
+    {
+        uint32_t u = (uint32_t)target;
+        for (int i = 0; i < 4; i++) {
+            dst[8 + i] = (uint8_t)((u >> (i * 8)) & 0xFFu);
+        }
+    }
+    dst[12] = 0x90u; dst[13] = 0x90u;
+#endif
 }
 
 /* ---- Single-instruction fixup ------------------------------------- */
@@ -373,7 +417,7 @@ static int fixup_one_insn(const uint8_t *orig_bytes,
             uint8_t modrm = p[modrm_off];
             unsigned mod = (modrm >> 6) & 0x3u;
             unsigned rm  = modrm & 0x7u;
-            if (!has_67 && mod == 0u && rm == 5u) {
+            if (is_riprel_modrm(has_67, mod, rm)) {
                 kind = FIX_RIPREL_DATA;
                 disp_off_in_insn = modrm_off + 1u;
             }
@@ -385,7 +429,7 @@ static int fixup_one_insn(const uint8_t *orig_bytes,
             uint8_t modrm = p[modrm_off];
             unsigned mod = (modrm >> 6) & 0x3u;
             unsigned rm  = modrm & 0x7u;
-            if (!has_67 && mod == 0u && rm == 5u) {
+            if (is_riprel_modrm(has_67, mod, rm)) {
                 kind = FIX_RIPREL_DATA;
                 disp_off_in_insn = modrm_off + 1u;
             }
@@ -400,11 +444,11 @@ static int fixup_one_insn(const uint8_t *orig_bytes,
         unsigned mod = (modrm >> 6) & 0x3u;
         unsigned reg = (modrm >> 3) & 0x7u;
         unsigned rm  = modrm & 0x7u;
-        if (!has_67 && mod == 0u && rm == 5u && (reg == 4u || reg == 2u)) {
+        if (is_riprel_modrm(has_67, mod, rm) && (reg == 4u || reg == 2u)) {
             if (insn_len < op_off_in_insn + 6u) return -4;
             kind = FIX_RIPREL_JCALL;
             disp_off_in_insn = modrm_off + 1u;
-        } else if (!has_67 && mod == 0u && rm == 5u) {
+        } else if (is_riprel_modrm(has_67, mod, rm)) {
             /* Other FF /n with RIP-relative — /0 INC, /1 DEC, /3 CALL
              * far, /5 JMP far, /6 PUSH.  Treat as data-style RIP
              * fixup.  Length matches Group 5 with disp32. */
@@ -418,7 +462,7 @@ static int fixup_one_insn(const uint8_t *orig_bytes,
         uint8_t modrm = p[modrm_off];
         unsigned mod = (modrm >> 6) & 0x3u;
         unsigned rm  = modrm & 0x7u;
-        if (!has_67 && mod == 0u && rm == 5u) {
+        if (is_riprel_modrm(has_67, mod, rm)) {
             /* RIP-relative.  Disp32 immediately follows the ModRM
              * byte.  Any immediate the opcode also carries lives
              * *after* the disp32 — Detours' AdjustTarget handles this

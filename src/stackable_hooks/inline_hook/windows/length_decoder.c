@@ -34,6 +34,32 @@
 
 #include <string.h>
 
+/* ---- Decode mode (64-bit vs 32-bit) -------------------------------- */
+/*
+ * The decoder only ever reads code that is already mapped in the calling
+ * process -- it measures the prologue of a function this process is about
+ * to detour. A process's code is all one machine type, so the build target
+ * selects the mode; there is no caller that must decode the other width,
+ * and therefore no runtime parameter.
+ *
+ * Three things differ, and the first is the one that silently corrupts
+ * lengths rather than rejecting them:
+ *
+ *   1. 0x40-0x4F are REX prefixes in 64-bit mode and INC/DEC r32 -- whole
+ *      one-byte instructions -- in 32-bit mode. Consuming them as prefixes
+ *      makes the decoder read the NEXT byte as the opcode, so it reports a
+ *      length for an instruction that was never there.
+ *   2. REX.W does not exist, so an OP_IMM_V immediate is never 8 bytes.
+ *   3. A number of one-byte opcodes are marked OP_INVALID in the map only
+ *      because 64-bit mode dropped them. They are ordinary instructions
+ *      here; see ct_ild_legacy32_entry.
+ *
+ * Also note OP_IMM_O (moffset): its width follows the ADDRESS size, which
+ * is 8/4 in 64-bit mode but 4/2 in 32-bit mode.
+ */
+/* CT_ILD_MODE64 is defined in length_decoder.h so that this file,
+ * install_windows.c and rel32_fixup.c cannot disagree about it. */
+
 /* ---- Per-opcode flag bits used in the maps ------------------------- */
 
 #define OP_MODRM    0x0001u  /* ModR/M byte follows opcode (+ optional SIB + disp) */
@@ -219,6 +245,55 @@ static const unsigned short g_opmap_0f3a[256] = {
 
 /* Compute displacement size from ModRM + address-size prefix and report
  * whether a SIB byte follows. Intel SDM Vol 2 §2.1.5 Tables 2-1/2-2. */
+#if !CT_ILD_MODE64
+/* One-byte opcodes the map marks OP_INVALID *because* 64-bit mode cannot
+ * encode them. All are legal in 32-bit mode, so a 32-bit decode must not
+ * reject them -- rejecting is safe (the caller falls back) but it would
+ * refuse to hook any function whose prologue happens to contain one.
+ *
+ * `out_known` distinguishes "this opcode is legal in 32-bit and here is
+ * its shape" from "still invalid", so a genuinely bad byte keeps failing.
+ *
+ * Not listed, deliberately: 0x62 (BOUND), 0xC4 (LES) and 0xC5 (LDS). Those
+ * encodings are ambiguous with EVEX/VEX and are rejected before the table
+ * lookup. Modern compiler output uses the VEX reading, so the rejection is
+ * kept for both modes rather than resolved by inspecting the next byte's
+ * mod field; none of the three appears in a Win32 API prologue.
+ */
+static unsigned int ct_ild_legacy32_entry(unsigned char op, int *out_known)
+{
+    *out_known = 1;
+    switch (op) {
+    /* PUSH/POP segment register. */
+    case 0x06: case 0x07: case 0x0E:
+    case 0x16: case 0x17: case 0x1E: case 0x1F:
+        return 0u;
+    /* DAA / DAS / AAA / AAS -- BCD adjust, no operands. */
+    case 0x27: case 0x2F: case 0x37: case 0x3F:
+        return 0u;
+    /* PUSHA(D) / POPA(D). */
+    case 0x60: case 0x61:
+        return 0u;
+    /* Undocumented-but-real Group1 Eb,Ib alias of 0x80. */
+    case 0x82:
+        return OP_MODRM | OP_IMM8;
+    /* Far CALL / far JMP ptr16:32 -- a 4-byte offset plus a 2-byte
+     * selector, which is IMM_Z (4 without a 0x66) plus IMM16. */
+    case 0x9A: case 0xEA:
+        return OP_IMM_Z | OP_IMM16;
+    /* INTO. */
+    case 0xCE:
+        return 0u;
+    /* AAM / AAD, each with a one-byte base operand. */
+    case 0xD4: case 0xD5:
+        return OP_IMM8;
+    default:
+        *out_known = 0;
+        return 0u;
+    }
+}
+#endif
+
 static int ct_ild_modrm_extras(unsigned char modrm, int has_addr_size_pfx,
                                int *out_has_sib)
 {
@@ -274,6 +349,7 @@ int ct_ild_decode(const unsigned char *code, size_t max_len)
 
     if (pos >= max_len) return 0;
 
+#if CT_ILD_MODE64
     /* ---- REX prefix (Vol 2 §2.2.1.2) ------------------------------- */
     /* Only the last REX before the opcode takes effect; consume the
      * chain. (HDE64 only allows one but Intel says the LAST wins.) */
@@ -282,6 +358,11 @@ int ct_ild_decode(const unsigned char *code, size_t max_len)
         pos++;
     }
     if (pos >= max_len) return 0;
+#else
+    /* No REX in 32-bit mode: 0x40-0x4F are INC/DEC r32, and the one-byte
+     * map already scores them as complete one-byte instructions. */
+    (void)has_rex_w;
+#endif
 
     /* ---- Reject VEX/EVEX prefixes outright (M50.0 limit) ----------- */
     {
@@ -318,6 +399,15 @@ int ct_ild_decode(const unsigned char *code, size_t max_len)
         }
     } else {
         entry = g_opmap1[op];
+#if !CT_ILD_MODE64
+        /* The map's OP_INVALID cells conflate "bad encoding" with "dropped
+         * by 64-bit mode". Re-score the latter for a 32-bit decode. */
+        if (entry & OP_INVALID) {
+            int known = 0;
+            unsigned int legacy = ct_ild_legacy32_entry(op, &known);
+            if (known) entry = legacy;
+        }
+#endif
     }
 
     /* ENTER (0xC8) is the only 1-byte opcode with both imm16 + imm8.
@@ -366,7 +456,12 @@ int ct_ild_decode(const unsigned char *code, size_t max_len)
     if (entry & OP_IMM16) imm += 2;
     if (entry & OP_IMM_Z) imm += has_66 ? 2u : 4u;
     if (entry & OP_IMM_V) imm += has_rex_w ? 8u : (has_66 ? 2u : 4u);
+    /* moffset follows the ADDRESS size, which differs by mode. */
+#if CT_ILD_MODE64
     if (entry & OP_IMM_O) imm += has_67 ? 4u : 8u;
+#else
+    if (entry & OP_IMM_O) imm += has_67 ? 2u : 4u;
+#endif
     if (entry & OP_REL8)  imm += 1;
     if (entry & OP_REL_Z) imm += has_66 ? 2u : 4u;
 

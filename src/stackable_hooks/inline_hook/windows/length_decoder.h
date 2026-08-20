@@ -38,6 +38,22 @@ extern "C" {
 #define CT_ILD_MAX_INSN_LEN 15
 
 /*
+ * Decode/emit mode. Every translation unit in this directory must agree,
+ * so it is defined once here rather than per-file.
+ *
+ * The inline-hook machinery only ever reads and rewrites code that is
+ * already mapped in the calling process, so the build target is the mode:
+ * a 32-bit build detours 32-bit code, a 64-bit build 64-bit code. There is
+ * no caller that must handle the other width, hence no runtime parameter.
+ */
+#if defined(_WIN64) || defined(__x86_64__) || defined(_M_X64) || \
+    defined(__amd64__)
+#define CT_ILD_MODE64 1
+#else
+#define CT_ILD_MODE64 0
+#endif
+
+/*
  * ct_ild_decode -- return the byte length of the instruction at `code`.
  *
  *   code     pointer to the first byte of a candidate instruction.

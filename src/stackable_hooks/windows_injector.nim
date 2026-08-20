@@ -183,6 +183,10 @@ proc ResumeThread(hThread: HANDLE): DWORD
 
 proc GetLastError(): DWORD
   {.importc, stdcall, dynlib: "kernel32".}
+proc GetProcessId(hProcess: HANDLE): DWORD
+  {.importc, stdcall, dynlib: "kernel32".}
+proc GetCurrentProcess(): HANDLE
+  {.importc, stdcall, dynlib: "kernel32".}
 proc CloseHandle(hObject: HANDLE): BOOL
   {.importc, stdcall, dynlib: "kernel32".}
 proc GetExitCodeProcess(hProcess: HANDLE, lpExitCode: ptr DWORD): BOOL
@@ -273,6 +277,16 @@ const
   Wow64ProbeExeName* = "stackable_hooks_wow64_probe32.exe"
     ## Convention: the 32-bit probe sits beside the shim it serves.
 
+  Inject64HelperExeName* = "stackable_hooks_inject64.exe"
+    ## Convention: the 64-bit injection helper sits beside the shim too.
+    ##
+    ## Needed for the mirror image of the WOW64 case. A 32-bit process can
+    ## neither resolve the 64-bit kernel32 nor drive VirtualAllocEx /
+    ## CreateRemoteThread against a 64-bit address space -- its calls go
+    ## through the WOW64 thunk layer, which does not reach there. Where the
+    ## probe answers a question for the other bitness, this helper performs
+    ## the whole operation, because the operation itself cannot cross.
+
 # The propagation path (`propagation_windows.injectShimIntoChild`) calls into
 # this state from worker threads, so every access is taken under a lock and
 # the accessors are `gcsafe`. The `cast(gcsafe)` is what the lock earns: the
@@ -321,6 +335,23 @@ proc wow64ProbePathFor*(dllPath64: string): string {.raises: [], gcsafe.} =
         return wow64ProbePathOverride
   dllPath64.parentDir / Wow64ProbeExeName
 
+proc inject64HelperPathFor*(shimPath: string): string {.raises: [], gcsafe.} =
+  ## The 64-bit injection helper paired with `shimPath`, by convention.
+  ##
+  ## `shimPath` may be either bitness -- a 32-bit shim's directory holds the
+  ## helper just as a 64-bit one's does, since both shims are staged side by
+  ## side by the build.
+  shimPath.parentDir / Inject64HelperExeName
+
+proc shim64PathFor*(shimPath32: string): string {.raises: [], gcsafe.} =
+  ## The 64-bit shim paired with a 32-bit one: the inverse of
+  ## `wow64ShimPathFor`, stripping the conventional `32` suffix.
+  let (dir, name, ext) = splitFile(shimPath32)
+  if name.endsWith("32"):
+    dir / (name[0 ..< name.len - 2] & ext)
+  else:
+    shimPath32
+
 proc processIsWow64*(hProcess: HANDLE): bool {.raises: [], gcsafe.} =
   ## True when `hProcess` is a 32-bit process on 64-bit Windows. On a 32-bit
   ## host every process reports false and the ordinary same-bitness path is
@@ -338,10 +369,33 @@ proc processIsWow64*(hProcess: HANDLE): bool {.raises: [], gcsafe.} =
   except OSError:
     false
 
+var inHelperSpawn {.threadvar.}: int
+  ## Depth of "this thread is currently spawning one of our own tool
+  ## processes" (the WOW64 probe or the 64-bit injection helper).
+  ##
+  ## Those spawns go through `CreateProcessW`, which in a shimmed process is
+  ## detoured -- so without this the spawn hook tries to inject the shim into
+  ## the helper, and injecting into a 64-bit child is what called the helper
+  ## in the first place. Measured: 129 helper processes before the guard.
+  ##
+  ## Thread-local and depth-counted because the spawn happens on the very
+  ## thread that is inside the hook, and because a nested spawn (probe from
+  ## inside a helper path) must not clear the flag early.
+  ##
+  ## Injecting the monitor into its own injection helper would be wrong even
+  ## if it terminated: the helper is infrastructure, not part of the traced
+  ## program, and its file I/O is not a dependency of the build action.
+
+proc spawningHelperProcess*(): bool {.raises: [], gcsafe.} =
+  ## True while this thread is spawning a probe/helper of our own.
+  inHelperSpawn > 0
+
 proc runProbeForExitCode(probeExe: string;
                          probeArgs: openArray[string]): uint32
                         {.raises: [], gcsafe.} =
   ## Spawn the 32-bit probe and return its exit code verbatim.
+  inc inHelperSpawn
+  defer: dec inHelperSpawn
   try:
     var si: STARTUPINFOW
     si.cb = DWORD(sizeof(STARTUPINFOW))
@@ -386,6 +440,50 @@ proc wow64LoadLibraryWAddress*(probeExe: string): uint32 {.raises: [], gcsafe.} 
       withLock wow64StateLock:
         wow64ProcAddressCache[cacheKey] = resolved
   resolved
+
+proc hostIsWow64Capable*(): bool {.raises: [], gcsafe.} =
+  ## True when this 32-bit process is running under WOW64 -- i.e. the host is
+  ## 64-bit, so a 64-bit child (and a 64-bit helper) is possible at all.
+  ##
+  ## On genuine 32-bit Windows every process is 32-bit, there is no other
+  ## bitness to bridge to, and the ordinary in-process path is correct.
+  try:
+    processIsWow64(GetCurrentProcess())
+  except OSError:
+    false
+
+proc runInject64Helper*(hProcess: HANDLE; shimPath64, initSymbol: string):
+    bool {.raises: [], gcsafe.} =
+  ## Inject `shimPath64` into a 64-bit `hProcess` by delegating to the 64-bit
+  ## helper. Used only from a 32-bit shim, which cannot do this itself.
+  ##
+  ## The helper is addressed by pid rather than by handle: a handle is
+  ## process-local, and duplicating one into a freshly spawned helper would
+  ## need the helper's own handle first. The target is suspended by the
+  ## caller for the duration, so the pid cannot be recycled underneath us.
+  let helper = inject64HelperPathFor(shimPath64)
+  let helperExists =
+    try: fileExists(extendedPath(helper))
+    except CatchableError: false
+  if not helperExists:
+    return false
+
+  let shimExists =
+    try: fileExists(extendedPath(shimPath64))
+    except CatchableError: false
+  if not shimExists:
+    return false
+
+  let pid =
+    try: GetProcessId(hProcess)
+    except OSError: 0'u32
+  if pid == 0:
+    return false
+
+  let rc = runProbeForExitCode(helper, [$pid, shimPath64, initSymbol])
+  # The helper reports 0 for success; every other value is a specific stage
+  # failure documented in tools/inject_helper.nim.
+  rc == 0
 
 proc wow64ExportRva*(probeExe, dllPath32, procName: string): uint32
                     {.raises: [], gcsafe.} =

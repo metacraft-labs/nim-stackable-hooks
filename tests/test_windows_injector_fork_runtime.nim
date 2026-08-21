@@ -38,6 +38,8 @@ proc runForkProbe(): int =
     captureStdioPath = capturePath)
   if injection.exitCode != 0:
     return 2
+  if injection.rootPid == 0:
+    return 5
   if not injection.monitoringSkipped:
     return 3
   if windowsForkRuntimeForExecutable(shell) notin injection.skipReason:
@@ -55,6 +57,7 @@ suite "Windows injector fork-runtime handling":
     argv.add(ArgvProbeValues)
     let injection = runWithMonitorShim(argv, systemDllPath())
     check injection.exitCode == 0
+    check injection.rootPid != 0
     check not injection.monitoringSkipped
 
   test "detects adjacent MSYS2 and Cygwin runtimes":

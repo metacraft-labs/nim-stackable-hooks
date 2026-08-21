@@ -676,7 +676,6 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
       discard CloseHandle(stdoutReadPipe); stdoutReadPipe = nil
     raise newException(OSError,
       "CreateProcessW failed (err=" & $GetLastError() & "): " & commandLine)
-
   result.rootPid = uint64(pi.dwProcessId)
 
   template safeClose(h: HANDLE) =

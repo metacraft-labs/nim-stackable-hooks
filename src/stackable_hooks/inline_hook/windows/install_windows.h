@@ -206,6 +206,26 @@ int ct_inline_hook_commit_transaction(void);
  * is active. */
 int ct_inline_hook_abort_transaction(void);
 
+/* How many operations one transaction can hold.  Callers that batch a
+ * variable-sized set of hooks need this to know when to fall back to the
+ * per-hook path; published here so the bound has exactly one spelling. */
+int ct_inline_hook_transaction_capacity(void);
+
+/* ---- Freeze accounting -------------------------------------------- */
+
+/* Number of thread-freeze rounds performed since process start.
+ *
+ * One round = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD) + SuspendThread
+ * on every other thread of this process + ResumeThread.  The snapshot is
+ * SYSTEM-WIDE (TH32CS_SNAPTHREAD ignores its process argument), so a round
+ * costs on the order of tens of milliseconds regardless of how few threads
+ * the caller has -- which is why the transaction API exists.
+ *
+ * Exposed so consumers can assert their batching structurally: N hooks
+ * torn down inside one transaction must cost ONE round, not N.  That is a
+ * property of the code, unlike a wall-clock budget. */
+unsigned long ct_inline_hook_suspend_round_count(void);
+
 /* ---- Re-entrancy TLS guard ---------------------------------------- */
 
 /* Returns non-zero if the current thread is inside a

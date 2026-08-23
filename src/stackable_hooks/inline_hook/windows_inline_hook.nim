@@ -101,6 +101,24 @@ proc inlineHookAbortTransaction*(): cint
   {.importc: "ct_inline_hook_abort_transaction", cdecl.}
   ## Abort the pending transaction.
 
+proc inlineHookTransactionCapacity*(): cint
+  {.importc: "ct_inline_hook_transaction_capacity", cdecl.}
+  ## How many queued operations one transaction can hold. A caller
+  ## batching a variable-sized hook table needs this to decide when to
+  ## fall back to the per-hook path; it is read from the C side rather
+  ## than restated here so the bound has exactly one spelling.
+
+proc inlineHookSuspendRoundCount*(): culong
+  {.importc: "ct_inline_hook_suspend_round_count", cdecl.}
+  ## Thread-freeze rounds performed since process start. One round is a
+  ## `CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD)` — a SYSTEM-WIDE thread
+  ## enumeration — plus a suspend/resume of every other thread in this
+  ## process, and costs tens of milliseconds no matter how few threads the
+  ## caller has. That is the whole reason the transaction API exists, and
+  ## this counter is what lets a test assert the batching STRUCTURALLY
+  ## (N hooks in one transaction cost one round, not N) instead of
+  ## asserting a wall-clock budget, which would be a flake.
+
 proc inlineHookInHandler*(): cint
   {.importc: "ct_inline_hook_in_handler", cdecl.}
   ## Returns non-zero when the calling thread is currently dispatching

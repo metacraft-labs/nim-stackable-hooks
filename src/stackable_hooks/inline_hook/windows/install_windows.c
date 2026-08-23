@@ -74,6 +74,8 @@ int ct_inline_hook_in_handler(void) { return 0; }
 void ct_inline_hook_enter(void) { }
 void ct_inline_hook_leave(void) { }
 int ct_inline_hook_install_get_last_install_mode(void) { return -1; }
+unsigned long ct_inline_hook_suspend_round_count(void) { return 0; }
+int ct_inline_hook_transaction_capacity(void) { return 0; }
 
 #else /* _WIN32 */
 
@@ -432,9 +434,33 @@ typedef struct {
     DWORD  count;
 } ct_frozen_t;
 
+/* Freeze rounds performed since process start.
+ *
+ * A "round" is one CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD) + suspend +
+ * resume of every other thread in this process.  That snapshot is
+ * SYSTEM-WIDE -- TH32CS_SNAPTHREAD ignores the th32ProcessID argument and
+ * walks every thread on the machine -- so its cost is set by the load of
+ * the whole box, not by how many threads this process has.  On a developer
+ * workstation it measures ~23.5 ms.
+ *
+ * That makes "how many rounds did this batch cost?" a load-bearing property
+ * rather than a curiosity: an N-hook teardown that takes N rounds instead of
+ * one is O(N * 23.5 ms) of pure freeze, paid by every process.  The counter
+ * exists so a test can assert the batching structurally (rounds stay at one
+ * per transaction) instead of asserting a wall-clock threshold, which would
+ * be a flake.  Written only inside g_hooks_cs, so a plain int suffices. */
+static unsigned long g_suspend_rounds = 0;
+
+unsigned long ct_inline_hook_suspend_round_count(void)
+{
+    return g_suspend_rounds;
+}
+
 static int suspend_other_threads(ct_frozen_t *out)
 {
     out->count = 0;
+
+    g_suspend_rounds++;
 
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (snap == INVALID_HANDLE_VALUE) return -1;
@@ -604,6 +630,15 @@ typedef struct {
 } ct_txn_t;
 
 static ct_txn_t g_txn;
+
+int ct_inline_hook_transaction_capacity(void)
+{
+    /* Published rather than duplicated on the consumer side: a batching
+     * caller has to know how many ops one transaction can hold before it
+     * falls back to the per-hook path, and a second spelling of 256 in
+     * another language is a seam that rots silently. */
+    return (int)CT_QUEUE_MAX;
+}
 
 int ct_inline_hook_begin_transaction(void)
 {

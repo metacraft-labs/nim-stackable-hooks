@@ -9,10 +9,12 @@ when not defined(windows):
 # we optionally invoke an init entry point in the loaded DLL (also via
 # CreateRemoteThread), then resume the original main thread.
 
-import std/[locks, os, strutils, tables]
+import std/[locks, os, strtabs, strutils, tables]
 
+import ./windows_env_block
 import ./windows_fork_runtime
 
+export windows_env_block
 export windows_fork_runtime
 
 proc toWideCStringSeq(s: string): seq[uint16] =
@@ -103,6 +105,9 @@ type
 
 const
   CREATE_SUSPENDED = 0x00000004'u32
+  # CREATE_UNICODE_ENVIRONMENT lives in `stackable_hooks/windows_env_block`
+  # (imported and re-exported above), next to the encoder that makes it
+  # mandatory and to `lpEnvironmentArgs`, which decides it.
   STARTF_USESTDHANDLES = 0x00000100'u32
   MEM_COMMIT = 0x00001000'u32
   MEM_RESERVE = 0x00002000'u32
@@ -522,7 +527,7 @@ proc wow64ExportRva*(probeExe, dllPath32, procName: string): uint32
 
 proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
     cwd = ""; captureStdio = false;
-    captureStdioPath = ""): WindowsInjectionResult =
+    captureStdioPath = ""; env: StringTableRef = nil): WindowsInjectionResult =
   ## Windows: Spawn `argv` in a CREATE_SUSPENDED state, inject the monitor
   ## shim DLL via CreateRemoteThread+LoadLibraryW, optionally invoke the
   ## shim's `repro_runtime_init` entry point, then resume the main thread.
@@ -534,6 +539,27 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
   ## ``osproc.startProcess`` default behaviour (pipe-captured stdio +
   ## pollCompletion drain) so integration tests at the fs-snoop level can
   ## reproduce wedges that only manifest under the build engine.
+  ##
+  ## ``env`` is the child's **complete** environment, and `nil` is NOT the
+  ## same as an empty table:
+  ##
+  ## * `nil` (the default) means "inherit this process's environment". It is
+  ##   compiled into `lpEnvironment = NULL`, which is byte-identical to what
+  ##   this proc did before it took an `env` parameter — existing callers
+  ##   see no change whatsoever.
+  ## * an EMPTY but non-nil table means "give the child an EMPTY
+  ##   environment". A different, deliberate outcome; it is never silently
+  ##   treated as inheritance.
+  ## * a populated table hands the child variables without `putEnv`-ing them
+  ##   into the host, which is the only way to run several injected children
+  ##   concurrently in one host process without them clobbering each other's
+  ##   monitoring variables.
+  ##
+  ## That contract, and the creation flag that has to travel with the block,
+  ## are decided by `windows_env_block.lpEnvironmentArgs`; encoding rules and
+  ## their failure modes are in `stackable_hooks/windows_env_block`. Both live
+  ## outside this Windows-gated module so they are unit-tested on the
+  ## development host rather than merely compiled.
   if argv.len == 0:
     raise newException(OSError, "runWithMonitorShim: empty argv")
   let dllExists =
@@ -542,6 +568,12 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
   if not dllExists:
     raise newException(OSError, "shim DLL not found: " & dllPath)
 
+  # NOTE (interaction with `env`): when `argv[0]` carries no directory
+  # component, `windowsForkRuntimeForExecutable` falls back to `findExe`, which
+  # searches THIS process's `PATH` — never `env`'s. A caller that hands the
+  # child a `PATH` different from the host's can therefore have the MSYS/Cygwin
+  # check look at a different image than the one that ends up running. Pass an
+  # absolute `argv[0]` (or a `cwd`-relative one) when the two PATHs disagree.
   let forkRuntime =
     try: windowsForkRuntimeForExecutable(argv[0], cwd)
     except ValueError: ""
@@ -556,6 +588,25 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
   var cwdW: seq[uint16] = @[]
   if cwd.len > 0:
     cwdW = toWideCStringSeq(cwd)
+
+  # A non-nil `env` becomes an explicit UTF-16 lpEnvironment block; a nil one
+  # leaves `lpEnvironment` NULL so the child inherits our block, exactly as
+  # before this parameter existed. The creation-flag bit and the pointer are
+  # one decision, not two — a block passed without CREATE_UNICODE_ENVIRONMENT
+  # is re-read as ANSI and the child comes up with a garbage environment — so
+  # `lpEnvironmentArgs` returns both together, keyed on `env == nil` rather
+  # than on the size of the encoded block. See its docstring: keying on the
+  # block would let an "empty child environment" degrade into "inherit the
+  # parent's" if the encoder ever stopped emitting a terminator-only block.
+  var envArgs: tuple[extraFlags: uint32; blk: seq[uint16]]
+  try:
+    envArgs = lpEnvironmentArgs(env)
+  except ValueError as e:
+    raise newException(OSError,
+      "runWithMonitorShim: invalid child environment: " & e.msg)
+  var envBlockW = envArgs.blk
+  let creationFlags =
+    CREATE_SUSPENDED or EXTENDED_STARTUPINFO_PRESENT or envArgs.extraFlags
 
   # Pipe for captured stdio mode (anonymous pipe; merged stdout+stderr).
   var stdoutReadPipe: HANDLE = nil
@@ -663,8 +714,12 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
   let ok = CreateProcessW(nil,
     cast[LPWSTR](addr cmdLineW[0]),
     nil, nil, BOOL(1),
-    CREATE_SUSPENDED or EXTENDED_STARTUPINFO_PRESENT,
-    nil,
+    creationFlags,
+    # Keyed on the caller's intent, not on the encoded size, so it cannot
+    # disagree with the CREATE_UNICODE_ENVIRONMENT bit above.
+    # `lpEnvironmentArgs` guarantees `blk` is non-empty whenever `env != nil`,
+    # so `addr envBlockW[0]` is in bounds on this arm.
+    (if env != nil: cast[LPVOID](addr envBlockW[0]) else: nil),
     if cwdW.len > 0: cast[LPCWSTR](addr cwdW[0]) else: nil,
     cast[pointer](addr siex), addr pi)
   if ok == 0:

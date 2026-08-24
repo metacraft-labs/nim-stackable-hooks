@@ -108,6 +108,12 @@ const portableTestSpecs: seq[StackableTestSpec] = @[
   # Linux/macOS.
   StackableTestSpec(source: "tests/test_windows_inline_hook_api.nim",
     binary: "build/test-bin/test_windows_inline_hook_api"),
+  # ``test_windows_env_block`` exercises ``stackable_hooks/windows_env_block``,
+  # which is deliberately NOT gated ``when defined(windows)`` — the
+  # ``lpEnvironment`` encoding is pure string/UTF-16 work, so it compiles and
+  # RUNS on every host. Portable, not Windows-only.
+  StackableTestSpec(source: "tests/test_windows_env_block.nim",
+    binary: "build/test-bin/test_windows_env_block"),
 ]
 
 const linuxOnlyTestSpecs: seq[StackableTestSpec] = @[

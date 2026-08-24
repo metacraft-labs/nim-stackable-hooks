@@ -21,6 +21,7 @@ proc selectedTests(): seq[string] =
     "tests/test_reentrancy_guard_prevents_recursion.nim",
     "tests/test_safe_tls.nim",
     "tests/test_smoke.nim",
+    "tests/test_windows_env_block.nim",
     "tests/test_windows_inline_hook_api.nim",
   ]
   when defined(macosx):

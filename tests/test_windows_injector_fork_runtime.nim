@@ -1,9 +1,12 @@
-import std/[os, osproc, strutils, tempfiles, unittest]
+import std/[os, osproc, strtabs, strutils, tempfiles, unittest]
 
 import stackable_hooks/windows_injector
 
 const ProbeArg = "--msys-fork-probe"
 const ArgvProbeArg = "--argv-fidelity-probe"
+const EnvProbeArg = "--explicit-env-probe"
+const EnvProbeName = "STACKABLE_HOOKS_EXPLICIT_ENV_PROBE"
+const EnvProbeValue = "child-only-value"
 const ArgvProbeValues = [
   "",
   "space arg",
@@ -24,6 +27,11 @@ proc runArgvFidelityProbe(): int =
   for i, expected in ArgvProbeValues:
     if received[i + 1] != expected:
       return 20 + i
+  0
+
+proc runExplicitEnvProbe(): int =
+  if getEnv(EnvProbeName) != EnvProbeValue:
+    return 30
   0
 
 proc runForkProbe(): int =
@@ -50,12 +58,26 @@ if paramCount() == 1 and paramStr(1) == ProbeArg:
   quit(runForkProbe())
 if paramCount() > 0 and paramStr(1) == ArgvProbeArg:
   quit(runArgvFidelityProbe())
+if paramCount() == 1 and paramStr(1) == EnvProbeArg:
+  quit(runExplicitEnvProbe())
 
 suite "Windows injector fork-runtime handling":
   test "CreateProcess command lines preserve every argument byte":
     var argv = @[getAppFilename(), ArgvProbeArg]
     argv.add(ArgvProbeValues)
     let injection = runWithMonitorShim(argv, systemDllPath())
+    check injection.exitCode == 0
+    check injection.rootPid != 0
+    check not injection.monitoringSkipped
+
+  test "CreateProcess passes an explicit child environment":
+    let childEnv = newStringTable(modeCaseInsensitive)
+    for name, value in envPairs():
+      childEnv[name] = value
+    childEnv[EnvProbeName] = EnvProbeValue
+
+    let injection = runWithMonitorShim(
+      @[getAppFilename(), EnvProbeArg], systemDllPath(), env = childEnv)
     check injection.exitCode == 0
     check injection.rootPid != 0
     check not injection.monitoringSkipped

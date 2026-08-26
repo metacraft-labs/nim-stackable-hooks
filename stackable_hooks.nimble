@@ -1,5 +1,5 @@
 # Package
-import std/[algorithm, strutils]
+import std/strutils
 version       = readFile("version.txt").strip()
 author        = "Metacraft Labs"
 description   = "Cross-platform stackable hooks framework for Nim."
@@ -10,33 +10,13 @@ skipDirs      = @["tests"]
 # Dependencies
 requires "nim >= 2.0.0"
 
-proc selectedTests(): seq[string] =
-  result = @[
-    "tests/test_explicit_hook_suppression.nim",
-    "tests/test_external_tls_combined_gate.nim",
-    "tests/test_hook_registry_priority_order.nim",
-    "tests/test_linux_raw_syscalls.nim",
-    "tests/test_per_library_enable_disable.nim",
-    "tests/test_propagation_registry_concurrent.nim",
-    "tests/test_reentrancy_guard_prevents_recursion.nim",
-    "tests/test_safe_tls.nim",
-    "tests/test_smoke.nim",
-    "tests/test_windows_env_block.nim",
-    "tests/test_windows_inline_hook_api.nim",
-  ]
-  when defined(macosx):
-    result.add "tests/test_macos_bodypatch_minimal_consumer.nim"
-  when defined(linux):
-    result.add "tests/test_linux_preload_helpers.nim"
-  when defined(windows):
-    result.add "tests/test_windows_injector_fork_runtime.nim"
-    result.add "tests/test_propagation_windows_edge_cases.nim"
-    result.add "tests/test_propagation_windows_fork_bomb.nim"
-    result.add "tests/test_propagation_windows_remote_buffer_lifetime.nim"
-    result.add "tests/test_propagation_windows_smoke.nim"
-    result.add "tests/test_windows_wow64_injection.nim"
-  sort(result)
+# The test corpus is NOT written out here. It lives in `tests/corpus.nim`,
+# which `repro.nim` includes too, so the nimble lane and the reprobuild lane
+# cannot drift apart. `tests/test_lane_registration.nim` fails the build if
+# either lane grows a test path of its own or if a file under `tests/` is
+# missing from the corpus.
+include "tests/corpus.nim"
 
 task test, "Run the stackable-hooks test suite":
-  for testFile in selectedTests():
+  for testFile in hostTestSources():
     exec "nim c -r " & testFile

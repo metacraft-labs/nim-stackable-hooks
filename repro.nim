@@ -22,7 +22,7 @@
 ##   "src")``); consumers ``import stackable_hooks`` (the umbrella at
 ##   ``src/stackable_hooks.nim``) or the individual submodules under
 ##   ``src/stackable_hooks/``.
-## * Emits, per test file under ``tests/``, a BUILD edge
+## * Emits, per test file in the corpus, a BUILD edge
 ##   (``buildNimUnittest.build``) that compiles ``build/test-bin/<stem>`` and
 ##   an EXECUTE edge (``edge.testBinary.run``) that runs it — the two-edge
 ##   test template from ``reprobuild-specs/Package-Model.md`` §"The test
@@ -31,26 +31,43 @@
 ##   so ``repro build test`` / ``repro test`` materialise the runnable
 ##   closure.
 ##
-## **Per-test platform gating.** Each test file self-adapts to its target OS
-## via ``when defined(...)`` in the file itself; the edge here mirrors that
-## exactly so the corpus this host runs matches what the repo's own
-## ``nim c -r`` would run:
+## **Per-test platform gating is no longer decided here.** This file used to
+## carry its own hand-written ``portableTestSpecs`` /
+## ``linuxOnlyTestSpecs`` / ``windowsOnlyTestSpecs`` tables, and they had
+## drifted from ``stackable_hooks.nimble``'s list: five nimble-listed tests
+## were absent from this lane entirely, one test file was in neither lane, and
+## the two lists disagreed about ``test_macos_bodypatch_minimal_consumer``.
+## This file's comment block also mis-described the three
+## ``test_propagation_windows_*`` files as uncompilable off Windows; they are
+## ``when defined(windows)``-wrapped and compile fine.
 ##
-##   * The three ``test_propagation_windows_*`` files ``import
-##     stackable_hooks/propagation_windows``, whose module head carries a hard
-##     ``{.error: "Windows-only".}`` on non-Windows. Their top-of-file
-##     ``when not defined(windows): quit(0)`` runtime guard never fires
-##     because the unconditional ``import`` below it fails to COMPILE off
-##     Windows. They are genuinely Windows-only, so their edges are gated
-##     ``when defined(windows)`` at extraction and are simply absent from the
-##     graph on Linux/macOS.
-##   * Every other test compiles + runs to ``exit 0`` on this Linux host —
-##     including ``test_macos_bodypatch_minimal_consumer`` (its non-macOS
-##     ``else:`` branch is a trivial ``static: doAssert not defined(macosx)``)
-##     and ``test_windows_inline_hook_api`` (its non-Windows ``else:`` branch
-##     compiles ``install_windows.c`` and runs real C-ABI ``doAssert``s). Both
-##     therefore keep a runnable edge on Linux; their OS-specific bodies are
-##     the file's own concern.
+## Both lanes now read ``tests/corpus.nim``. The per-entry ``targets`` list
+## there decides everything: ``runsOnHost`` gates the edges below, and the
+## non-host targets feed the cross-target ``nim check`` matrix that
+## ``tests/test_cross_target_compile.nim`` drives. See that file's header for
+## why the corpus exists and what
+## ``tests/test_lane_registration.nim`` enforces about it.
+##
+## **KNOWN RED IN THIS LANE, PRE-EXISTING AND NOT INTRODUCED HERE.**
+## ``stackable_hooks.test_execute.test_linux_raw_syscalls`` exits **127**
+## under reprobuild's ``dgAutomaticMonitor`` dependency policy, so
+## ``repro test`` exits 1 on Linux. It is not flaky and it is not a gating
+## decision made here: it reproduces identically at the commit before the
+## corpus landed (22 actions, 21 succeeded, that one failed, three runs) and
+## after it (40 actions, 39 succeeded, the same one failed). The binary
+## itself is healthy — run directly it exits 0 with 38 ``[OK]``.
+##
+## What the monitor costs is silent: under it the run dies after
+## ``ucontext register helpers and raw register replay are exported through
+## C ABI`` with only 35 ``[OK]``, so THREE cases never execute in this lane —
+## ``SIGTRAP install/uninstall substrate restores process handler without
+## raising trap``, ``live INT3 handler replays raw syscall and advances saved
+## RIP`` and ``memory scanner describes callsites in a controlled executable
+## buffer``. The io-mon shim and this repo's live SIGTRAP/INT3 patching do
+## not coexist; both want the trap. Recorded here rather than tolerated
+## quietly, because a lane whose exit code is always 1 stops being read, and
+## because the three skipped cases are a coverage loss the ``[OK]`` count
+## alone does not show. Fixing it is out of scope for the corpus work.
 
 import repro_project_dsl
 
@@ -69,75 +86,18 @@ import repro_project_dsl
 # harness already prints per-suite results and exits non-zero on failure.
 import ct_test_nim_unittest
 
-type
-  StackableTestSpec = object
-    ## One entry per test file. ``source`` is the repo-relative ``.nim``
-    ## path; ``binary`` is the ``build/test-bin/<stem>`` output.
-    source: string
-    binary: string
-
-const portableTestSpecs: seq[StackableTestSpec] = @[
-  # Tests that compile + run to exit 0 on every host (Linux/macOS/Windows).
-  # Portable framework primitives with no OS gate in the file.
-  StackableTestSpec(source: "tests/test_hook_registry_priority_order.nim",
-    binary: "build/test-bin/test_hook_registry_priority_order"),
-  StackableTestSpec(source: "tests/test_per_library_enable_disable.nim",
-    binary: "build/test-bin/test_per_library_enable_disable"),
-  StackableTestSpec(source: "tests/test_propagation_registry_concurrent.nim",
-    binary: "build/test-bin/test_propagation_registry_concurrent"),
-  StackableTestSpec(source: "tests/test_reentrancy_guard_prevents_recursion.nim",
-    binary: "build/test-bin/test_reentrancy_guard_prevents_recursion"),
-  StackableTestSpec(source: "tests/test_safe_tls.nim",
-    binary: "build/test-bin/test_safe_tls"),
-  StackableTestSpec(source: "tests/test_smoke.nim",
-    binary: "build/test-bin/test_smoke"),
-  # ``test_linux_raw_syscalls`` has no OS gate — its ``platform support is
-  # explicit`` case has ``when linux/amd64`` … ``else`` arms so it compiles +
-  # runs everywhere (asserting the unsupported-platform contract off Linux).
-  StackableTestSpec(source: "tests/test_linux_raw_syscalls.nim",
-    binary: "build/test-bin/test_linux_raw_syscalls"),
-  # ``test_macos_bodypatch_minimal_consumer``: ``when defined(macosx):
-  # <bodypatch API> else: static: doAssert not defined(macosx)`` — the
-  # non-macOS arm is a trivial compile-time assertion, so it runs to exit 0
-  # on Linux/Windows too.
-  StackableTestSpec(source: "tests/test_macos_bodypatch_minimal_consumer.nim",
-    binary: "build/test-bin/test_macos_bodypatch_minimal_consumer"),
-  # ``test_windows_inline_hook_api``: ``when defined(windows): <Nim wrapper
-  # API> else: <compile install_windows.c + run C-ABI doAsserts>`` — the
-  # non-Windows arm does real C-ABI verification, so it runs to exit 0 on
-  # Linux/macOS.
-  StackableTestSpec(source: "tests/test_windows_inline_hook_api.nim",
-    binary: "build/test-bin/test_windows_inline_hook_api"),
-]
-
-const linuxOnlyTestSpecs: seq[StackableTestSpec] = @[
-  # ``test_linux_preload_helpers`` opens with ``when not defined(linux):
-  # {.error.}`` — it imports ``stackable_hooks/platform/linux_preload`` and
-  # exercises the LD_PRELOAD reentrancy/RTLD_NEXT primitives. Linux-only by
-  # construction; gated ``when defined(linux)`` at extraction below.
-  StackableTestSpec(source: "tests/test_linux_preload_helpers.nim",
-    binary: "build/test-bin/test_linux_preload_helpers"),
-]
-
-const windowsOnlyTestSpecs: seq[StackableTestSpec] = @[
-  # The three ``propagation_windows`` tests import a module whose head is
-  # ``when not defined(windows): {.error: "Windows-only".}``. They do not
-  # compile off Windows, so their edges are gated ``when defined(windows)``
-  # and absent from the Linux/macOS graph.
-  StackableTestSpec(source: "tests/test_propagation_windows_smoke.nim",
-    binary: "build/test-bin/test_propagation_windows_smoke"),
-  StackableTestSpec(source: "tests/test_propagation_windows_edge_cases.nim",
-    binary: "build/test-bin/test_propagation_windows_edge_cases"),
-  StackableTestSpec(source: "tests/test_propagation_windows_fork_bomb.nim",
-    binary: "build/test-bin/test_propagation_windows_fork_bomb"),
-]
+# The shared corpus. `include`, not `import`, because `stackable_hooks.nimble`
+# consumes the same file from NimScript and the two must be the same text.
+include "tests/corpus.nim"
 
 package stackable_hooks:
   uses:
     # Toolchain floor — the PATH-resolvable binaries the build needs.
     # ``nim`` compiles every test binary (the ``buildNimUnittest.build``
-    # edges below); ``gcc`` is the C back-end ``nim c`` shells out to (and,
-    # for ``test_windows_inline_hook_api`` on Linux, the compiler for the
+    # edges below) and is ALSO invoked at run time by
+    # ``test_cross_target_compile`` as ``nim check --os:… --cpu:…``; ``gcc``
+    # is the C back-end ``nim c`` shells out to (and, for
+    # ``test_windows_inline_hook_api`` on Linux, the compiler for the
     # ``{.compile.}``d ``install_windows.c``). Sufficient for the path-mode
     # resolver under ``nix develop``.
     "nim >=2.2 <3.0"
@@ -188,24 +148,13 @@ package stackable_hooks:
         registerImplicitName = false)
       executeActions.add(executeEdge)
 
-    # Portable tests — always in the graph.
-    for spec in portableTestSpecs:
-      emitTestPair(spec.source, spec.binary,
+    # One pair per corpus entry whose ``targets`` cover this host OS. The
+    # gate is ``runsOnHost``, the exact predicate ``stackable_hooks.nimble``
+    # uses, so the two lanes select the same corpus by construction rather
+    # than by two people keeping two lists in step.
+    for spec in hostTargets():
+      emitTestPair(spec.testSource, spec.testBinary,
         testBuildActions, testExecuteActions)
-
-    # Linux-only tests — only compilable/runnable on Linux; gated at
-    # extraction so they never enter the graph on macOS/Windows.
-    when defined(linux):
-      for spec in linuxOnlyTestSpecs:
-        emitTestPair(spec.source, spec.binary,
-          testBuildActions, testExecuteActions)
-
-    # Windows-only tests — import a ``{.error.}``-guarded module off Windows,
-    # so their edges only exist when the extraction host is Windows.
-    when defined(windows):
-      for spec in windowsOnlyTestSpecs:
-        emitTestPair(spec.source, spec.binary,
-          testBuildActions, testExecuteActions)
 
     discard collect("test", testExecuteActions)
     discard collect("test-builds", testBuildActions)

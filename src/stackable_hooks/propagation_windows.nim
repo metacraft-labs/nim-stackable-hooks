@@ -28,6 +28,10 @@
 ##   * ``waitDeadlineMs`` — replace ``INFINITE`` with a deadline. On
 ##     timeout the framework abandons the wait, leaves the child
 ##     uninstrumented, and returns ``ioWaitTimeout``. Default 5000ms.
+##     Abandoning the wait means abandoning the remote thread's ARGUMENT
+##     too: the child-side path buffer is deliberately leaked rather than
+##     freed under a thread that may still be reading it. See the
+##     cross-process lifetime note in ``injectShimIntoChild``.
 ##   * ``skipIfImageHasShim`` — query ``EnumProcessModulesEx`` for the
 ##     child's loaded modules and skip injection if the shim is
 ##     already mapped (e.g. via inherited handles or static linkage).
@@ -80,8 +84,7 @@ const
   MEM_RESERVE = 0x00002000'u32
   MEM_RELEASE = 0x00008000'u32
   PAGE_READWRITE = 0x04'u32
-  WAIT_TIMEOUT = 0x102'u32
-  WAIT_FAILED = 0xFFFFFFFF'u32
+  WAIT_OBJECT_0 = 0x0'u32
   GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS = 0x00000004'u32
   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT = 0x00000002'u32
 
@@ -276,7 +279,10 @@ proc injectShimIntoChild*(hProcess: HANDLE;
   ##                          saturated; the caller can decide whether
   ##                          to retry or proceed un-injected.
   ##   ``ioWaitTimeout``    — LoadLibraryW didn't complete within
-  ##                          ``waitDeadlineMs``; child runs uninstrumented.
+  ##                          ``waitDeadlineMs``; child runs uninstrumented
+  ##                          and the child-side path buffer is
+  ##                          deliberately leaked (reclaimed when the child
+  ##                          exits).
   ##   ``ioInjectFailed``   — VirtualAllocEx / WriteProcessMemory /
   ##                          CreateRemoteThread reported an error.
   ##   ``ioInitFailed``     — LoadLibraryW succeeded but the init
@@ -337,7 +343,44 @@ proc injectShimIntoChild*(hProcess: HANDLE;
     MEM_COMMIT or MEM_RESERVE, PAGE_READWRITE)
   if remoteBuf == nil:
     return ioInjectFailed
-  defer: discard VirtualFreeEx(hProcess, remoteBuf, 0, MEM_RELEASE)
+
+  # ---------------------------------------------------------------------
+  # CROSS-PROCESS LIFETIME — why there is no unconditional ``defer`` here.
+  #
+  # ``remoteBuf`` lives in the CHILD's address space and is handed to a
+  # ``CreateRemoteThread`` running ``kernel32!LoadLibraryW``. That thread's
+  # lifetime is NOT bounded by this stack frame, so the local ``defer``
+  # idiom — "free on every exit path" — is wrong here BY CONSTRUCTION: it
+  # is a lifetime rule for objects this frame owns, and this frame does
+  # not own the remote read.
+  #
+  # The bug it caused: on the ``ioWaitTimeout`` path the deadline expired
+  # while ``LoadLibraryW`` was still running, and the ``defer`` unmapped
+  # the buffer under it. ntdll's AVX2 zero-scan over the path string
+  # (``vpcmpeqb ymm1,ymm2,[rdx]``) then read a region that had gone
+  # ``MEM_FREE``, and the child died with ``STATUS_ACCESS_VIOLATION``
+  # (0xC0000005) — observed as compilers crashing mid-build on Windows.
+  # Only GRANDchildren were ever hit, because the ROOT injector
+  # (``windows_injector.nim``) waits ``INFINITE`` and therefore always has
+  # proof the remote thread finished before it frees.
+  #
+  # The rule: free ONLY with PROOF the remote thread exited, i.e. only
+  # after ``WaitForSingleObject`` returned ``WAIT_OBJECT_0``. Until the
+  # remote thread exists, this frame is still the sole owner and freeing
+  # is safe (the early-failure returns below); the instant the thread is
+  # created ownership transfers to it, and it comes back only on
+  # ``WAIT_OBJECT_0``.
+  #
+  # On timeout/failure we therefore DELIBERATELY LEAK the reservation.
+  # The cost is bounded and self-healing: one 64 KB reservation in the
+  # CHILD's address space, reclaimed in full when the child exits. Leaking
+  # that is strictly better than unmapping memory a live remote thread is
+  # mid-read.
+  # ---------------------------------------------------------------------
+  var remoteBufOwned = true
+  defer:
+    if remoteBufOwned:
+      discard VirtualFreeEx(hProcess, remoteBuf, 0, MEM_RELEASE)
 
   var written: SIZE_T = 0
   if WriteProcessMemory(hProcess, remoteBuf, addr wpath[0],
@@ -366,11 +409,22 @@ proc injectShimIntoChild*(hProcess: HANDLE;
   let hThread = CreateRemoteThread(hProcess, nil, 0, loadLibraryW,
     remoteBuf, 0, nil)
   if hThread == nil:
+    # No remote thread exists, so nothing can be reading the buffer:
+    # ownership never left this frame and the deferred free is correct.
     return ioInjectFailed
+  # Ownership transfers to the remote thread HERE, before the wait — a
+  # thread that outlives the deadline must keep its argument.
+  remoteBufOwned = false
   let wait = WaitForSingleObject(hThread, cfg.waitDeadlineMs)
   discard CloseHandle(hThread)
-  if wait == WAIT_TIMEOUT or wait == WAIT_FAILED:
+  if wait != WAIT_OBJECT_0:
+    # Timed out (or the wait itself failed): the remote thread may still
+    # be dereferencing ``remoteBuf``. Leak it on purpose — see the
+    # cross-process lifetime note above.
     return ioWaitTimeout
+  # WAIT_OBJECT_0 is the PROOF the remote thread exited; LoadLibraryW is
+  # done with the path string, so ownership is ours again.
+  remoteBufOwned = true
 
   # Init dispatch — only when the consumer asked for one.
   if initSymbol.len == 0:
@@ -443,9 +497,12 @@ proc injectShimIntoChild*(hProcess: HANDLE;
     nil, 0, nil)
   if initThread == nil:
     return ioInitFailed
+  # The init thread is passed ``nil`` as its parameter — it never touches
+  # ``remoteBuf`` — and ``LoadLibraryW`` has provably returned by now, so
+  # the deferred free is safe on both arms below.
   let initWait = WaitForSingleObject(initThread, cfg.waitDeadlineMs)
   discard CloseHandle(initThread)
-  if initWait == WAIT_TIMEOUT or initWait == WAIT_FAILED:
+  if initWait != WAIT_OBJECT_0:
     return ioWaitTimeout
   ioInjected
 

@@ -98,6 +98,7 @@ when defined(windows) and defined(vcc) and
    dynamic linker handles uniformly per-thread). */
 #if defined(_MSC_VER) && defined(CT_STACKABLE_HOOKS_EXTERNAL_TLS)
 int _ct_hook_depth_get(void);
+int _ct_hooks_allowed_get(void);
 void _ct_hook_depth_set(int v);
 int _ct_hook_depth_inc_and_get(void);
 int _ct_hook_depth_dec_and_get(void);
@@ -436,6 +437,12 @@ proc ctHookDepthGet*(): cint
     {.importc: "_ct_hook_depth_get", cdecl.}
   ## Read the calling thread's reentrancy depth counter.
 
+when defined(windows) and defined(vcc) and
+    defined(ctStackableHooksExternalTls):
+  proc ctHooksAllowedGet*(): cint
+      {.importc: "_ct_hooks_allowed_get", cdecl.}
+    ## Read depth and permanent-suppression state in one host TLS lookup.
+
 proc ctHookDepthSet*(v: cint)
     {.importc: "_ct_hook_depth_set", cdecl.}
   ## Overwrite the calling thread's reentrancy depth counter.  Used
@@ -563,7 +570,12 @@ proc hooksAllowed*(): bool =
   ## ``hooksExplicitlySuppressedForCurrentThread`` directly rather than
   ## ``hooksAllowed``, which would also reject it for the depth it
   ## legitimately holds.
-  ctHookDepthGet() == 0 and not hooksExplicitlySuppressedForCurrentThread()
+  when defined(windows) and defined(vcc) and
+      defined(ctStackableHooksExternalTls):
+    ctHooksAllowedGet() != 0
+  else:
+    ctHookDepthGet() == 0 and
+      not hooksExplicitlySuppressedForCurrentThread()
 
 proc currentHookDepth*(): int {.inline.} =
   ## MW39 (MCR-Windows-CtMcr-Port) -- public accessor for the per-thread

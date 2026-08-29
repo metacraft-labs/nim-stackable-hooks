@@ -39,6 +39,42 @@ when not defined(macosx):
 #define STACKABLE_BODYPATCH_MAX_TARGETS 64
 #endif
 
+/* arm64e pointer-authentication (PAC) safety.
+ *
+ * On Apple silicon the shim is a fat dylib with an arm64e slice, and dyld
+ * loads that slice into any arm64e host process (Apple's /usr/bin/clang,
+ * /usr/bin/ld, and every shared-cache system tool). On arm64e, code pointers
+ * returned by NSAddressOfSymbol / dlsym carry a pointer-authentication
+ * signature in their high bits, and function pointers handed to us as `hook`
+ * are likewise signed. The body-patch primitive treats those pointers as raw
+ * virtual addresses: it masks off page bits and memcpy's from the target page,
+ * and it stores `hook` behind a plain `br x16` stub. A signed pointer used as a
+ * raw address dereferences a non-canonical VA (e.g. 0xaf0d00018f264000, where
+ * 0xaf0d is the PAC signature over a valid 0x18f264000 text page) and faults
+ * with EXC_BAD_ACCESS the instant the shim's constructor runs -- which crashed
+ * every monitored arm64e child with SIGSEGV. The arm64 slice has no PAC and was
+ * never affected, so the bug only showed on Apple silicon.
+ *
+ * Strip the authentication bits before any pointer is used as an address. On
+ * the arm64 slice `__has_feature(ptrauth_calls)` is false and these are no-ops,
+ * so the arm64 code path is byte-identical to before. A stripped code pointer
+ * is still a correct raw VA for reading the original bytes, for mach_vm_remap,
+ * and for the non-authenticated `br x16` branch the stub performs. */
+#if defined(__has_feature)
+#  if __has_feature(ptrauth_calls)
+#    include <ptrauth.h>
+#    define STACKABLE_BODYPATCH_HAS_PTRAUTH 1
+#  endif
+#endif
+
+static inline void *stackable_bodypatch_strip_code(void *p) {
+#ifdef STACKABLE_BODYPATCH_HAS_PTRAUTH
+  return ptrauth_strip(p, ptrauth_key_function_pointer);
+#else
+  return p;
+#endif
+}
+
 static int stackable_bodypatch_addr_in_image_substr(const void *addr,
                                                     const char *image_substr) {
   Dl_info info;
@@ -72,7 +108,10 @@ static void *stackable_bodypatch_resolve_macho_symbol(const char *name,
       NSLOOKUPSYMBOLINIMAGE_OPTION_BIND |
       NSLOOKUPSYMBOLINIMAGE_OPTION_RETURN_ON_ERROR);
     if (sym) {
-      void *ptr = NSAddressOfSymbol(sym);
+      /* On arm64e NSAddressOfSymbol returns a PAC-signed code pointer; strip
+       * it here so every consumer (dladdr image check, install, trampoline)
+       * sees a raw virtual address. */
+      void *ptr = stackable_bodypatch_strip_code(NSAddressOfSymbol(sym));
       if (ptr && !stackable_bodypatch_addr_in_image_substr(ptr, exclude_substr)) {
         return ptr;
       }
@@ -99,6 +138,12 @@ static void stackable_bodypatch_remember(uintptr_t target) {
 
 int stackable_macos_bodypatch_install(void *target, void *hook) {
   if (target == NULL || hook == NULL) return 1;
+
+  /* Defensive: a caller may hand us a signed `target` (e.g. a raw &symbol on
+   * arm64e) and `hook` is a signed function pointer. The stub below stores
+   * `hook` behind a plain `br x16`, so it must be the raw address. */
+  target = stackable_bodypatch_strip_code(target);
+  hook = stackable_bodypatch_strip_code(hook);
 
   uintptr_t taddr = (uintptr_t)target;
   if (stackable_bodypatch_already(taddr)) return 0;
@@ -192,6 +237,10 @@ static int stackable_bodypatch_prologue_relocatable(const void *target) {
 void *stackable_macos_bodypatch_build_trampoline(void *target, int *err) {
   if (err) *err = 0;
   if (target == NULL) { if (err) *err = 1; return NULL; }
+
+  /* Strip PAC so the prologue read and the `target + 16` resume address are
+   * raw virtual addresses on the arm64e slice. */
+  target = stackable_bodypatch_strip_code(target);
 
   if (!stackable_bodypatch_prologue_relocatable(target)) {
     if (err) *err = 2;

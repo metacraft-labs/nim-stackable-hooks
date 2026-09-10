@@ -20,6 +20,13 @@ when defined(windows):
   import stackable_hooks/propagation_windows
   import stackable_hooks/windows_fork_runtime
 
+  # The self-respawn case below spawns THIS binary. Exit immediately in the
+  # child so the suite does not recurse; it only has to exist long enough
+  # to be classified.
+  if paramCount() >= 1 and paramStr(1) == "--edge-case-self-respawn-probe":
+    sleep(3000)
+    quit(0)
+
   type
     HANDLE = pointer
     DWORD = uint32
@@ -82,6 +89,66 @@ when defined(windows):
       check cfg.maxInFlight == 16
       check cfg.waitDeadlineMs == 5000'u32
       check cfg.skipIfImageHasShim
+      # The attach strategy is UNIVERSAL, so the default has to be the
+      # park and a zero-initialised config has to land on it too --
+      # `asDirect` is the pre-park technique and must never be reached by
+      # accident.
+      check cfg.attachStrategy == asEntryPark
+      check cfg.parkTimeoutMs == 5000'u32
+      check ord(asEntryPark) == 0
+      check InjectionConfig().attachStrategy == asEntryPark
+
+    test "injectShimIntoChild: asDirect keeps the pre-park semantics":
+      # asDirect must NOT consult the fork-runtime heuristic: it is the
+      # verbatim legacy path, and the regression control in
+      # test_windows_entry_park_msys depends on being able to ask for it.
+      # A bogus handle can never be a fork-runtime image, so the only
+      # thing this can prove here is that the call still reaches the
+      # allocation and fails there rather than short-circuiting.
+      let bogus = cast[pointer](0xF00D'u)
+      var cfg = defaultInjectionConfig()
+      cfg.attachStrategy = asDirect
+      cfg.maxInFlight = 16
+      cfg.waitDeadlineMs = 1
+      cfg.skipIfImageHasShim = false
+      let outcome = injectShimIntoChild(bogus, r"C:\foo\bar.dll", "", cfg)
+      check outcome != ioInjected
+      check outcome != ioSkippedForkRuntime
+      check outcome != ioParkFailed
+
+    test "mappedForkRuntime: this native test process has no fork runtime":
+      # The authoritative half of the fork-child detection. This binary is
+      # a plain Nim executable, so the loader has neither runtime mapped;
+      # if this ever reports one, `isCygwinForkChild` would start
+      # classifying ordinary self-respawns as forks.
+      check mappedForkRuntime() == ""
+
+    test "isCygwinForkChild: a nil handle is not a fork child":
+      check not isCygwinForkChild(nil)
+
+    test "isCygwinForkChild: a native self-respawn is NOT a fork child":
+      # This is the false-positive guard that keeps ordinary tools safe.
+      # `nim`, `gcc` and `msbuild` all re-exec themselves; the child image
+      # then equals ours EXACTLY, which is the second half of the
+      # detection. The first half -- a fork runtime mapped into US -- is
+      # what must keep them injectable, and this proves it does.
+      let child = startProcess(getAppFilename(),
+        args = @["--edge-case-self-respawn-probe"],
+        options = {poStdErrToStdOut})
+      defer:
+        terminate(child)
+        discard waitForExit(child, 5000)
+        close(child)
+      let handle = OpenProcess(ProcessQueryLimitedInformation, BOOL(0),
+        DWORD(processID(child)))
+      require handle != nil
+      defer: discard CloseHandle(handle)
+
+      # Same image as ours, by construction ...
+      check windowsProcessImagePath(handle).cmpIgnoreCase(
+        getAppFilename()) == 0
+      # ... and still not a fork child, because we are not Cygwin.
+      check not isCygwinForkChild(handle)
 
     test "resolveSelfImagePath: empty pointer returns empty string gracefully":
       let p = resolveSelfImagePath(nil)

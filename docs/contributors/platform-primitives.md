@@ -47,3 +47,37 @@ These functions are mechanism-only helpers. The caller must ensure that no other
 
 `stackable_hooks/windows_injector` is an opt-in helper module providing host-side Windows process creation and DLL injection logic using the standard suspended creation + `CreateRemoteThread` + `LoadLibraryW` pattern.
 It includes process handle-whitelisting via `STARTUPINFOEX` to prevent handle-leak deadlocks on parent-inherited resources.
+
+## Windows Entry-Point Park
+
+`stackable_hooks/windows_entry_park` is the attach primitive the propagation
+framework uses before it injects. It parks a `CREATE_SUSPENDED` child's **main
+thread** at the child's image entry point — patch the entry with `EB FE`,
+`ResumeThread`, poll `GetThreadContext` until the instruction pointer reaches
+the entry, `SuspendThread` — so the Windows loader runs `LdrpInitializeProcess`
+on that thread rather than on an injected remote thread.
+
+Why it exists: the loader initialises a process on whichever thread reaches
+`LdrInitializeThunk` first. A `CreateRemoteThread` into a never-run child
+therefore runs every static import's `DLL_PROCESS_ATTACH` — `msys-2.0.dll`'s
+included — on a thread that then exits, and an MSYS2/Cygwin child wedges at its
+first `fork()`. This is a *thread* problem, not an address-collision problem;
+`research/msys-attach-2026-09/` carries the measurement that separates the two,
+along with the two plausible alternatives (the initial debug breakpoint, a fixed
+`Sleep`) that do not work.
+
+Two properties callers depend on:
+
+* **Suspend-count neutral.** The park resumes and re-suspends, so on return the
+  thread is suspended exactly once, as it was passed in. The caller's own
+  `ResumeThread` remains the single wakeup.
+* **It runs the child's loader.** A caller who asked for `CREATE_SUSPENDED`
+  themselves is entitled to a child that has executed nothing — Cygwin's `fork()`
+  copies the parent's address space into exactly such a child — so the park must
+  not be applied to one. `propagation_windows.autoPropagateCreateProcessW`
+  decides this from the original creation flags and withholds the thread handle
+  when the caller asked.
+
+The park is x86-only (`EB FE`) and reports `epsUnsupported` on Windows/ARM64 and
+for a 32-bit host looking at a 64-bit child; callers keep the legacy technique
+there, and refuse fork-runtime children rather than wedge them.

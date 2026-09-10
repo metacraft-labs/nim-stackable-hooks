@@ -166,6 +166,14 @@ const testCorpus*: seq[TestEntry] = @[
   TestEntry(stem: "test_windows_inline_hook_api", targets: AllHostTargets,
     why: "Off Windows its `else` arm compiles install_windows.c and runs " &
          "real C-ABI doAsserts, so it is genuine coverage everywhere."),
+  TestEntry(stem: "test_windows_entry_park_msys",
+    targets: @[tLinuxAmd64, tMacosArm64, tWindowsAmd64, tWindowsArm64],
+    why: "Body is `when defined(windows)`-wrapped with an " &
+         "`else: static: doAssert` arm, so it compiles everywhere and is " &
+         "a no-op off Windows. Its Windows arm spawns a real MSYS2/Cygwin " &
+         "shell and a real native child, so the run lane is Windows only " &
+         "while the cross-target lane still compile-verifies it from " &
+         "Linux and macOS."),
   TestEntry(stem: "test_windows_wow64_injection",
     targets: @[tLinuxAmd64, tMacosArm64, tWindowsAmd64, tWindowsArm64],
     why: "Body is `when defined(windows)`-wrapped; compiles everywhere, " &
@@ -222,6 +230,16 @@ const moduleCorpus*: seq[ModuleEntry] = @[
   ModuleEntry(path: "src/stackable_hooks/propagation_windows.nim",
     targets: WindowsOnlyTargets,
     why: "`when not defined(windows): {.error.}` module head."),
+  ModuleEntry(path: "src/stackable_hooks/windows_entry_park.nim",
+    targets: @[tWindowsAmd64, tWindowsArm64, tWindowsI386],
+    why: "`when not defined(windows): {.error.}` module head. i386 is " &
+         "listed IN ADDITION to the usual Windows pair because this " &
+         "module has a live 32-bit arm of its own -- a WOW64 host reads a " &
+         "32-bit CONTEXT and a 32-bit PEB -- and the amd64/arm64 targets " &
+         "compile neither of those branches. It is also the only module " &
+         "here whose body is gated on the CPU rather than the OS: the " &
+         "`EB FE` park is x86-only and arm64 compiles the unsupported " &
+         "stub, so both arms need a target."),
   ModuleEntry(path: "src/stackable_hooks/windows_fork_runtime.nim",
     targets: WindowsOnlyTargets,
     why: "`when not defined(windows): {.error.}` module head."),

@@ -42,6 +42,51 @@
 ##     returns. Init takes the consumer's own internal lock; the OS
 ##     loader's per-DLL constructor has already completed by then so
 ##     loader-lock contention is bounded.
+##
+## MSYS2/CYGWIN CHILDREN
+## ---------------------
+## Two independent hazards, both propagation-framework concerns because
+## ``injectShimIntoChild`` attaches to every Windows child it is handed.
+##
+## HAZARD 1 — the loader runs on the wrong thread. A ``CreateRemoteThread``
+## into a never-run ``CREATE_SUSPENDED`` child makes the Windows loader
+## initialise the whole process, ``msys-2.0.dll``'s ``DLL_PROCESS_ATTACH``
+## included, on that remote thread, which then exits. The Cygwin runtime is
+## left bound to a dead thread and the shell wedges at its first ``fork()``.
+## ``stackable_hooks/windows_entry_park`` fixes this by parking the child's
+## MAIN thread at its image entry point first; its docstring carries the
+## measurements, including the two plausible alternatives that do not work.
+## ``attachStrategy`` selects the technique and defaults to the park.
+##
+## HAZARD 2 — Cygwin's ``fork()`` is itself a ``CreateProcessW``. Once a
+## shell is instrumented it hooks its own forks, and a fork child is the one
+## place where the identical-address constraint from
+## ``codetracer-specs/Architecture/Hooking-Cygwin-Binaries-On-Windows.md``
+## genuinely does bite: the runtime replays the parent's address space into
+## it. ``isCygwinForkChild`` refuses those outright. Both refusals return
+## outcomes that are NOT ``ioInjected``, so a consumer grading on the
+## outcome keeps the subtree reported-incomplete rather than
+## silently-complete.
+##
+## WHAT IS STILL NOT ATTACHED, and why
+## -----------------------------------
+## A spawn issued from INSIDE an instrumented MSYS2/Cygwin process. The
+## Cygwin runtime passes ``CREATE_SUSPENDED`` on every ``fork``, ``exec``
+## and ``spawn`` because it has to write its ``child_info`` block into the
+## child before letting it run — so ``callerAskedSuspended`` is always true
+## there and the park is never sound. Consequences, in order:
+##
+## * shell -> NATIVE child (``bash`` running ``nim.exe``) keeps working
+##   exactly as it does today, on the legacy technique.
+## * shell -> its own ``fork()`` is refused (``ioSkippedForkChild``).
+## * shell -> another MSYS image is refused (``ioSkippedForkRuntime``)
+##   rather than wedged, which is a strict improvement on hanging but is
+##   NOT coverage.
+##
+## Whether an MSYS-to-MSYS spawn could be parked safely is unmeasured:
+## Cygwin writes into the child before resuming it, and running the loader
+## first may or may not disturb that. It is left refused rather than
+## guessed at.
 
 when not defined(windows):
   {.error: "stackable_hooks/propagation_windows is Windows-only".}
@@ -52,8 +97,14 @@ import std/[atomics, locks, strutils, widestrs]
 
 import ./hook_registry
 import ./propagation
+import ./windows_entry_park
 import ./windows_fork_runtime
 import ./windows_injector
+
+# Re-exported whole: a consumer that spawns its own suspended children
+# needs the park primitive itself, not only the outcomes this module
+# derives from it.
+export windows_entry_park
 
 # Re-exported so a shim's spawn hook can consult it through this module,
 # which is the one it already imports for `injectShimIntoChild`.
@@ -137,6 +188,8 @@ proc QueryFullProcessImageNameW(hProcess: HANDLE, dwFlags: DWORD,
                                 lpExeName: LPWSTR,
                                 lpdwSize: ptr DWORD): BOOL
   {.importc, stdcall, dynlib: "kernel32".}
+proc GetCurrentProcess(): HANDLE
+  {.importc, stdcall, dynlib: "kernel32".}
 
 proc windowsProcessImagePath*(hProcess: pointer): string =
   ## Resolve a child image after CreateProcessW has created it suspended.
@@ -158,17 +211,56 @@ proc windowsForkRuntimeForProcess*(hProcess: pointer): string =
 # ---------------------------------------------------------------------------
 
 type
+  AttachStrategy* = enum
+    ## How ``injectShimIntoChild`` reaches a suspended child.
+    asEntryPark
+      ## Park the child's main thread at its image entry point, so the
+      ## Windows loader initialises the process ON THAT THREAD, then
+      ## inject. The default, and universal: it is applied to every child,
+      ## not only MSYS2/Cygwin ones. The comment block in
+      ## ``injectShimIntoChild`` records why universal was chosen over
+      ## gating the park on fork-runtime detection.
+    asDirect
+      ## VERBATIM PRE-PARK BEHAVIOUR: ``CreateRemoteThread`` straight into a
+      ## child that has never executed an instruction, with no fork-runtime
+      ## refusal in front of it. On an MSYS2/Cygwin child this WEDGES the
+      ## child at its first ``fork()`` while still returning ``ioInjected``
+      ## — the exact falsely-complete outcome the default exists to
+      ## prevent. It is kept for two reasons: a consumer that needs
+      ## bit-identical legacy semantics can still ask for them, and the
+      ## regression test needs to be able to demand the broken behaviour so
+      ## the passing case cannot pass vacuously.
+      ##
+      ## Note this is a strategy, not a fallback. When ``asEntryPark`` is
+      ## selected and the park is merely UNAVAILABLE (no main-thread
+      ## handle, ARM64, a 32-bit host looking at a 64-bit child) the direct
+      ## technique is still used for a native child — but a fork-runtime
+      ## child is refused with ``ioSkippedForkRuntime`` instead.
+
   InjectionConfig* = object
     ## Tuning knobs for ``injectShimIntoChild``. See the module docstring
     ## for the rationale on each field.
     maxInFlight*: int
     waitDeadlineMs*: DWORD
     skipIfImageHasShim*: bool
+    attachStrategy*: AttachStrategy
+    parkTimeoutMs*: DWORD
 
   InjectionOutcome* = enum
     ioInjected, ioAlreadyPresent, ioSkippedCap,
     ioWaitTimeout, ioInjectFailed, ioInitFailed,
-    ioNothingToInject
+    ioNothingToInject,
+    ioSkippedForkChild,
+      ## The child is this process's own Cygwin/MSYS ``fork()`` child.
+      ## Never injectable; see ``isCygwinForkChild``.
+    ioSkippedForkRuntime,
+      ## The child uses an MSYS2/Cygwin fork runtime AND could not be
+      ## parked, so injecting would wedge it at its first ``fork()``.
+      ## Refused rather than attempted.
+    ioParkFailed
+      ## The entry-point park resumed the child and it never reached its
+      ## entry point. The child has RUN, so a post-hoc injection would be
+      ## the racy technique the park exists to replace. Refused.
 
 proc defaultInjectionConfig*(): InjectionConfig =
   ## Defaults chosen for webpack-class fork-bomb workloads:
@@ -181,9 +273,15 @@ proc defaultInjectionConfig*(): InjectionConfig =
   ## - skipIfImageHasShim = true: the cheapest win is not injecting
   ##   when the shim is already present from inherited handles or
   ##   static linkage.
+  ## - attachStrategy = asEntryPark: universal, see the type's docstring.
+  ## - parkTimeoutMs = 5000: the park completes in 1-2 ms on a real image;
+  ##   this is a safety net for a child that never reaches its entry
+  ##   point at all, not a tuning parameter.
   InjectionConfig(maxInFlight: 16,
                   waitDeadlineMs: 5000,
-                  skipIfImageHasShim: true)
+                  skipIfImageHasShim: true,
+                  attachStrategy: asEntryPark,
+                  parkTimeoutMs: 5000)
 
 # ---------------------------------------------------------------------------
 # Concurrency cap (maxInFlight)
@@ -257,6 +355,72 @@ proc basenameOf(path: string): string =
   let i = max(path.rfind('\\'), path.rfind('/'))
   if i < 0: path else: path.substr(i + 1)
 
+proc mappedForkRuntime*(): string =
+  ## Which MSYS2/Cygwin runtime, if any, is MAPPED INTO THIS PROCESS.
+  ##
+  ## Note the difference from ``windowsForkRuntimeForProcess``, which asks
+  ## the FILESYSTEM whether a runtime sits next to an image. That is a
+  ## heuristic — it cannot see a runtime resolved off ``PATH`` from another
+  ## directory, and it answers for a runtime that is merely present rather
+  ## than loaded. For OUR OWN process we do not have to guess: the loader
+  ## already knows, and ``GetModuleHandleW`` reports it authoritatively.
+  for runtime in ["msys-2.0.dll", "cygwin1.dll"]:
+    var name = wideStringFromString(runtime)
+    if GetModuleHandleW(cast[LPCWSTR](addr name[0])) != nil:
+      return runtime
+  ""
+
+proc isCygwinForkChild*(hProcess: pointer): bool =
+  ## True when ``hProcess`` is a re-exec of THIS process's own image issued
+  ## from inside a mapped MSYS2/Cygwin runtime — i.e. a ``fork()`` child
+  ## (or a self-``exec``/self-``spawn``, which take the same runtime path).
+  ##
+  ## Cygwin implements ``fork()`` as ``CreateProcessW`` on its own image
+  ## followed by ``WriteProcessMemory`` of the parent's address space into
+  ## the child. Two things follow. First, injecting into one is exactly the
+  ## identical-address case the Cygwin hooking spec warns about, and unlike
+  ## HAZARD 1 no thread trick makes it safe. Second, the child is entitled
+  ## to have executed NOTHING when the runtime starts writing into it, so it
+  ## must not be parked either. Refuse both.
+  ##
+  ## WHAT THIS DETECTION CAN SEE
+  ## * Any fork issued by a process we ourselves instrumented — bash never
+  ##   calls Win32 ``CreateProcessW`` directly, so a spawn we observe from
+  ##   inside a mapped runtime came from the runtime.
+  ## * It separates ``fork`` from ``spawn``: bash running ``nim.exe`` is a
+  ##   DIFFERENT image and stays injectable, which is what keeps the trace
+  ##   complete for the native subtree.
+  ##
+  ## WHAT IT CANNOT SEE
+  ## * A fork whose child image resolves to a different path than ours —
+  ##   a copy, a hardlink, or a bind-style junction of the same binary.
+  ##   Both sides go through ``QueryFullProcessImageNameW`` so casing and
+  ##   short names normalise, but content-identical files at two paths do
+  ##   not.
+  ## * A fork inside a Cygwin process we never instrumented: we never see
+  ##   its ``CreateProcessW`` at all, so there is nothing to classify.
+  ## * Whether a fork child ends up instrumented. The parent's address
+  ##   space is copied verbatim, so our mapped pages and the IAT patches
+  ##   pointing at them are present in the child — but with no loader entry
+  ##   behind them, and Cygwin's own ``dll_list`` replay only covers DLLs
+  ##   loaded through the runtime, which ours is not. This function makes
+  ##   no claim either way, and the ``ioSkippedForkChild`` outcome is
+  ##   deliberately not ``ioInjected`` so the subtree grades as incomplete.
+  if hProcess == nil:
+    return false
+  # Cheap gate first: the overwhelmingly common case is a native parent,
+  # and this costs two GetModuleHandleW calls with no allocation of the
+  # 32K-wide path buffers below.
+  if mappedForkRuntime().len == 0:
+    return false
+  let childImage = windowsProcessImagePath(hProcess)
+  if childImage.len == 0:
+    return false
+  let selfImage = windowsProcessImagePath(GetCurrentProcess())
+  if selfImage.len == 0:
+    return false
+  cmpIgnoreCase(childImage, selfImage) == 0
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -264,11 +428,31 @@ proc basenameOf(path: string): string =
 proc injectShimIntoChild*(hProcess: HANDLE;
                           libraryPath: string;
                           initSymbol: string = "";
-                          cfg: InjectionConfig = defaultInjectionConfig()):
+                          cfg: InjectionConfig = defaultInjectionConfig();
+                          hThread: HANDLE = nil):
     InjectionOutcome =
   ## Inject one library into the given child process. The caller is
   ## responsible for having spawned the child with ``CREATE_SUSPENDED``
   ## and for resuming its main thread once propagation completes.
+  ##
+  ## ``hThread`` is the child's MAIN thread, still carrying that
+  ## ``CREATE_SUSPENDED`` count of one. Passing it enables the entry-point
+  ## park (HAZARD 1 in the module docstring), which is what makes an
+  ## MSYS2/Cygwin child attachable at all. It is a defaulted parameter so
+  ## existing three-argument callers keep compiling and keep their exact
+  ## previous behaviour.
+  ##
+  ## THE PARK IS SUSPEND-COUNT NEUTRAL. It resumes the thread, waits for it
+  ## to reach the image entry point, and suspends it again, so on return
+  ## the thread is suspended exactly once - precisely as it was passed in.
+  ## The caller's own ``ResumeThread`` remains the single wakeup.
+  ##
+  ## DO NOT pass ``hThread`` when the CALLER of ``CreateProcessW`` asked
+  ## for ``CREATE_SUSPENDED`` themselves. The park runs the child's loader,
+  ## and such a caller is entitled to a child that has executed nothing -
+  ## Cygwin's own ``fork()`` relies on that to copy the parent's address
+  ## space in. With ``hThread = nil`` this proc falls back to the legacy
+  ## technique and refuses fork-runtime children outright.
   ##
   ## Returns one of:
   ##   ``ioInjected``       — LoadLibraryW completed; init (if any) was
@@ -287,6 +471,18 @@ proc injectShimIntoChild*(hProcess: HANDLE;
   ##                          CreateRemoteThread reported an error.
   ##   ``ioInitFailed``     — LoadLibraryW succeeded but the init
   ##                          remote thread couldn't be created.
+  ##   ``ioSkippedForkChild``   — the child is this process's own Cygwin
+  ##                          ``fork()`` child; never injectable.
+  ##   ``ioSkippedForkRuntime`` — the child carries an MSYS2/Cygwin fork
+  ##                          runtime and could not be parked; injecting
+  ##                          would wedge it, so nothing was attempted.
+  ##   ``ioParkFailed``     — the park resumed the child and it never
+  ##                          reached its entry point; the child has run,
+  ##                          so injection was refused rather than raced.
+  ##
+  ## Only ``ioInjected`` and ``ioAlreadyPresent`` mean the child is
+  ## instrumented. Every refusal above is deliberately a DIFFERENT value so
+  ## a consumer cannot grade a skipped subtree as complete.
   if libraryPath.len == 0:
     return ioNothingToInject
 
@@ -298,6 +494,15 @@ proc injectShimIntoChild*(hProcess: HANDLE;
   if spawningHelperProcess():
     return ioNothingToInject
 
+  # HAZARD 2. Cygwin's fork() is itself a CreateProcessW on our own image,
+  # so an instrumented shell hooks its own forks. A fork child is the one
+  # case where the identical-address constraint genuinely bites, and it is
+  # also entitled to have executed nothing when the runtime starts writing
+  # the parent's address space into it -- so it must be neither injected
+  # NOR parked. This is the first thing we check for that reason.
+  if isCygwinForkChild(hProcess):
+    return ioSkippedForkChild
+
   # A 32-bit child takes the 32-bit shim, so the already-present check has
   # to look for the shim that would actually be injected -- see
   # docs/windows-wow64-injection.md.
@@ -305,6 +510,63 @@ proc injectShimIntoChild*(hProcess: HANDLE;
   discard IsWow64Process(hProcess, addr childIsWow64)
   let effectiveLibrary =
     if childIsWow64 != 0: wow64ShimPathFor(libraryPath) else: libraryPath
+
+  # ---------------------------------------------------------------------
+  # HAZARD 1 -- the attach strategy. THIS IS UNIVERSAL, NOT GATED ON MSYS.
+  #
+  # The alternative was to park only children that look like they carry a
+  # fork runtime. That was rejected: the gate would be
+  # `windowsForkRuntimeForImagePath`, a FILESYSTEM heuristic asking whether
+  # `msys-2.0.dll` happens to sit next to the image. It cannot see a
+  # runtime resolved off PATH from another directory, and a gate that
+  # answers "no" wrongly does not degrade -- it HANGS the child. Making
+  # correctness depend on that heuristic being right is worse than not
+  # depending on it at all.
+  #
+  # Universal is also less of a change than it looks. The legacy technique
+  # ALREADY runs the child's entire loader before our shim maps -- that is
+  # the whole diagnosis: `LdrpInitializeProcess` runs on the injected
+  # remote thread. The park does not reorder anything relative to our shim;
+  # it moves that same initialisation onto the thread the OS would have
+  # used for an uninstrumented process. Every native child therefore ends
+  # up CLOSER to its uninstrumented behaviour, not further from it.
+  #
+  # Composition with the other knobs:
+  #  * `maxInFlight` deliberately does NOT cover the park. That cap exists
+  #    to bound concurrent cross-process REMOTE THREADS; a park creates no
+  #    remote thread. N concurrent parks are N children performing ordinary
+  #    process startup, which is what an uninstrumented fork bomb does
+  #    anyway.
+  #  * `skipIfImageHasShim` gets strictly better: the probe below now runs
+  #    against a child whose loader has FINISHED, so `EnumProcessModulesEx`
+  #    reports the real module list instead of the two or three entries a
+  #    never-run process has. A statically linked shim was previously
+  #    invisible to it.
+  #  * `waitDeadlineMs` and resume-before-init are untouched.
+  var park = parkChildAtEntryPoint(hProcess, hThread, childIsWow64 != 0,
+    (if cfg.attachStrategy == asEntryPark: cfg.parkTimeoutMs else: 0'u32))
+  defer: releaseEntryPark(park)
+
+  if cfg.attachStrategy == asEntryPark:
+    case park.status
+    of epsParked:
+      discard
+    of epsTimedOut:
+      # The child HAS RUN. Injecting now is the fixed-`Sleep` technique
+      # that was measured to be a race (0 ms hangs, >=1 ms passes) rather
+      # than a fix. Refuse, and let the consumer grade the subtree
+      # incomplete.
+      return ioParkFailed
+    of epsUnsupported, epsSetupFailed:
+      # The child has executed NOTHING and is exactly as CreateProcessW
+      # left it, so the legacy pre-loader remote thread is still available
+      # and is byte-for-byte what this proc did before the park existed --
+      # correct for a native child, fatal for a fork-runtime one. The
+      # filesystem heuristic is consulted HERE and nowhere else: it is not
+      # load-bearing for a child we managed to park, and being wrong on
+      # this path can only cost us an injection, never wedge a child.
+      if windowsForkRuntimeForProcess(hProcess).len > 0:
+        return ioSkippedForkRuntime
 
   when sizeof(pointer) == 4:
     # We are a 32-bit shim. A child that is NOT WOW64 on 64-bit Windows is a
@@ -533,20 +795,38 @@ proc autoPropagateCreateProcessW*(ctx: var HookContext) {.raises: [].} =
     SetLastError(savedLastError)
     return
 
-  # A native launcher such as make.exe can spawn MSYS2/Cygwin workers.
-  # Injecting a remote thread before their fork runtime initializes wedges the
-  # child. Leave that subtree uninstrumented; consumers conservatively mark the
-  # unmatched process subtree incomplete.
-  if windowsForkRuntimeForProcess(pi[].hProcess).len == 0:
-    let cfg = defaultInjectionConfig()
-    for node in propagationNodes():
-      if not node.enabled.load():
-        continue
-      if node.libraryPath.len == 0:
-        continue
-      discard injectShimIntoChild(pi[].hProcess, node.libraryPath,
-        node.initSymbol, cfg)
+  # A native launcher such as make.exe can spawn MSYS2/Cygwin workers, and
+  # an instrumented shell calls CreateProcessW from inside its own fork().
+  # Both hazards are handled INSIDE injectShimIntoChild now -- it parks the
+  # child's main thread at the image entry point so the loader initialises
+  # on that thread, and it refuses a fork child of this very process
+  # outright. The blanket `windowsForkRuntimeForProcess(...) == 0` guard
+  # that used to stand here is gone with them: it was a filesystem
+  # heuristic standing in for a thread-scheduling problem, and it skipped
+  # every MSYS child whether or not it was attachable.
+  #
+  # What we still decide here, because only this frame knows it, is whether
+  # the park is SOUND. The park runs the child's loader. A caller who asked
+  # for CREATE_SUSPENDED themselves is entitled to a child that has
+  # executed nothing -- Cygwin's own fork() copies the parent's address
+  # space into exactly such a child, and a debugger or another injector
+  # expects the same. When they asked, we hand injectShimIntoChild a nil
+  # thread handle, which pins it to the legacy technique and makes it
+  # refuse fork-runtime children rather than wedge them. That is strictly
+  # the behaviour this hook had before the park existed.
+  let cfg = defaultInjectionConfig()
+  let injectThread = if callerAskedSuspended: nil else: pi[].hThread
+  for node in propagationNodes():
+    if not node.enabled.load():
+      continue
+    if node.libraryPath.len == 0:
+      continue
+    discard injectShimIntoChild(pi[].hProcess, node.libraryPath,
+      node.initSymbol, cfg, injectThread)
 
+  # Still the single wakeup. injectShimIntoChild leaves the suspend count
+  # exactly as it found it, park or no park, so this stays correct whether
+  # zero, one or several nodes were injected.
   if not callerAskedSuspended:
     discard ResumeThread(pi[].hThread)
   SetLastError(savedLastError)

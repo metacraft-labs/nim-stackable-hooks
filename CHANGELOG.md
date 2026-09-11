@@ -4,6 +4,50 @@
 
 ### Added
 
+- **The child's own main thread now maps the shim**
+  (`windows_entry_park.callOnParkedThread`). A parked child is injected by
+  borrowing its already-parked main thread: the entry point still holds the
+  park's `EB FE`, so it doubles as a return address — set `RIP` to
+  `LoadLibraryW` with `RCX` = the remote path buffer, resume, wait for the
+  instruction pointer to come back to the self-jump, read `RAX`, and
+  restore the saved `CONTEXT` byte for byte. `repro_runtime_init` is
+  dispatched the same way. The borrow is refused (`false`, never a silent
+  fallback) for a WOW64 child, an unparked child, or a child that does not
+  return to the self-jump, and both `runWithMonitorShim` and
+  `injectShimIntoChild` now decline to park a WOW64 child at all rather
+  than park one they cannot borrow.
+- **The root spawn is parked too.** `runWithMonitorShim` parks the child it
+  creates and injects through the borrow, so an MSYS2/Cygwin ROOT is
+  monitored instead of refused. `parkTimeoutMs = 0` restores the pre-park
+  behaviour verbatim for a regression test to demand.
+- `tests/test_windows_entry_park_thread_locals.nim` plus
+  `tests/fixtures/park_tls_lib.nim` and `tests/fixtures/park_tls_child.nim`
+  — the failing-before / passing-after pair for the borrow, two-armed
+  against one identical fixture: borrowed load passes, remote-thread load
+  into the same parked child fails.
+
+### Fixed
+
+- **A use-after-free in every parked child**, found as a deterministic
+  SIGSEGV. A `CreateRemoteThread(LoadLibraryW)` runs the injected DLL's
+  module body on a thread that then exits. A Nim `--threads:on` shim keeps
+  its allocator in a `MemRegion` **threadvar** — in that thread's TLS
+  block, released when the thread goes — and every chunk carries a pointer
+  back to the region that owns it, so every process-global the module body
+  allocated is owned by a region that no longer exists. The first free of
+  one from any other thread dereferences it. Before the entry-point park
+  the injecting thread ran the whole loader while the child's main thread
+  had not started and the two regions compared equal, so nothing bit; the
+  park separates them. Measured in an injected child: a fault in
+  `addToSharedFreeList` reading `owner.sharedFreeLists[]` in a page
+  `VirtualQuery` reports as `MEM_RESERVE`, on the 64→128 rehash of a
+  shim-global table, at the 44th distinct environment variable, 3/3 runs —
+  and silent instead of fatal once an unrelated environment variable moved
+  the heap. Borrowing the parked main thread removes the class: the thread
+  that allocates the globals is the one that outlives every free of them.
+
+### Added
+
 - **Windows entry-point park** (`stackable_hooks/windows_entry_park`) — a
   new attach primitive that parks a `CREATE_SUSPENDED` child's MAIN thread
   at its image entry point (patch `EB FE`, resume, poll `GetThreadContext`

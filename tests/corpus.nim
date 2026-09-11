@@ -174,6 +174,15 @@ const testCorpus*: seq[TestEntry] = @[
          "shell and a real native child, so the run lane is Windows only " &
          "while the cross-target lane still compile-verifies it from " &
          "Linux and macOS."),
+  TestEntry(stem: "test_windows_entry_park_thread_locals",
+    targets: @[tLinuxAmd64, tMacosArm64, tWindowsAmd64, tWindowsArm64],
+    why: "Body is gated on `defined(windows) and (i386 or amd64)`, so it " &
+         "compiles everywhere and is a no-op off Windows and on ARM64. " &
+         "Its Windows arm builds two fixtures and injects a real DLL into " &
+         "a real parked child both ways round -- borrowed thread and " &
+         "remote thread -- so the run lane is Windows only while the " &
+         "cross-target lane still compile-verifies it from Linux and " &
+         "macOS."),
   TestEntry(stem: "test_windows_wow64_injection",
     targets: @[tLinuxAmd64, tMacosArm64, tWindowsAmd64, tWindowsArm64],
     why: "Body is `when defined(windows)`-wrapped; compiles everywhere, " &

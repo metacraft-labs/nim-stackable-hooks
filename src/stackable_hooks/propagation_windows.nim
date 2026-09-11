@@ -58,35 +58,81 @@
 ## measurements, including the two plausible alternatives that do not work.
 ## ``attachStrategy`` selects the technique and defaults to the park.
 ##
-## HAZARD 2 — Cygwin's ``fork()`` is itself a ``CreateProcessW``. Once a
-## shell is instrumented it hooks its own forks, and a fork child is the one
-## place where the identical-address constraint from
-## ``codetracer-specs/Architecture/Hooking-Cygwin-Binaries-On-Windows.md``
-## genuinely does bite: the runtime replays the parent's address space into
-## it. ``isCygwinForkChild`` refuses those outright. Both refusals return
-## outcomes that are NOT ``ioInjected``, so a consumer grading on the
-## outcome keeps the subtree reported-incomplete rather than
+## HAZARD 2 — Cygwin's ``fork()`` is itself a ``CreateProcessW``, on OUR OWN
+## IMAGE, so an instrumented shell hooks its own forks. ``isCygwinForkChild``
+## identifies those, and they are refused WHEN THEY CANNOT BE PARKED. Every
+## refusal returns an outcome that is NOT ``ioInjected``, so a consumer
+## grading on the outcome keeps the subtree reported-incomplete rather than
 ## silently-complete.
+##
+## A FORK CHILD IS ATTACHABLE WHEN WE OWN THE SUSPENSION
+## -----------------------------------------------------
+## This module used to refuse every fork child outright, on two stated
+## grounds. Both were measured on this host (Git-for-Windows 2.55.0.5's
+## ``msys-2.0.dll``) and neither survived:
+##
+## 1. "The Cygwin runtime passes ``CREATE_SUSPENDED`` on every ``fork``,
+##    ``exec`` and ``spawn``, so ``callerAskedSuspended`` is always true
+##    there and the park is never sound."
+##
+##    IT DOES NOT. An instrumented ``bash`` forking, and the same ``bash``
+##    ``exec``-ing ``grep``, were both observed entering the
+##    ``CreateProcessW`` hook with ``CREATE_SUSPENDED`` CLEAR. This Cygwin
+##    does not need the flag: the child runs immediately and synchronises
+##    with its parent through the ``child_info`` block's own events. So the
+##    consumer's spawn hook is free to add ``CREATE_SUSPENDED`` itself, and
+##    when it does, IT owns the suspension and the park is sound by exactly
+##    the same rule as for any other child.
+##
+## 2. "A fork child is the one case where the identical-address constraint
+##    genuinely bites: the runtime replays the parent's address space into
+##    it."
+##
+##    Not for OUR mapping. Cygwin's ``dll_list`` replay covers the DLLs the
+##    runtime itself tracks; a shim mapped into the parent after that
+##    snapshot is not among them and is simply absent from the child — which
+##    is WHY a fork child arrives uninstrumented in the first place.
+##    Injecting into the parked child adds a mapping the replay has no
+##    opinion about.
+##
+## MEASURED, with the park applied to fork children: the research workload
+## ``research/msys-attach-2026-09/heavy.sh`` (25 iterations of nested
+## ``$(...)`` substitution, a pipeline and a subshell — the script that
+## wedges 20/20 under a pre-park remote thread) ran 5/5 green under the
+## monitor with 331 processes observed per run, including fork children,
+## their ``exec``-ed children, and the second-generation forks those
+## performed. The composability worry — a fork FROM a fork child — is the
+## ordinary case in that workload, and it holds.
+##
+## SO THE CONDITION IS THE PARK, NOT THE KIND OF CHILD. ``hThread == nil``
+## means the caller could not hand us the child's main thread, which means
+## the caller does not own the suspension, which means the park is unsound —
+## and only then is a fork child refused with ``ioSkippedForkChild``. A park
+## that is attempted and fails still refuses: ``epsTimedOut`` means the
+## child has RUN (``ioParkFailed``), and ``epsUnsupported`` /
+## ``epsSetupFailed`` on a fork-runtime image means the legacy remote thread
+## would wedge it (``ioSkippedForkRuntime``).
 ##
 ## WHAT IS STILL NOT ATTACHED, and why
 ## -----------------------------------
-## A spawn issued from INSIDE an instrumented MSYS2/Cygwin process. The
-## Cygwin runtime passes ``CREATE_SUSPENDED`` on every ``fork``, ``exec``
-## and ``spawn`` because it has to write its ``child_info`` block into the
-## child before letting it run — so ``callerAskedSuspended`` is always true
-## there and the park is never sound. Consequences, in order:
+## A child whose caller genuinely asked for ``CREATE_SUSPENDED``. The park
+## runs the child's loader, and such a caller is entitled to a child that
+## has executed nothing, so the consumer's hook must not add a suspension of
+## its own there and must pass ``hThread = nil``. On this Cygwin that case
+## turns out to be the exception rather than the rule for MSYS spawns, but
+## it is the case the refusals above exist for.
 ##
-## * shell -> NATIVE child (``bash`` running ``nim.exe``) keeps working
-##   exactly as it does today, on the legacy technique.
-## * shell -> its own ``fork()`` is refused (``ioSkippedForkChild``).
-## * shell -> another MSYS image is refused (``ioSkippedForkRuntime``)
-##   rather than wedged, which is a strict improvement on hanging but is
-##   NOT coverage.
-##
-## Whether an MSYS-to-MSYS spawn could be parked safely is unmeasured:
-## Cygwin writes into the child before resuming it, and running the loader
-## first may or may not disturb that. It is left refused rather than
-## guessed at.
+## NOT THE RESUME. An earlier design hooked ``kernel32!ResumeThread`` to
+## attach in the window between the runtime finishing its writes and the
+## child running. It was built and measured, and there is no such window:
+## the runtime never suspends these children, so the hook never fires for
+## one. (``msys-2.0.dll`` does import ``ResumeThread`` from ``KERNEL32`` and
+## imports no resume entry point from ``ntdll`` — the hook point was right,
+## the premise was not.) Hooking ``ResumeThread`` is also actively
+## dangerous here: ``ct_inline_hook`` calls it to thaw the threads it froze
+## to apply a patch, so the detour re-enters the shim with every other
+## thread of the process suspended, and the first allocation deadlocks the
+## process where it stands.
 
 when not defined(windows):
   {.error: "stackable_hooks/propagation_windows is Windows-only".}
@@ -251,8 +297,10 @@ type
     ioWaitTimeout, ioInjectFailed, ioInitFailed,
     ioNothingToInject,
     ioSkippedForkChild,
-      ## The child is this process's own Cygwin/MSYS ``fork()`` child.
-      ## Never injectable; see ``isCygwinForkChild``.
+      ## The child is this process's own Cygwin/MSYS ``fork()`` child AND
+      ## could not be parked, because the caller owns its suspension. A fork
+      ## child we CAN park is injected like any other; see
+      ## ``isCygwinForkChild`` and the module docstring.
     ioSkippedForkRuntime,
       ## The child uses an MSYS2/Cygwin fork runtime AND could not be
       ## parked, so injecting would wedge it at its first ``fork()``.
@@ -449,10 +497,15 @@ proc injectShimIntoChild*(hProcess: HANDLE;
   ##
   ## DO NOT pass ``hThread`` when the CALLER of ``CreateProcessW`` asked
   ## for ``CREATE_SUSPENDED`` themselves. The park runs the child's loader,
-  ## and such a caller is entitled to a child that has executed nothing -
-  ## Cygwin's own ``fork()`` relies on that to copy the parent's address
-  ## space in. With ``hThread = nil`` this proc falls back to the legacy
-  ## technique and refuses fork-runtime children outright.
+  ## and such a caller is entitled to a child that has executed nothing.
+  ## With ``hThread = nil`` this proc falls back to the legacy technique and
+  ## refuses fork-runtime children outright.
+  ##
+  ## Passing it for a Cygwin ``fork()`` child is not only allowed but is the
+  ## whole reason that subtree is observable: this Cygwin does NOT create
+  ## fork children suspended, so the consumer's own forced
+  ## ``CREATE_SUSPENDED`` is the only one there is. See the module
+  ## docstring's measurement.
   ##
   ## Returns one of:
   ##   ``ioInjected``       — LoadLibraryW completed; init (if any) was
@@ -472,7 +525,8 @@ proc injectShimIntoChild*(hProcess: HANDLE;
   ##   ``ioInitFailed``     — LoadLibraryW succeeded but the init
   ##                          remote thread couldn't be created.
   ##   ``ioSkippedForkChild``   — the child is this process's own Cygwin
-  ##                          ``fork()`` child; never injectable.
+  ##                          ``fork()`` child and no main thread was passed,
+  ##                          so it could not be parked.
   ##   ``ioSkippedForkRuntime`` — the child carries an MSYS2/Cygwin fork
   ##                          runtime and could not be parked; injecting
   ##                          would wedge it, so nothing was attempted.
@@ -495,12 +549,18 @@ proc injectShimIntoChild*(hProcess: HANDLE;
     return ioNothingToInject
 
   # HAZARD 2. Cygwin's fork() is itself a CreateProcessW on our own image,
-  # so an instrumented shell hooks its own forks. A fork child is the one
-  # case where the identical-address constraint genuinely bites, and it is
-  # also entitled to have executed nothing when the runtime starts writing
-  # the parent's address space into it -- so it must be neither injected
-  # NOR parked. This is the first thing we check for that reason.
-  if isCygwinForkChild(hProcess):
+  # so an instrumented shell hooks its own forks.
+  #
+  # `hThread == nil` is the whole condition, and it is not really about
+  # forking: it says the caller did not hand us the child's main thread, so
+  # the caller does not own the child's suspension, so the child cannot be
+  # parked, so the only technique left is the pre-loader remote thread --
+  # which wedges a Cygwin child at its first fork(). Refuse.
+  #
+  # With a main thread in hand the child IS attachable, fork child or not.
+  # The module docstring carries the measurement, and the two grounds on
+  # which this used to be an unconditional refusal, neither of which held.
+  if isCygwinForkChild(hProcess) and hThread == nil:
     return ioSkippedForkChild
 
   # A 32-bit child takes the 32-bit shim, so the already-present check has
@@ -543,8 +603,19 @@ proc injectShimIntoChild*(hProcess: HANDLE;
   #    never-run process has. A statically linked shim was previously
   #    invisible to it.
   #  * `waitDeadlineMs` and resume-before-init are untouched.
+  #
+  # NOT FOR A WOW64 CHILD. The park is only half of the technique; the
+  # other half is borrowing the parked thread to map the shim, and
+  # `callOnParkedThread` refuses a 32-bit child because a 32-bit frame and
+  # `Wow64SetThreadContext` are unmeasured here. Parking one anyway would
+  # produce exactly the combination that corrupts a child -- a
+  # loader-initialised main thread plus a remote-thread load -- so a
+  # 32-bit child keeps the legacy technique end to end and a 32-bit child
+  # carrying a fork runtime is refused rather than wedged.
   var park = parkChildAtEntryPoint(hProcess, hThread, childIsWow64 != 0,
-    (if cfg.attachStrategy == asEntryPark: cfg.parkTimeoutMs else: 0'u32))
+    (if cfg.attachStrategy == asEntryPark and childIsWow64 == 0:
+       cfg.parkTimeoutMs
+     else: 0'u32))
   defer: releaseEntryPark(park)
 
   if cfg.attachStrategy == asEntryPark:
@@ -668,25 +739,52 @@ proc injectShimIntoChild*(hProcess: HANDLE;
     if loadLibraryW == nil:
       return ioInjectFailed
 
-  let hThread = CreateRemoteThread(hProcess, nil, 0, loadLibraryW,
-    remoteBuf, 0, nil)
-  if hThread == nil:
-    # No remote thread exists, so nothing can be reading the buffer:
-    # ownership never left this frame and the deferred free is correct.
-    return ioInjectFailed
-  # Ownership transfers to the remote thread HERE, before the wait — a
-  # thread that outlives the deadline must keep its argument.
-  remoteBufOwned = false
-  let wait = WaitForSingleObject(hThread, cfg.waitDeadlineMs)
-  discard CloseHandle(hThread)
-  if wait != WAIT_OBJECT_0:
-    # Timed out (or the wait itself failed): the remote thread may still
-    # be dereferencing ``remoteBuf``. Leak it on purpose — see the
-    # cross-process lifetime note above.
-    return ioWaitTimeout
-  # WAIT_OBJECT_0 is the PROOF the remote thread exited; LoadLibraryW is
-  # done with the path string, so ownership is ours again.
-  remoteBufOwned = true
+  # WHO CALLS ``LoadLibraryW`` MATTERS AS MUCH AS THE CALL. A remote
+  # thread runs the shim's module body and then exits, and a Nim
+  # ``--threads:on`` shim keeps its allocator in a THREADVAR -- so every
+  # process-global the module body allocated is owned by a region that dies
+  # with that thread, and the first cross-thread free of one dereferences
+  # it. Before the park the two threads' regions happened to coincide;
+  # parked, they do not. The measurement and the fault are documented on
+  # ``windows_entry_park.callOnParkedThread``; it borrows the parked main
+  # thread so the child maps the shim itself.
+  var borrowedLoad = false
+  if park.status == epsParked and childIsWow64 == 0:
+    var llModule: uint64 = 0
+    # The buffer belongs to the child for the duration of the borrowed
+    # call, exactly as it belongs to a remote thread on the legacy arm.
+    remoteBufOwned = false
+    if not callOnParkedThread(park, hThread, false, loadLibraryW,
+        remoteBuf, cfg.parkTimeoutMs, llModule):
+      # The child either died or never came back to the parked entry
+      # point. Falling back to a remote thread here is NOT available: it
+      # is the combination this branch exists to avoid.
+      return ioInjectFailed
+    # The call returned, so ``LoadLibraryW`` is done with the path string.
+    remoteBufOwned = true
+    if llModule == 0:
+      return ioInjectFailed
+    borrowedLoad = true
+  else:
+    let llThread = CreateRemoteThread(hProcess, nil, 0, loadLibraryW,
+      remoteBuf, 0, nil)
+    if llThread == nil:
+      # No remote thread exists, so nothing can be reading the buffer:
+      # ownership never left this frame and the deferred free is correct.
+      return ioInjectFailed
+    # Ownership transfers to the remote thread HERE, before the wait — a
+    # thread that outlives the deadline must keep its argument.
+    remoteBufOwned = false
+    let wait = WaitForSingleObject(llThread, cfg.waitDeadlineMs)
+    discard CloseHandle(llThread)
+    if wait != WAIT_OBJECT_0:
+      # Timed out (or the wait itself failed): the remote thread may still
+      # be dereferencing ``remoteBuf``. Leak it on purpose — see the
+      # cross-process lifetime note above.
+      return ioWaitTimeout
+    # WAIT_OBJECT_0 is the PROOF the remote thread exited; LoadLibraryW is
+    # done with the path string, so ownership is ours again.
+    remoteBufOwned = true
 
   # Init dispatch — only when the consumer asked for one.
   if initSymbol.len == 0:
@@ -755,6 +853,15 @@ proc injectShimIntoChild*(hProcess: HANDLE;
     return ioInjected
 
   let childInit = cast[pointer](cast[uint](childBase) + rva)
+  if borrowedLoad:
+    # Same thread that mapped the shim, for the same reason: init installs
+    # the hooks and touches the shim's thread-locals, and the thread whose
+    # locals have to be sound is the child's own.
+    var initRet: uint64 = 0
+    if not callOnParkedThread(park, hThread, false, childInit, nil,
+        cfg.parkTimeoutMs, initRet):
+      return ioInitFailed
+    return ioInjected
   let initThread = CreateRemoteThread(hProcess, nil, 0, childInit,
     nil, 0, nil)
   if initThread == nil:

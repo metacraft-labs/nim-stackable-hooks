@@ -134,8 +134,17 @@ when defined(i386) or defined(amd64):
     # address the structure by offset rather than transcribing 1232 bytes
     # of register file that we never touch.
     ContextAmd64Control = 0x00100001'u32
+    # CONTEXT_AMD64 | CONTROL | INTEGER | FLOATING_POINT. `callOnParkedThread`
+    # saves and restores the whole register file, not just the three
+    # registers it overwrites: the thread it borrows is the child's MAIN
+    # thread, parked mid-loader-handoff, and handing it back with anything
+    # but the state it arrived in would be a corruption we could not see.
+    ContextAmd64Full = 0x0010000B'u32
     ContextAmd64Size = 1232
     ContextAmd64FlagsOffset = 0x30'u
+    ContextAmd64RaxOffset = 0x78'u
+    ContextAmd64RcxOffset = 0x80'u
+    ContextAmd64RspOffset = 0x98'u
     ContextAmd64RipOffset = 0xF8'u
 
     # CONTEXT_i386 | CONTEXT_CONTROL. WOW64_CONTEXT has the same layout.
@@ -165,6 +174,8 @@ when defined(i386) or defined(amd64):
                              size: uint): int32
     {.importc, stdcall, dynlib: "kernel32".}
   proc GetThreadContext(hThread: pointer; ctx: pointer): int32
+    {.importc, stdcall, dynlib: "kernel32".}
+  proc SetThreadContext(hThread: pointer; ctx: pointer): int32
     {.importc, stdcall, dynlib: "kernel32".}
   proc ResumeThread(hThread: pointer): uint32
     {.importc, stdcall, dynlib: "kernel32".}
@@ -356,6 +367,169 @@ when defined(i386) or defined(amd64):
     discard restoreEntryBytes(result)
     result.status = epsTimedOut
 
+  proc waitForParkedIp(park: var EntryPark; hThread: pointer;
+                       childIsWow64: bool; timeoutMs: uint32): bool =
+    ## Poll until the thread is stopped ON the ``EB FE`` at the entry point.
+    ## The proof is the same one ``parkChildAtEntryPoint`` waits for when it
+    ## first parks the thread: the instruction pointer is back on the
+    ## self-jump, confirmed AFTER the suspend, so the thread is stopped
+    ## there rather than merely observed passing through. The park keeps its
+    ## own copy of the loop because its failure path has to restore the
+    ## patched bytes, which a borrowed call must NOT do -- the park is still
+    ## live across the call.
+    let deadline = GetTickCount64() + uint64(timeoutMs)
+    let wantIp = uint64(cast[uint](park.entry))
+    while true:
+      var ip: uint64 = 0
+      if instructionPointer(hThread, childIsWow64, ip) and ip == wantIp:
+        discard SuspendThread(hThread)
+        var confirmed: uint64 = 0
+        if instructionPointer(hThread, childIsWow64, confirmed) and
+            confirmed == wantIp:
+          return true
+        discard ResumeThread(hThread)
+      var exitCode: uint32 = 0
+      if GetExitCodeProcess(park.hProcess, addr exitCode) != 0 and
+          exitCode != StillActive:
+        return false
+      if GetTickCount64() >= deadline:
+        return false
+      SleepMs(1'u32)
+
+  proc callOnParkedThread*(park: var EntryPark; hThread: pointer;
+                           childIsWow64: bool; fn: pointer; arg: pointer;
+                           timeoutMs: uint32; ret: var uint64): bool =
+    ## Call ``fn(arg)`` IN THE CHILD, ON ITS OWN MAIN THREAD, and come back
+    ## with the thread parked exactly as it was.
+    ##
+    ## WHY THIS EXISTS, AND WHY A REMOTE THREAD IS NOT GOOD ENOUGH HERE.
+    ## A ``CreateRemoteThread(LoadLibraryW)`` runs the injected DLL's entry
+    ## point, its module body and its init export on a thread that then
+    ## EXITS. For a shim built the way every Nim ``--threads:on`` shim is,
+    ## that is a use-after-free waiting to happen: the allocator is a
+    ## ``MemRegion`` THREADVAR, so it lives in that thread's TLS block,
+    ## which the OS releases when the thread goes; every chunk carries a
+    ## pointer back to the region that owns it; and so every process-global
+    ## the module body allocated is owned by a region that no longer
+    ## exists. The first free of one from any other thread -- a table
+    ## rehash is enough -- dereferences it.
+    ##
+    ## Before the park this never bit, because the injecting thread ran the
+    ## whole loader while the child's main thread had not started, and the
+    ## two ended up with regions that compared equal. The park separates
+    ## them, and the consequence was measured: an injected child faulted in
+    ## ``addToSharedFreeList``, reading ``owner.sharedFreeLists[]`` in a
+    ## page ``VirtualQuery`` reports as MEM_RESERVE, on the 64-to-128
+    ## rehash of a shim-global table -- the 44th distinct environment
+    ## variable, every run. Setting an unrelated environment variable moved
+    ## the heap enough to make the same run silent instead, which is what a
+    ## use-after-free looks like and why "it did not crash" is not
+    ## evidence.
+    ##
+    ## Borrowing the parked thread removes the class rather than the
+    ## symptom: the child's OWN main thread maps the shim and runs its
+    ## init, so the globals are owned by the one thread guaranteed to
+    ## outlive every free of them. It also means the loader provisions that
+    ## thread's static-TLS block for the module as the mapping thread,
+    ## rather than leaving it to the retrofit path.
+    ##
+    ## HOW THE RETURN IS ARRANGED. The entry point still holds the park's
+    ## ``EB FE``, so it doubles as a return address: push it, point ``RIP``
+    ## at ``fn`` with ``RCX`` = ``arg`` (the Win64 first-argument register),
+    ## resume, and wait for the instruction pointer to come back to the
+    ## self-jump. That is the same proof the park itself waits on, so the
+    ## thread ends up suspended exactly where it started, with the same
+    ## suspend count, and the caller's single ``ResumeThread`` still owns
+    ## the wakeup.
+    ##
+    ## FAILURE IS NEVER SILENT. Every early return leaves ``ret`` at zero
+    ## and answers ``false``; a caller must treat that as "the child was
+    ## not injected" rather than retry with a remote thread, which is the
+    ## broken combination this proc exists to replace.
+    ##
+    ## WOW64 is refused (``false``) rather than approximated: a 32-bit
+    ## child needs ``Wow64SetThreadContext`` and a 32-bit frame, and
+    ## neither is measured here. Callers park only what they can borrow.
+    ret = 0
+    when sizeof(pointer) == 8:
+      if childIsWow64 or park.status != epsParked or hThread == nil or
+          fn == nil or timeoutMs == 0:
+        return false
+
+      var savedRaw: array[ContextAmd64Size + 16, byte]
+      let saved = alignUp16(addr savedRaw[0])
+      cast[ptr uint32](cast[uint](saved) + ContextAmd64FlagsOffset)[] =
+        ContextAmd64Full
+      if GetThreadContext(hThread, saved) == 0:
+        return false
+
+      let savedRsp = cast[ptr uint64](cast[uint](saved) +
+        ContextAmd64RspOffset)[]
+      if savedRsp < 0x10000'u64:
+        return false
+
+      # The return address goes just below the parked frame, on the
+      # thread's OWN stack, so the callee grows it through the guard page
+      # the ordinary way. How far below is not free: at the entry point
+      # only the pages the loader touched are committed, so a fixed gap can
+      # land in the guard page and the write fails. Try a few and take the
+      # first that lands -- a failure here is a refusal, not a guess.
+      var retAddr = uint64(cast[uint](park.entry))
+      var rsp: uint64 = 0
+      for gap in [0x200'u64, 0x100'u64, 0x80'u64, 0x20'u64]:
+        if savedRsp <= gap + 16'u64:
+          continue
+        # Win64 entry condition: RSP+8 is 16-byte aligned at the callee's
+        # first instruction, i.e. RSP itself is 16n+8 once the return
+        # address is in place.
+        let candidate = ((savedRsp - gap) and not 0xF'u64) - 8'u64
+        var wrote: uint = 0
+        if WriteProcessMemory(park.hProcess, cast[pointer](candidate),
+            addr retAddr, 8'u, addr wrote) != 0 and wrote == 8:
+          rsp = candidate
+          break
+      if rsp == 0:
+        return false
+
+      var callRaw: array[ContextAmd64Size + 16, byte]
+      let call = alignUp16(addr callRaw[0])
+      copyMem(call, saved, ContextAmd64Size)
+      cast[ptr uint32](cast[uint](call) + ContextAmd64FlagsOffset)[] =
+        ContextAmd64Full
+      cast[ptr uint64](cast[uint](call) + ContextAmd64RspOffset)[] = rsp
+      cast[ptr uint64](cast[uint](call) + ContextAmd64RcxOffset)[] =
+        uint64(cast[uint](arg))
+      cast[ptr uint64](cast[uint](call) + ContextAmd64RipOffset)[] =
+        uint64(cast[uint](fn))
+      if SetThreadContext(hThread, call) == 0:
+        return false
+
+      if ResumeThread(hThread) == high(uint32):
+        discard SetThreadContext(hThread, saved)
+        return false
+
+      if not waitForParkedIp(park, hThread, childIsWow64, timeoutMs):
+        # The child either died or never came back to the self-jump. Its
+        # state is unknown; say so rather than restoring a context that may
+        # no longer describe anything.
+        discard SuspendThread(hThread)
+        return false
+
+      var doneRaw: array[ContextAmd64Size + 16, byte]
+      let done = alignUp16(addr doneRaw[0])
+      cast[ptr uint32](cast[uint](done) + ContextAmd64FlagsOffset)[] =
+        ContextAmd64Full
+      if GetThreadContext(hThread, done) == 0:
+        return false
+      ret = cast[ptr uint64](cast[uint](done) + ContextAmd64RaxOffset)[]
+
+      # Hand the thread back byte-for-byte.
+      if SetThreadContext(hThread, saved) == 0:
+        return false
+      true
+    else:
+      false
+
   proc releaseEntryPark*(park: var EntryPark): bool
       {.discardable.} =
     ## Restore the entry point and leave the thread SUSPENDED. Resuming is
@@ -379,5 +553,14 @@ else:
 
   proc releaseEntryPark*(park: var EntryPark): bool {.discardable.} =
     true
+
+  proc callOnParkedThread*(park: var EntryPark; hThread: pointer;
+                           childIsWow64: bool; fn: pointer; arg: pointer;
+                           timeoutMs: uint32; ret: var uint64): bool =
+    ## Nothing is ever parked on this architecture, so nothing can be
+    ## borrowed. Refusing keeps the caller on the legacy technique rather
+    ## than letting it believe a call happened.
+    ret = 0
+    false
 
 {.pop.}

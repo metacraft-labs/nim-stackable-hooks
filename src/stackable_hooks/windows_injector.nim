@@ -11,9 +11,11 @@ when not defined(windows):
 
 import std/[locks, os, strtabs, strutils, tables]
 
+import ./windows_entry_park
 import ./windows_env_block
 import ./windows_fork_runtime
 
+export windows_entry_park
 export windows_env_block
 export windows_fork_runtime
 
@@ -527,7 +529,8 @@ proc wow64ExportRva*(probeExe, dllPath32, procName: string): uint32
 
 proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
     cwd = ""; captureStdio = false;
-    captureStdioPath = ""; env: StringTableRef = nil): WindowsInjectionResult =
+    captureStdioPath = ""; env: StringTableRef = nil;
+    parkTimeoutMs: DWORD = 5000): WindowsInjectionResult =
   ## Windows: Spawn `argv` in a CREATE_SUSPENDED state, inject the monitor
   ## shim DLL via CreateRemoteThread+LoadLibraryW, optionally invoke the
   ## shim's `repro_runtime_init` entry point, then resume the main thread.
@@ -560,6 +563,31 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
   ## their failure modes are in `stackable_hooks/windows_env_block`. Both live
   ## outside this Windows-gated module so they are unit-tested on the
   ## development host rather than merely compiled.
+  ##
+  ## ``parkTimeoutMs`` bounds the ENTRY-POINT PARK, which is what makes an
+  ## MSYS2/Cygwin root monitorable at all. This proc always spawns the child
+  ## itself with ``CREATE_SUSPENDED``, so it -- and nobody else -- owns the
+  ## suspension, and parking is therefore always sound here: the park resumes
+  ## the main thread, waits for it to reach the image entry point (proof the
+  ## loader finished ON THE MAIN THREAD, which is what a Cygwin runtime
+  ## requires), and suspends it again with the count it arrived with. See
+  ## ``stackable_hooks/windows_entry_park``.
+  ##
+  ## ``parkTimeoutMs = 0`` DISABLES the park and restores the pre-park
+  ## behaviour verbatim: a child carrying an MSYS2/Cygwin fork runtime is then
+  ## left uninjected and reported through ``monitoringSkipped`` /
+  ## ``skipReason``. It exists so a regression test can demand the unparked
+  ## arm and observe the refusal -- the passing arm cannot then pass
+  ## vacuously -- and is the same "0 means no park" encoding
+  ## ``propagation_windows.injectShimIntoChild`` already uses.
+  ##
+  ## WHAT IS **NOT** SILENTLY COMPLETE. ``monitoringSkipped`` is set only
+  ## when the park did not happen AND the target carries a fork runtime; when
+  ## the park succeeds the child is injected like any other and
+  ## ``monitoringSkipped`` stays false. The claim that follows from a false
+  ## ``monitoringSkipped`` is only "we injected", never "the child reported":
+  ## the second is `rootPid`'s job, and a consumer that passes it to its merge
+  ## still downgrades a root that emitted nothing.
   if argv.len == 0:
     raise newException(OSError, "runWithMonitorShim: empty argv")
   let dllExists =
@@ -577,11 +605,12 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
   let forkRuntime =
     try: windowsForkRuntimeForExecutable(argv[0], cwd)
     except ValueError: ""
-  let skipInjection = forkRuntime.len > 0
-  if skipInjection:
-    result.monitoringSkipped = true
-    result.skipReason = "target uses " & forkRuntime &
-      ", whose fork emulation is incompatible with pre-main remote threads"
+  # DECIDED AFTER THE PARK, not here. Carrying a fork runtime no longer
+  # implies "unmonitorable": it only means the child must be parked at its
+  # entry point before a remote thread touches it. The refusal survives for
+  # the case where the park could not be performed -- see the park block
+  # inside the `try` below, which is the ONLY writer of these two fields.
+  var skipInjection = false
 
   let commandLine = buildCommandLine(argv)
   var cmdLineW = toWideCStringSeq(commandLine)
@@ -743,6 +772,59 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
     #    mismatch), and its kernel32 is at a different base, so both the
     #    DLL and the LoadLibraryW address have to be switched together.
     let childIsWow64 = processIsWow64(pi.hProcess)
+
+    # 0b. PARK THE CHILD'S MAIN THREAD AT ITS IMAGE ENTRY POINT.
+    #
+    # The Windows loader initialises a process on whichever thread reaches
+    # `LdrInitializeThunk` first. Everything below fires a
+    # `CreateRemoteThread` into a child that has never executed an
+    # instruction, so without this the loader -- `msys-2.0.dll`'s
+    # `DLL_PROCESS_ATTACH` included -- runs on that remote thread, which then
+    # exits, and the Cygwin runtime is left bound to a dead thread: the shell
+    # wedges at its first `fork()`. That is the whole reason MSYS/Cygwin
+    # roots used to be refused outright.
+    #
+    # The park removes the reason. It resumes the main thread with the entry
+    # point patched to `EB FE` (`jmp $`), waits for RIP to reach it -- proof
+    # the loader finished AND released the loader lock, measured at 1-2 ms --
+    # and suspends it again with the suspend count it arrived with, so the
+    # `ResumeThread` at step 6 is still the single wakeup.
+    # `releaseEntryPark` restores the two patched bytes immediately before
+    # it. Measurements and the two plausible alternatives that do NOT work
+    # are in `stackable_hooks/windows_entry_park`.
+    #
+    # SOUNDNESS. The park RUNS THE CHILD'S LOADER, so it must never be
+    # applied to a child whose caller asked for `CREATE_SUSPENDED` and is
+    # entitled to a child that has executed nothing. This proc adds
+    # `CREATE_SUSPENDED` itself and exposes no way for a caller to request
+    # one, so that case cannot arise here.
+    #
+    # NOT FOR A WOW64 CHILD. The park is only half of the technique: the
+    # other half is borrowing the parked thread to map the shim, and
+    # `callOnParkedThread` refuses a 32-bit child because a 32-bit frame
+    # and `Wow64SetThreadContext` are unmeasured here. Parking one anyway
+    # would leave exactly the combination that corrupts the child -- a
+    # loader-initialised main thread plus a remote-thread load -- so a
+    # 32-bit child keeps the legacy technique end to end, and a 32-bit
+    # child carrying a fork runtime is refused below rather than wedged.
+    var park = parkChildAtEntryPoint(pi.hProcess, pi.hThread, childIsWow64,
+      (if childIsWow64: 0'u32 else: parkTimeoutMs))
+    if park.status != epsParked and forkRuntime.len > 0:
+      # No park (ARM64, a 32-bit host looking at a 64-bit child, or
+      # `parkTimeoutMs = 0`) AND a fork runtime: injecting now is the wedge
+      # above. Refuse, and say so through the result so the consumer keeps
+      # the subtree reported-incomplete rather than silently-complete.
+      #
+      # `epsTimedOut` is included deliberately even though the child has RUN
+      # by then: a post-hoc injection is the fixed-`Sleep` technique measured
+      # to be a race (0 ms hangs, >=1 ms passes), not a fix.
+      skipInjection = true
+      result.monitoringSkipped = true
+      result.skipReason = "target uses " & forkRuntime &
+        ", whose fork emulation is incompatible with pre-main remote " &
+        "threads, and its main thread could not be parked (" &
+        $park.status & ")"
+
     let effectiveDllPath =
       if childIsWow64: wow64ShimPathFor(dllPath) else: dllPath
     if childIsWow64:
@@ -811,19 +893,49 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
     # 4. MSYS2/Cygwin fork emulation cannot tolerate a remote thread before
     # the runtime initializes. Resume those targets without injection and let
     # the caller mark the observation incomplete and noncacheable.
+    #
+    #    WHO CALLS IT MATTERS AS MUCH AS WHAT IT DOES. A remote thread
+    #    runs the shim's module body and then exits, and a Nim
+    #    `--threads:on` shim keeps its allocator in a THREADVAR -- so every
+    #    process-global the module body allocated ends up owned by a region
+    #    that dies with that thread, and the first cross-thread free of one
+    #    dereferences it. Before the park the two threads' regions happened
+    #    to coincide; parked, they do not. The measurement and the fault it
+    #    produced are on `windows_entry_park.callOnParkedThread`, which
+    #    borrows the parked main thread so the child maps the shim itself.
     var llExit: DWORD = 1
+    var llModule: uint64 = 0
+    var borrowedLoad = false
     if not skipInjection:
-      let llThread = CreateRemoteThread(pi.hProcess, nil, 0,
-        loadLibraryW, remoteBuf, 0, nil)
-      if llThread == nil:
-        discard VirtualFreeEx(pi.hProcess, remoteBuf, 0, MEM_RELEASE)
-        raise newException(OSError,
-          "CreateRemoteThread(LoadLibraryW) failed (err=" & $GetLastError() & ")")
+      if park.status == epsParked and not childIsWow64:
+        if not callOnParkedThread(park, pi.hThread, childIsWow64,
+            loadLibraryW, remoteBuf, parkTimeoutMs, llModule):
+          discard VirtualFreeEx(pi.hProcess, remoteBuf, 0, MEM_RELEASE)
+          raise newException(OSError,
+            "the parked child's main thread could not be borrowed to load " &
+            "the shim. Falling back to CreateRemoteThread here is NOT an " &
+            "option: it would run the shim's module initialisation on a " &
+            "thread that then exits, leaving every global it allocated " &
+            "owned by a heap region that dies with it. shim=" &
+            effectiveDllPath)
+        borrowedLoad = true
+        # The borrowed call returns LoadLibraryW's HMODULE in RAX. Only
+        # "did it load" is wanted below, and a 64-bit base cannot be
+        # narrowed to a DWORD without risking a 4 GiB-aligned base
+        # reporting as a failure.
+        llExit = (if llModule != 0: 1'u32 else: 0'u32)
+      else:
+        let llThread = CreateRemoteThread(pi.hProcess, nil, 0,
+          loadLibraryW, remoteBuf, 0, nil)
+        if llThread == nil:
+          discard VirtualFreeEx(pi.hProcess, remoteBuf, 0, MEM_RELEASE)
+          raise newException(OSError,
+            "CreateRemoteThread(LoadLibraryW) failed (err=" & $GetLastError() & ")")
 
-      discard WaitForSingleObject(llThread, INFINITE)
-      llExit = 0
-      discard GetExitCodeThread(llThread, addr llExit)
-      discard CloseHandle(llThread)
+        discard WaitForSingleObject(llThread, INFINITE)
+        llExit = 0
+        discard GetExitCodeThread(llThread, addr llExit)
+        discard CloseHandle(llThread)
     discard VirtualFreeEx(pi.hProcess, remoteBuf, 0, MEM_RELEASE)
 
     if llExit == 0:
@@ -908,15 +1020,31 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
 
       if rva != 0:
         let childInit = cast[pointer](cast[uint](foundShim) + rva)
-        let initThread = CreateRemoteThread(pi.hProcess, nil, 0,
-          childInit, nil, 0, nil)
-        if initThread != nil:
-          discard WaitForSingleObject(initThread, INFINITE)
-          discard CloseHandle(initThread)
+        if borrowedLoad:
+          # Same thread that mapped the shim, for the same reason: the init
+          # entry point installs hooks and touches the shim's thread-locals,
+          # and the thread whose locals must be sound is the child's own.
+          var initRet: uint64 = 0
+          if not callOnParkedThread(park, pi.hThread, childIsWow64,
+              childInit, nil, parkTimeoutMs, initRet):
+            raise newException(OSError,
+              "the shim loaded into the child but repro_runtime_init could " &
+              "not be called on its parked main thread; the child would run " &
+              "with the shim mapped and no hooks installed")
+        else:
+          let initThread = CreateRemoteThread(pi.hProcess, nil, 0,
+            childInit, nil, 0, nil)
+          if initThread != nil:
+            discard WaitForSingleObject(initThread, INFINITE)
+            discard CloseHandle(initThread)
       if parentShim != nil:
         discard FreeLibraryRaw(parentShim)
 
-    # 6. Resume the suspended main thread.
+    # 6. Restore the parked entry point, then resume the suspended main
+    #    thread. The order matters: `releaseEntryPark` puts the two original
+    #    bytes back, and resuming before it would leave the child spinning on
+    #    `EB FE` forever. It is a no-op when nothing was parked.
+    releaseEntryPark(park)
     discard ResumeThread(pi.hThread)
 
     # 7. Wait for the child to exit. In capture mode we close our write

@@ -70,6 +70,7 @@
 ## alone does not show. Fixing it is out of scope for the corpus work.
 
 import repro_project_dsl
+import repro_dsl_stdlib/foreign_env
 
 # ``ct_test_nim_unittest`` supplies the ``buildNimUnittest.build(...)``
 # typed-tool used by every test BUILD edge below, and the
@@ -111,6 +112,9 @@ package stackable_hooks:
   library stackable_hooks
 
   devEnv:
+    when not defined(windows):
+      useFlakeDevShell()
+
     task "bump-version", command = "nim r scripts/bump_version.nim", description = "Bump version number"
 
   build:

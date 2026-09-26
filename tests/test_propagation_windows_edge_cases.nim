@@ -94,7 +94,11 @@ when defined(windows):
       # `asDirect` is the pre-park technique and must never be reached by
       # accident.
       check cfg.attachStrategy == asEntryPark
-      check cfg.parkTimeoutMs == 5000'u32
+      # A HARD deadline for a wedged child, not a budget for a slow one:
+      # the old 5 s default resumed healthy-but-slow children mid-call.
+      # See docs/windows-borrowed-call-deadline.md (R1).
+      check cfg.parkTimeoutMs == DefaultInjectDeadlineMs
+      check DefaultInjectDeadlineMs == 600_000'u32
       check ord(asEntryPark) == 0
       check InjectionConfig().attachStrategy == asEntryPark
 

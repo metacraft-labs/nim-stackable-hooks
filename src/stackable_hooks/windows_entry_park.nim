@@ -94,6 +94,13 @@ type
       ## The child is suspended at its patched entry point, fully
       ## initialised, loader lock free. The caller owns the park and must
       ## call ``releaseEntryPark``.
+    epsAbandoned
+      ## A borrowed call (``borrowParkedThread``) could not hand the thread
+      ## back: its context was lent out and could not be restored. The child
+      ## HAS BEEN TERMINATED and its main thread carries one EXTRA suspend
+      ## count, so a caller's ``ResumeThread`` cannot run it. Nothing about
+      ## this child may be used again. See
+      ## ``docs/windows-borrowed-call-deadline.md``.
 
   EntryPark* = object
     ## Handle on a parked child. Zero-initialises to ``epsUnsupported``,
@@ -103,6 +110,55 @@ type
     hProcess: pointer
     origBytes: array[2, byte]
     oldProtect: uint32
+
+  BorrowedCallStatus* = enum
+    ## Outcome of ``borrowParkedThread``. What matters is the state each one
+    ## leaves the CHILD in, because that decides whether the caller may
+    ## resume it. See ``docs/windows-borrowed-call-deadline.md``.
+    bcsNotRun
+      ## Refused, or failed before the thread executed anything borrowed.
+      ## The thread is exactly as the park left it. Resuming the child is
+      ## safe; it simply runs uninjected.
+    bcsReturned
+      ## ``fn`` returned to the self-jump, ``ret`` holds its ``RAX``, and the
+      ## saved context has been restored byte for byte.
+    bcsNoResult
+      ## ``fn`` returned and the saved context has been restored, but its
+      ## return value could not be read. The child is intact; the call's
+      ## effect is unknown.
+    bcsChildExited
+      ## The child died while ``fn`` ran. Nothing to restore.
+    bcsPoisoned
+      ## The thread's context was lent out and could NOT be handed back --
+      ## the hard deadline passed mid-call, or the saved context could not
+      ## be restored. Resuming it would run the rest of ``fn`` and then
+      ## return into the real entry point on a borrowed stack. So this proc
+      ## has already suspended it a second time and TERMINATED the child
+      ## with ``InjectionAbandonedExitCode``; the park is ``epsAbandoned``.
+      ## A caller must report the spawn as failed.
+
+  BorrowedCall* = object
+    status*: BorrowedCallStatus
+    ret*: uint64
+      ## ``RAX`` on ``bcsReturned``; zero otherwise.
+    elapsedMs*: uint64
+      ## How long the call ran in the child, measured from the resume.
+
+const
+  InfiniteDeadline* = 0xFFFF_FFFF'u32
+    ## Win32 ``INFINITE``. As a deadline: wait as long as the child lives.
+  DefaultInjectDeadlineMs* = 600_000'u32
+    ## Hard deadline for the park and for each borrowed call. It is a last
+    ## resort for a genuinely wedged child, not a performance budget: a
+    ## healthy child on an I/O-starved host has been measured taking far
+    ## longer than the 5 s this used to be, and the old recovery turned
+    ## that slow child into a corrupted one.
+  SlowInjectionNoticeMs* = 5_000'u32
+    ## The old deadline. Consumers use it as the threshold above which an
+    ## injection is worth annotating as slow. It has no effect on outcome.
+  InjectionAbandonedExitCode* = 0xC00000B5'u32
+    ## ``STATUS_IO_TIMEOUT``. The exit code a poisoned child is terminated
+    ## with, so a post-mortem can tell it from a crash.
 
 when defined(i386) or defined(amd64):
 
@@ -187,6 +243,28 @@ when defined(i386) or defined(amd64):
     {.importc, stdcall, dynlib: "kernel32".}
   proc SleepMs(ms: uint32)
     {.importc: "Sleep", stdcall, dynlib: "kernel32".}
+  proc TerminateProcess(hProcess: pointer; exitCode: uint32): int32
+    {.importc, stdcall, dynlib: "kernel32".}
+  proc WaitForSingleObject(h: pointer; ms: uint32): uint32
+    {.importc, stdcall, dynlib: "kernel32".}
+
+  proc deadlinePassed(start: uint64; timeoutMs: uint32): bool {.inline.} =
+    ## ``InfiniteDeadline`` never passes: the wait is then bounded only by
+    ## the child staying alive.
+    timeoutMs != InfiniteDeadline and
+      GetTickCount64() - start >= uint64(timeoutMs)
+
+  proc pollPause(start: uint64) {.inline.} =
+    ## 1 ms while the answer is expected any moment (a park measures 1-2 ms
+    ## on a healthy host), then 10 ms: a wait that has already lasted this
+    ## long is a starved host, and spinning GetThreadContext against it
+    ## helps nothing.
+    SleepMs(if GetTickCount64() - start < 100'u64: 1'u32 else: 10'u32)
+
+  proc childAlive(hProcess: pointer): bool =
+    var exitCode: uint32 = 0
+    not (GetExitCodeProcess(hProcess, addr exitCode) != 0 and
+         exitCode != StillActive)
 
   when sizeof(pointer) == 8:
     # Only exists on 64-bit Windows. Declaring it on a 32-bit build would
@@ -337,7 +415,12 @@ when defined(i386) or defined(amd64):
       result.status = epsSetupFailed
       return
 
-    let deadline = GetTickCount64() + uint64(timeoutMs)
+    # `timeoutMs` is a HARD deadline for a wedged loader, not a budget for
+    # a slow one (R5 in docs/windows-borrowed-call-deadline.md). Missing it
+    # is safe here -- the thread is suspended before it reaches user code
+    # and the entry bytes are restored under that suspension -- but it
+    # leaves the child unmonitored, so a slow child must not trip it.
+    let start = GetTickCount64()
     let wantIp = uint64(cast[uint](entry))
     while true:
       var ip: uint64 = 0
@@ -352,23 +435,27 @@ when defined(i386) or defined(amd64):
           result.status = epsParked
           return
         discard ResumeThread(hThread)
-      var exitCode: uint32 = 0
-      if GetExitCodeProcess(hProcess, addr exitCode) != 0 and
-          exitCode != StillActive:
+      if not childAlive(hProcess):
         # The child died before reaching its entry point -- a missing
         # dependency, typically. Nothing to restore into a dead process.
         result.status = epsTimedOut
         return
-      if GetTickCount64() >= deadline:
+      if deadlinePassed(start, timeoutMs):
         break
-      SleepMs(1'u32)
+      pollPause(start)
 
     discard SuspendThread(hThread)
     discard restoreEntryBytes(result)
     result.status = epsTimedOut
 
+  type
+    ParkWait = enum
+      pwParked    ## back on the self-jump, suspended
+      pwExited    ## the child died
+      pwDeadline  ## the hard deadline passed; suspended wherever it was
+
   proc waitForParkedIp(park: var EntryPark; hThread: pointer;
-                       childIsWow64: bool; timeoutMs: uint32): bool =
+                       childIsWow64: bool; timeoutMs: uint32): ParkWait =
     ## Poll until the thread is stopped ON the ``EB FE`` at the entry point.
     ## The proof is the same one ``parkChildAtEntryPoint`` waits for when it
     ## first parks the thread: the instruction pointer is back on the
@@ -377,7 +464,11 @@ when defined(i386) or defined(amd64):
     ## own copy of the loop because its failure path has to restore the
     ## patched bytes, which a borrowed call must NOT do -- the park is still
     ## live across the call.
-    let deadline = GetTickCount64() + uint64(timeoutMs)
+    ##
+    ## On ``pwDeadline`` the thread is left SUSPENDED where it is. It is
+    ## mid-call, and resuming it is exactly the corruption this module must
+    ## never cause; the caller poisons the child instead.
+    let start = GetTickCount64()
     let wantIp = uint64(cast[uint](park.entry))
     while true:
       var ip: uint64 = 0
@@ -386,19 +477,40 @@ when defined(i386) or defined(amd64):
         var confirmed: uint64 = 0
         if instructionPointer(hThread, childIsWow64, confirmed) and
             confirmed == wantIp:
-          return true
+          return pwParked
         discard ResumeThread(hThread)
-      var exitCode: uint32 = 0
-      if GetExitCodeProcess(park.hProcess, addr exitCode) != 0 and
-          exitCode != StillActive:
-        return false
-      if GetTickCount64() >= deadline:
-        return false
-      SleepMs(1'u32)
+      if not childAlive(park.hProcess):
+        return pwExited
+      if deadlinePassed(start, timeoutMs):
+        discard SuspendThread(hThread)
+        # The call may have come back between the last sample and the
+        # suspend. Then it is simply a success, and a slow one.
+        var last: uint64 = 0
+        if instructionPointer(hThread, childIsWow64, last) and
+            last == wantIp:
+          return pwParked
+        if not childAlive(park.hProcess):
+          return pwExited
+        return pwDeadline
+      pollPause(start)
 
-  proc callOnParkedThread*(park: var EntryPark; hThread: pointer;
+  proc poisonChild(park: var EntryPark; hThread: pointer) =
+    ## The thread's context is lent out and cannot be handed back. Make sure
+    ## it never runs another instruction, whatever the caller does next:
+    ##
+    ## * one EXTRA suspend, so the caller's unconditional ``ResumeThread``
+    ##   (every caller has one, in a ``finally``) still leaves it frozen,
+    ##   even if the termination below were to fail;
+    ## * terminate the child, and wait for it, so a caller that reports the
+    ##   spawn as failed is not racing a process that is still exiting.
+    discard SuspendThread(hThread)
+    discard TerminateProcess(park.hProcess, InjectionAbandonedExitCode)
+    discard WaitForSingleObject(park.hProcess, 30_000'u32)
+    park.status = epsAbandoned
+
+  proc borrowParkedThread*(park: var EntryPark; hThread: pointer;
                            childIsWow64: bool; fn: pointer; arg: pointer;
-                           timeoutMs: uint32; ret: var uint64): bool =
+                           deadlineMs: uint32): BorrowedCall =
     ## Call ``fn(arg)`` IN THE CHILD, ON ITS OWN MAIN THREAD, and come back
     ## with the thread parked exactly as it was.
     ##
@@ -442,31 +554,44 @@ when defined(i386) or defined(amd64):
     ## suspend count, and the caller's single ``ResumeThread`` still owns
     ## the wakeup.
     ##
-    ## FAILURE IS NEVER SILENT. Every early return leaves ``ret`` at zero
-    ## and answers ``false``; a caller must treat that as "the child was
-    ## not injected" rather than retry with a remote thread, which is the
-    ## broken combination this proc exists to replace.
+    ## FAILURE IS NEVER SILENT, AND NEVER RESUMES A LENT-OUT THREAD. Every
+    ## status but ``bcsReturned`` means "the child was not injected"; a
+    ## caller must not retry with a remote thread, which is the broken
+    ## combination this proc exists to replace. ``bcsPoisoned`` means more:
+    ## the thread's context was lent out and could not be handed back, so
+    ## the child has been TERMINATED here, before any caller gets the
+    ## chance to resume it. See ``docs/windows-borrowed-call-deadline.md``.
+    ##
+    ## THE DEADLINE IS A LAST RESORT. ``deadlineMs`` bounds a WEDGED call;
+    ## while the child is alive and the call has not come back, this keeps
+    ## waiting (``InfiniteDeadline`` waits for as long as the child lives).
+    ## It used to be a 5 s budget whose expiry suspended the thread
+    ## mid-call and returned ``false`` -- after which every caller restored
+    ## the entry bytes and resumed it, and the child finished the borrowed
+    ## call and returned into its real entry point on the borrowed stack.
+    ## That is a corrupted child manufactured out of a slow one, and it was
+    ## observed exactly so on an I/O-starved build host.
     ##
     ## WOW64 is refused (``false``) rather than approximated: a 32-bit
     ## child needs ``Wow64SetThreadContext`` and a 32-bit frame, and
     ## neither is measured here. Callers park only what they can borrow.
-    ret = 0
+    result = BorrowedCall(status: bcsNotRun)
     when sizeof(pointer) == 8:
       if childIsWow64 or park.status != epsParked or hThread == nil or
-          fn == nil or timeoutMs == 0:
-        return false
+          fn == nil or deadlineMs == 0:
+        return
 
       var savedRaw: array[ContextAmd64Size + 16, byte]
       let saved = alignUp16(addr savedRaw[0])
       cast[ptr uint32](cast[uint](saved) + ContextAmd64FlagsOffset)[] =
         ContextAmd64Full
       if GetThreadContext(hThread, saved) == 0:
-        return false
+        return
 
       let savedRsp = cast[ptr uint64](cast[uint](saved) +
         ContextAmd64RspOffset)[]
       if savedRsp < 0x10000'u64:
-        return false
+        return
 
       # The return address goes just below the parked frame, on the
       # thread's OWN stack, so the callee grows it through the guard page
@@ -489,7 +614,7 @@ when defined(i386) or defined(amd64):
           rsp = candidate
           break
       if rsp == 0:
-        return false
+        return
 
       var callRaw: array[ContextAmd64Size + 16, byte]
       let call = alignUp16(addr callRaw[0])
@@ -502,33 +627,65 @@ when defined(i386) or defined(amd64):
       cast[ptr uint64](cast[uint](call) + ContextAmd64RipOffset)[] =
         uint64(cast[uint](fn))
       if SetThreadContext(hThread, call) == 0:
-        return false
+        return
 
+      # FROM HERE THE CONTEXT IS LENT OUT. Every exit below either hands it
+      # back byte for byte or poisons the child; none leaves a resumable
+      # thread that is not the one the park produced.
       if ResumeThread(hThread) == high(uint32):
-        discard SetThreadContext(hThread, saved)
-        return false
+        # Never ran, so restoring is enough -- if restoring works.
+        if SetThreadContext(hThread, saved) != 0:
+          return
+        poisonChild(park, hThread)
+        result.status = bcsPoisoned
+        return
 
-      if not waitForParkedIp(park, hThread, childIsWow64, timeoutMs):
-        # The child either died or never came back to the self-jump. Its
-        # state is unknown; say so rather than restoring a context that may
-        # no longer describe anything.
-        discard SuspendThread(hThread)
-        return false
+      let started = GetTickCount64()
+      let waited = waitForParkedIp(park, hThread, childIsWow64, deadlineMs)
+      result.elapsedMs = GetTickCount64() - started
+      case waited
+      of pwExited:
+        result.status = bcsChildExited
+        return
+      of pwDeadline:
+        poisonChild(park, hThread)
+        result.status = bcsPoisoned
+        return
+      of pwParked:
+        discard
 
       var doneRaw: array[ContextAmd64Size + 16, byte]
       let done = alignUp16(addr doneRaw[0])
       cast[ptr uint32](cast[uint](done) + ContextAmd64FlagsOffset)[] =
         ContextAmd64Full
-      if GetThreadContext(hThread, done) == 0:
-        return false
-      ret = cast[ptr uint64](cast[uint](done) + ContextAmd64RaxOffset)[]
+      let haveResult = GetThreadContext(hThread, done) != 0
 
-      # Hand the thread back byte-for-byte.
+      # Hand the thread back byte-for-byte. Parked on the self-jump with a
+      # stack pointer that is not the one the loader left is NOT a state to
+      # resume from, so a failed restore poisons the child too.
       if SetThreadContext(hThread, saved) == 0:
-        return false
-      true
-    else:
-      false
+        poisonChild(park, hThread)
+        result.status = bcsPoisoned
+        return
+      if haveResult:
+        result.ret = cast[ptr uint64](cast[uint](done) +
+          ContextAmd64RaxOffset)[]
+        result.status = bcsReturned
+      else:
+        result.status = bcsNoResult
+
+  proc callOnParkedThread*(park: var EntryPark; hThread: pointer;
+                           childIsWow64: bool; fn: pointer; arg: pointer;
+                           timeoutMs: uint32; ret: var uint64): bool =
+    ## Boolean form of ``borrowParkedThread``: ``true`` only on
+    ## ``bcsReturned``. ``timeoutMs`` is the HARD deadline. A caller that
+    ## has to tell a poisoned (terminated) child apart from an intact,
+    ## uninjected one -- every spawn hook does -- must use
+    ## ``borrowParkedThread`` or check ``park.status == epsAbandoned``.
+    let r = borrowParkedThread(park, hThread, childIsWow64, fn, arg,
+      timeoutMs)
+    ret = r.ret
+    r.status == bcsReturned
 
   proc releaseEntryPark*(park: var EntryPark): bool
       {.discardable.} =
@@ -554,12 +711,17 @@ else:
   proc releaseEntryPark*(park: var EntryPark): bool {.discardable.} =
     true
 
-  proc callOnParkedThread*(park: var EntryPark; hThread: pointer;
+  proc borrowParkedThread*(park: var EntryPark; hThread: pointer;
                            childIsWow64: bool; fn: pointer; arg: pointer;
-                           timeoutMs: uint32; ret: var uint64): bool =
+                           deadlineMs: uint32): BorrowedCall =
     ## Nothing is ever parked on this architecture, so nothing can be
     ## borrowed. Refusing keeps the caller on the legacy technique rather
     ## than letting it believe a call happened.
+    BorrowedCall(status: bcsNotRun)
+
+  proc callOnParkedThread*(park: var EntryPark; hThread: pointer;
+                           childIsWow64: bool; fn: pointer; arg: pointer;
+                           timeoutMs: uint32; ret: var uint64): bool =
     ret = 0
     false
 

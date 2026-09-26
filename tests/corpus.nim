@@ -187,6 +187,15 @@ const testCorpus*: seq[TestEntry] = @[
          "remote thread -- so the run lane is Windows only while the " &
          "cross-target lane still compile-verifies it from Linux and " &
          "macOS."),
+  TestEntry(stem: "test_windows_entry_park_slow_call",
+    targets: @[tLinuxAmd64, tMacosArm64, tWindowsAmd64, tWindowsArm64],
+    why: "Body is gated on `defined(windows) and defined(amd64)` with an " &
+         "`else: static: doAssert` arm, so it compiles everywhere and is a " &
+         "no-op off Windows x64 (the borrow is x64-only). Its Windows arm " &
+         "forces the slow borrowed-call path for real -- kernel32!Sleep " &
+         "borrowed on a real child's main thread, and a fixture DLL whose " &
+         "load sleeps -- so the run lane is Windows only while the " &
+         "cross-target lane compile-verifies it from Linux and macOS."),
   TestEntry(stem: "test_windows_wow64_injection",
     targets: @[tLinuxAmd64, tMacosArm64, tWindowsAmd64, tWindowsArm64],
     why: "Body is `when defined(windows)`-wrapped; compiles everywhere, " &

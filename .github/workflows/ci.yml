@@ -12,7 +12,7 @@ env:
 jobs:
   lint:
     name: Lint
-    runs-on: eph-linux-x64
+    runs-on: [self-hosted, linux, x64]
     steps:
       - name: Generate CI token
         id: app-token
@@ -53,7 +53,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runs-on: [eph-linux-x64, eph-macos-arm64]
+        # `slug` names the artifact (a plain string); `runs-on` carries the
+        # capability-label array (RC4: the eph-* names are retired).
+        include:
+          - slug: linux-x64
+            runs-on: [self-hosted, linux, x64]
+          - slug: macos-arm64
+            runs-on: [self-hosted, macos, arm64]
     steps:
       - name: Generate CI token
         id: app-token
@@ -81,7 +87,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-logs-${{ matrix.runs-on }}
+          name: build-logs-${{ matrix.slug }}
           path: build.log
           retention-days: 30
 
@@ -93,11 +99,14 @@ jobs:
       matrix:
         include:
           - env: nix
-            runs-on: eph-linux-x64
+            slug: linux-x64
+            runs-on: [self-hosted, linux, x64]
           - env: nix
-            runs-on: eph-macos-arm64
+            slug: macos-arm64
+            runs-on: [self-hosted, macos, arm64]
           - env: reprobuild
-            runs-on: eph-linux-x64
+            slug: linux-x64
+            runs-on: [self-hosted, linux, x64]
     steps:
       - name: Generate CI token
         id: app-token
@@ -130,6 +139,60 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-logs-${{ matrix.runs-on }}-${{ matrix.env }}
+          name: test-logs-${{ matrix.slug }}-${{ matrix.env }}
           path: test.log
           retention-days: 30
+
+  windows-injection:
+    name: Windows injection tests (x64)
+    # The Windows entry-park / propagation tests need a real Windows x64 host:
+    # they spawn, park, borrow and terminate real processes. No other lane here
+    # runs them today (the nix matrix has no Windows entry, and the reprobuild
+    # lane fails in its own bootstrap before compiling anything). The
+    # persistent Windows runners carry `nim` and a MinGW gcc on the SYSTEM PATH,
+    # so this job needs no dev-env setup. `dev-env-ready` keeps it off a
+    # drained runner.
+    runs-on: [self-hosted, windows, x64, dev-env-ready]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run the Windows injection tests
+        shell: pwsh
+        run: |
+          # The PATH `gcc` on these runners is not the provisioned toolchain
+          # (it reports 2.95 and cannot read the CRT headers). The profile
+          # installs WinLibs GCC per service account; put it first.
+          $gccRoots = @(
+            "$env:LOCALAPPDATA\repo-workspaces\toolchains\gcc",
+            'C:\Windows\ServiceProfiles\NetworkService\AppData\Local\repo-workspaces\toolchains\gcc',
+            'C:\Windows\System32\config\systemprofile\AppData\Local\repo-workspaces\toolchains\gcc'
+          )
+          $gccBin = $null
+          foreach ($r in $gccRoots) {
+            if (Test-Path $r) {
+              $cand = Get-ChildItem $r -Directory | Sort-Object Name -Descending |
+                ForEach-Object { Join-Path $_.FullName 'bin' } |
+                Where-Object { Test-Path (Join-Path $_ 'gcc.exe') } | Select-Object -First 1
+              if ($cand) { $gccBin = $cand; break }
+            }
+          }
+          if (-not $gccBin) { throw "no provisioned WinLibs gcc found under: $($gccRoots -join ', ')" }
+          $env:PATH = "$gccBin;$env:PATH"
+          nim -v
+          gcc --version
+          $tests = @(
+            'test_windows_entry_park_slow_call',
+            'test_windows_entry_park_thread_locals',
+            'test_propagation_windows_smoke',
+            'test_propagation_windows_edge_cases',
+            'test_propagation_windows_fork_bomb',
+            'test_propagation_windows_remote_buffer_lifetime'
+          )
+          New-Item -ItemType Directory -Force build/test-bin | Out-Null
+          $failed = @()
+          foreach ($t in $tests) {
+            Write-Host "=== $t"
+            & nim c -r --hints:off --cc:gcc --path:src "--out:build/test-bin/$t.exe" "tests/$t.nim"
+            if ($LASTEXITCODE -ne 0) { $failed += "$t (exit $LASTEXITCODE)" }
+          }
+          if ($failed.Count -gt 0) { throw "failed: $($failed -join '; ')" }

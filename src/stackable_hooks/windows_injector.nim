@@ -530,7 +530,7 @@ proc wow64ExportRva*(probeExe, dllPath32, procName: string): uint32
 proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
     cwd = ""; captureStdio = false;
     captureStdioPath = ""; env: StringTableRef = nil;
-    parkTimeoutMs: DWORD = 5000): WindowsInjectionResult =
+    parkTimeoutMs: DWORD = DefaultInjectDeadlineMs): WindowsInjectionResult =
   ## Windows: Spawn `argv` in a CREATE_SUSPENDED state, inject the monitor
   ## shim DLL via CreateRemoteThread+LoadLibraryW, optionally invoke the
   ## shim's `repro_runtime_init` entry point, then resume the main thread.
@@ -572,6 +572,12 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
   ## loader finished ON THE MAIN THREAD, which is what a Cygwin runtime
   ## requires), and suspends it again with the count it arrived with. See
   ## ``stackable_hooks/windows_entry_park``.
+  ##
+  ## ``parkTimeoutMs`` is a HARD deadline for a wedged child, applied to the
+  ## park and to each call borrowed on the parked thread; it is not a
+  ## performance budget (see ``docs/windows-borrowed-call-deadline.md``). A
+  ## borrowed call that outlives it leaves the child TERMINATED rather than
+  ## resumed mid-call, and this proc raises.
   ##
   ## ``parkTimeoutMs = 0`` DISABLES the park and restores the pre-park
   ## behaviour verbatim: a child carrying an MSYS2/Cygwin fork runtime is then
@@ -911,6 +917,12 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
         if not callOnParkedThread(park, pi.hThread, childIsWow64,
             loadLibraryW, remoteBuf, parkTimeoutMs, llModule):
           discard VirtualFreeEx(pi.hProcess, remoteBuf, 0, MEM_RELEASE)
+          if park.status == epsAbandoned:
+            raise newException(OSError,
+              "the child's main thread did not return from loading the " &
+              "shim within " & $parkTimeoutMs & " ms; it was mid-call, so " &
+              "it was terminated rather than resumed. shim=" &
+              effectiveDllPath)
           raise newException(OSError,
             "the parked child's main thread could not be borrowed to load " &
             "the shim. Falling back to CreateRemoteThread here is NOT an " &
@@ -1027,6 +1039,12 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
           var initRet: uint64 = 0
           if not callOnParkedThread(park, pi.hThread, childIsWow64,
               childInit, nil, parkTimeoutMs, initRet):
+            if park.status == epsAbandoned:
+              raise newException(OSError,
+                "repro_runtime_init did not return on the child's main " &
+                "thread within " & $parkTimeoutMs & " ms; it was mid-call, " &
+                "so the child was terminated rather than resumed with its " &
+                "hooks half-installed")
             raise newException(OSError,
               "the shim loaded into the child but repro_runtime_init could " &
               "not be called on its parked main thread; the child would run " &

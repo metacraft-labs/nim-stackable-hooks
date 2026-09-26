@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+### Fixed
+
+- **A slow Windows child is no longer turned into a corrupted one.** A call
+  borrowed on a parked child's main thread (`LoadLibraryW`, then the shim's
+  init) had a 5 s deadline. When a call missed it, the thread was suspended
+  mid-call and every caller then resumed it. The child finished the call
+  and returned into its real entry point on the borrowed stack, which
+  crashed healthy but slow processes (compilers on an I/O-starved host).
+  The park and every borrowed call now keep waiting while the child is
+  alive, up to a hard deadline of `DefaultInjectDeadlineMs` (10 min;
+  `InfiniteDeadline` waits for as long as the child lives). A call that
+  outlives the hard deadline no longer resumes the thread: the child is
+  terminated (`InjectionAbandonedExitCode`) and reported as its own outcome,
+  `ioChildTerminated`. `autoPropagateCreateProcessW` then fails the spawn
+  with `ERROR_TIMEOUT`, and `runWithMonitorShim` raises. See
+  `docs/windows-borrowed-call-deadline.md`.
+
+### Added
+
+- `windows_entry_park.borrowParkedThread` / `BorrowedCallStatus`, the
+  status-returning form of `callOnParkedThread`, and `epsAbandoned`.
+- `injectShimIntoChildReport` (outcome plus time spent waiting on the
+  child), `failSpawnForTerminatedChild`, and
+  `setPropagationInjectionConfig`.
+- `tests/test_windows_entry_park_slow_call.nim` plus
+  `tests/fixtures/slow_load_lib.nim`. These force the slow path for real:
+  `kernel32!Sleep` is borrowed on a real child's main thread, and a DLL
+  whose load sleeps is injected. Slower than the old deadline completes,
+  and the child reaches its own exit code. Past a short hard deadline, the
+  child is terminated and is never resumed.
+
 ### Added
 
 - **The child's own main thread now maps the shim**

@@ -108,6 +108,10 @@ const
 
 const testCorpus*: seq[TestEntry] = @[
   # ---- compiles and runs on every host -------------------------------
+  TestEntry(stem: "test_nimcache_is_worktree_local", targets: AllHostTargets,
+    why: "Portable: every Nim compile in this checkout keeps its nimcache " &
+         "inside the checkout (config.nims), probed with `nim dump` plus " &
+         "a --skipParentCfg negative control."),
   TestEntry(stem: "test_explicit_hook_suppression", targets: AllHostTargets,
     why: "Portable: exercises the real per-thread suppression storage " &
          "through the public reentrancy API on every platform."),

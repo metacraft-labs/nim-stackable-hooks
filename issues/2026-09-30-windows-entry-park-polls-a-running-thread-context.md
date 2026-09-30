@@ -32,3 +32,20 @@ on x64 and ARM hosts before selecting a repair for the release bootstrap.
 Fetched dev `8f4d806` and searched current docs and all issue history for
 running contexts and polling. This is the repository's first `issues/` record;
 no earlier issue was found. No implementation change is included here.
+
+## Validation of the proposed suspension control
+
+Shared `f841035`, run `36691629213`, tests the disposable `72f5782` source
+with balanced suspension on x64 and ARM hosts. Windows x64 job `109809949852`
+passes the real slow-call, termination and failed-spawn assertions. Its
+thread-local-state fixture then fails: the borrowed child exits 5, meaning its
+TLS offset differs from a fresh thread's offset. The remote-thread negative
+control still rejects the incorrect loading thread. No compiler graph ran in
+that job, and the change is not selected for production.
+
+Follow-up `36693214051` at shared `4b21d61` compares that same TLS fixture
+against the original parking source on the same toolchain before attributing
+the failure to this change. It retains failed regression status while also
+collecting the complete monitored compiler graph. The earlier `f04af34` run
+stopped before assertions because its diagnostic child used an invalid Nim
+module filename; it supplies no behavioral evidence.

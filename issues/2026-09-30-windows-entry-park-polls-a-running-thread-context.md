@@ -49,3 +49,24 @@ the failure to this change. It retains failed regression status while also
 collecting the complete monitored compiler graph. The earlier `f04af34` run
 stopped before assertions because its diagnostic child used an invalid Nim
 module filename; it supplies no behavioral evidence.
+
+## TLS fixture and full-graph results
+
+The separate TLS control `36698212669` at shared `c114b4a` fails the original
+and balanced parking variants on both hosts. The actual GCC-built DLL uses
+emulated TLS, so the fixture's assumed native TEB-relative offset is invalid.
+Hooks `db9e21a` replaces that assumption with real per-thread state and address
+checks and adds a deliberately shared probe as a negative control. Shared
+`febe28c`, run `36699038944`, passes all three cases for both parking variants
+on both hosts: 12 passing cases, including both negative controls. This fixes
+the fixture without changing production parking or any deadline.
+
+The longer balanced control `36693214051` at shared `4b21d61` completes its
+x64 job `109815014368` with all 100 compilations passing. Two of the 98 test
+programs fail: `t_observation_socket_write_path` sees one dropped row where it
+expects at least two, and `t_stats_table_publication` does not observe the key
+within ten seconds. The remaining test graph records 93 successful, 95 cached,
+two failed and eight blocked actions. Its ARM-host job is still running as of
+2026-09-30 10:05 UTC. These failures do not establish a regression caused by
+balanced parking; the same complete graph has no original-parking comparison
+in this run. The change remains diagnostic only.

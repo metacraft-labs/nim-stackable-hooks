@@ -181,3 +181,23 @@ flushing, hard deadlines and all tests remain. Failure traces include the
 successfully prepared target address. Exact-source transformation, Windows
 C compilation/link and workflow lint pass. This remains an experiment;
 production hook code is unchanged.
+
+## Repeated ordinary compiler-launch failures
+
+RunQuota `48bb701`'s [ARM-host job](https://github.com/metacraft-labs/runquota/actions/runs/36729033751/job/109933446531)
+finishes compilation with 101 successful actions and one failed action,
+`t_hardware_run_tool_streams`. GCC reports that `cc1.exe` cannot be started.
+io-mon stable `c01a3d8`'s [ARM-host job](https://github.com/metacraft-labs/io-mon/actions/runs/36729975964/job/109936751770)
+reports 96 successful actions, two failed test compilations and two blocked
+executions. Both compiles (`test_io_mon_cross_thread_sweep_sentinel` and
+`test_shim_signal_handler_policy`) fail starting `as.exe`. Each compiler message
+says `CreateProcess: No such file or directory`, matching the launch symptom
+in the traced workloads. These ordinary reports contain no hook checkpoints
+and do not independently prove the same underlying stall.
+
+The io-mon tree equals previously validated `7bc8f72`, whose complete ARM-host
+job passed. Public release assets and their source tag remain unchanged.
+Retained failure reports: `/tmp/runquota-48bb-arm-evidence` and
+`/tmp/io-mon-c01-arm-failure`. Refreshed hooks dev `8f4d806` and agents
+`2c9f0f8` before extending this existing investigation. Prepared full graph
+`36738909519` at tooling `5383510` is still running.

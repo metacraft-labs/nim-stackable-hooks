@@ -1,6 +1,6 @@
 # Linux raw-syscall fixture exits while an outer monitor owns SIGTRAP
 
-Status: open. Observed in stackable-hooks `65720d2`, io-mon `5e71adf`.
+Status: open. Observed in stackable-hooks `65720d2`, io-mon `4b2bb39` from the POSIX bootstrap flake lock.
 
 ## Observed
 
@@ -51,3 +51,26 @@ handler on every exit path. Retain duplicate-install rejection, all existing
 live INT3 tests and automatic monitoring. This changes only fixture setup
 and strengthens chaining/restoration assertions; it does not change the
 shipping handler implementation or omit the outer monitor.
+
+## The lifecycle fix passes; the next live INT3 case fails
+
+At `f3a9dc1`, Linux Reprobuild job `110142647589` in run `36790688346`
+now prints the lifecycle fixture's passing assertion and reaches 36 passing
+cases. It exits 127 in the following live INT3/replay case; stderr remains
+empty. The runtime compiler dependency fix also passes the full cross-target
+case. Native Linux and macOS suites pass at the same source.
+
+The POSIX bootstrap is Reprobuild `c14b1e6` with its flake-pinned io-mon
+`4b2bb39` and hooks `72f5782`; the Windows-only `repro-io-mon-pin` input
+must not be reported as the Linux dependency. The source log confirms the
+`4b2bb39` download. Log: `/tmp/hooks-f3-linux-repro.log`.
+
+Next bounded control: keep that exact native/monitored test and trace signal
+syscalls. Its handler replays through a raw-syscall function that the outer
+monitor may itself intercept. Compare the original fixture, allowing nested
+SIGTRAP with `SA_NODEFER`, and allowing nesting while treating successfully
+chained foreign traps as handled. Retain exact one-hit/getpid assertions and
+failure accounting for unhandled signals. These are diagnostic fixture
+variants, not a selected production change. Observe native success and the
+monitor's real signal sequence before choosing a repair; do not suppress the
+monitor or mark incomplete evidence cacheable.

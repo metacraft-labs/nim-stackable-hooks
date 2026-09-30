@@ -271,3 +271,30 @@ native controls remain. The Windows parent compiles and links against the same
 pinned sources. Run `36758986422` supplies the runtime comparison; the complete
 all-range graph remains active. Evidence for the completed direct control is
 `/tmp/windows-borrowed-assembler-bec-evidence`.
+
+## The small assembler probe reproduces the stalled protection call
+
+Repeat `36758986422` at tooling `1090ee89566d6cd6383f1b9516d86718816371e6`
+passes all 128 native assemblies. Direct monitoring passes 127 and fails one,
+index 1, after 621.777 seconds including cleanup. Its original 600000 ms
+borrowed-call deadline expires with reason 2 and initialization phase 130,
+before writable protection of exact `Kernel32!CreateFileW` at offset
+`0xf32f0`, protection `0x80`. Three peers are frozen at ntdll offsets
+`0x176874`, `0x16d1a4` and `0x19edec`. The main thread remains at
+`ntdll+0x176784`, its entry still parked. The trace does not identify a lock
+owner. Propagated assembly never starts because the direct arm fails first.
+
+The assembler and retained shim hashes match the preceding control. Evidence
+is `/tmp/windows-borrowed-assembler-109-evidence/monitored-1/parent.log`.
+This is now a small real reproduction of the full compiler failure, with no
+mock, shortened production timeout or changed hook semantics.
+
+The next controlled comparison rebuilds both original and all-range-prepared
+DLLs from hooks `8f4d806` and io-mon `5e71adf` using one toolchain. It records
+both exact patches and binary hashes; a rebuilt original is not claimed to be
+byte-identical to the retained DLL. Each variant attempts 128 native, 512 direct
+and 512 propagated assemblies, retaining the same COFF/capture assertions.
+An original failure must not prevent the prepared variant from running.
+The full all-range graph `36753037680` at `8fd4eff` remains active and is still
+required for final validation. Refreshed dev `8f4d806` and agents `af0134b`
+before recording this result; production hook code remains unchanged.

@@ -348,3 +348,23 @@ prepared is `8049FFFD014E4F9D8A79E182B3F2D8000533F35D35DD97E27AF6449E945CAF3D`.
 Evidence is `/tmp/windows-hook-page-preparation-c6d`. Increasing parent
 concurrency did not reproduce the defect, so it supplies no causal evidence
 for the experimental repair. The complete candidate graph remains pending.
+
+## Complete all-range graph: compilation passes, execution still fails
+
+Run `36753037680` at tooling `8fd4eff` completes on 2026-09-30 at
+20:18 UTC against RunQuota `8cf662c` and hooks `8f4d806`, with the disposable
+all-range preparation. All 100 monitored compile actions succeed. This run
+does not reproduce a compiler-injection failure. The retained shim hash is
+`BBB2E1EE4B77C96F6D527DBBEB3763BCA33996A3CA44DE515B31F4309507D21E`.
+
+The subsequent test graph has 93 successful actions, 85 up-to-date actions,
+12 failed executions and eight blocked executions. Seven failures return 124,
+one returns 137 and four return 1. No phase-130 trace accompanies those test
+failures, so they are not attributed to this hook-protection defect. RunQuota's
+`issues/2026-09-29-windows-monitored-daemon-deadlines-expire.md` records their
+details. Passing compilation alone is not a complete release gate.
+
+Evidence is `/tmp/windows-arm-prepared-all-8fd-evidence`. The current-source
+comparison `36763970172` at `f5a3d99` remains active with RunQuota `33add18`
+and the separately validated root-exit capture repair at hooks `def2464`.
+The release candidate `a173baf` still uses original hook protection.

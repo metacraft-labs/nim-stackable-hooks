@@ -65,6 +65,11 @@ unprovisioned compiler before reaching tests. PR commit `3554385` activates
 the pinned source-bootstrap toolchain; its ordinary checks are active and its
 native Windows injection suite passes. Runtime sources remain unchanged.
 
+That corrected bootstrap at `3554385` passes the full Windows build and
+51 of 52 test actions, including the capture regression. The sole failed action
+is the separate cross-target host-assumption issue; PR commit `eb40f51` repairs
+its assertions and keeps the runtime source identical to `def2464`.
+
 Evidence: `/tmp/windows-injector-capture-f68-x64` and
 `/tmp/windows-injector-capture-f68-arm`.
 PR: <https://github.com/metacraft-labs/nim-stackable-hooks/pull/12>.

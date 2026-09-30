@@ -44,3 +44,12 @@ native Windows job so the host-dependent assertion is exercised directly.
 Refreshed dev `8f4d806` and agents `0580d4a`; searched current issues and their
 complete history for `targetsToCheck`, matrix coverage and cross-target failures.
 No earlier record covers this assertion mismatch.
+
+## Repair validation
+
+Repair `1230347` preserves the selector, both declared Windows CPUs and
+every corpus coverage assertion. Expected cross-target membership now excludes
+the actual native Windows CPU, and the exclusion control uses a distinct second
+target. All 102 real Nim checks pass on macOS ARM64 at that commit; workflow
+validation also passes. PR 12 includes the same change at `eb40f51` and adds the
+full matrix to its native Windows job. Real Windows verification is pending.

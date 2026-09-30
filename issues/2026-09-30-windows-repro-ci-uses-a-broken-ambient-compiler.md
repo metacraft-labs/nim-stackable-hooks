@@ -2,7 +2,7 @@
 
 | | |
 | --- | --- |
-| Status | open |
+| Status | in-progress; corrected Windows build passes, PR 12 promotion pending |
 | Recorded | 2026-09-30 |
 | Observed in | nim-stackable-hooks at `def2464b2d282c7c1a982689a25953e1d4501f93` |
 | Area | `.github/workflows/ci-reprobuild.yml`, Windows toolchain activation |
@@ -35,3 +35,12 @@ Fetched dev `8f4d806` and agents `b7a1cdd`, searched open issues and full issue
 history for GCC, compiler PATH and these header errors. No existing issue owns
 this workflow mismatch. This failure precedes the new capture regression's
 execution and does not show that its runtime repair failed.
+
+## Pinned toolchain result
+
+At `3554385`, run `36764895453` passes the Windows Reprobuild build and
+51 of 52 test actions. All 93 selected cross-target compiler checks pass as
+well. The single failed action instead contains host-dependent matrix assertions,
+recorded in `2026-09-30-cross-target-coverage-assertions-assume-a-posix-host.md`.
+The original header/ambient-compiler failure is not reproduced. PR 12 at
+`eb40f51` carries the separate assertion repair; ordinary promotion is pending.

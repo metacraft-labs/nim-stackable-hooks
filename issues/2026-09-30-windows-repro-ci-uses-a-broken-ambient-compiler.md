@@ -60,3 +60,27 @@ the direct build/test commands and `dev-exec`'s environment activation for
 Just. Keep non-Windows mode selection unchanged. This retains every test and
 uses the declared toolchain; it does not add a PATH bypass. Fetched dev
 `8f4d806` and agents `aba22b9` before extending this existing workflow issue.
+
+## Fresh-host runtime bootstrap on Linux and macOS
+
+The separate runner-selection candidate `5cadd95` exposes bootstrap gaps
+before helper tests execute. Linux job `110130967953` in run `36787069280`
+installs Reprobuild v0.2.5 and fails with
+`__repro-extract-interface: error while loading shared libraries`.
+Legacy Reprobuild test job `110130986373` in run `36787065853` fails the same
+way. This matches the existing owning record in
+`reprobuild-specs/issues/2026-09-26-release-launcher-makes-the-engine-self-spawn-the-loader.md`.
+
+macOS job `110130968087` in run `36787069280` also installs the release
+bootstrap, then refuses monitoring because no non-SIP shell is available.
+The shared source bootstrap already exports its rooted shell; that closure is
+tracked in
+`metacraft-specs/issues/2026-09-28-reprobuild-source-bootstrap-loses-runtime-dependencies.md`.
+
+Select the already pinned source bootstrap for every Reprobuild job,
+including the separate legacy Reprobuild entry in `ci.yml`. The workflow
+changes are `65720d2` and `8f33762`; no helper runtime code changes.
+Full CI is pending. Logs: `/tmp/hooks-5cadd-linux-repro.log`,
+`/tmp/hooks-5cadd-macos-repro.log`,
+`/tmp/hooks-5cadd-linux-native-repro.log`. These setup/launcher failures are
+independent of the repaired Windows root-exit capture behavior.

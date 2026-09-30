@@ -1,11 +1,11 @@
 # Windows Reprobuild CI uses a broken ambient compiler
 
-| | |
-| --- | --- |
-| Status | in-progress; corrected Windows build passes, PR 12 promotion pending |
-| Recorded | 2026-09-30 |
-| Observed in | nim-stackable-hooks at `def2464b2d282c7c1a982689a25953e1d4501f93` |
-| Area | `.github/workflows/ci-reprobuild.yml`, Windows toolchain activation |
+|             |                                                                      |
+| ----------- | -------------------------------------------------------------------- |
+| Status      | in-progress; corrected Windows build passes, PR 12 promotion pending |
+| Recorded    | 2026-09-30                                                           |
+| Observed in | nim-stackable-hooks at `def2464b2d282c7c1a982689a25953e1d4501f93`    |
+| Area        | `.github/workflows/ci-reprobuild.yml`, Windows toolchain activation  |
 
 ## Observed
 
@@ -108,3 +108,16 @@ raw-syscall exit 127 is recorded separately and remains a failing gate.
 Fetched dev `8f4d806` and agents `0738aa9`; searched current issues and full
 issue history for tool identities, absent Just and the monitored raw-syscall
 failure before extending this record.
+
+At `c8c90e7` the recipe now declares those tools and provisioning defaults;
+`f3a9dc1` adds the independent signal fixture fix. Local extraction at
+`f3a9dc1` reports 46 test actions on macOS, and the cross-target execute edge
+has `toolIdentityRefs = [nim, gcc]` with Nim on its PATH. Both real legacy
+cross-check commands pass locally. PR 12 at `f3a9dc1` is running complete
+CI `36790688338` / `36790688346`.
+
+The old `65720d2` macOS job `110131791732` fails every compile for missing
+`string.h`: its implicit provisioning selected the standalone compiler archive
+without a macOS SDK closure. The Nix default supplies that closure; the local
+full cross-check passes with it. Native Linux and macOS tests both pass at
+`f3a9dc1`; monitored Linux validation remains pending.

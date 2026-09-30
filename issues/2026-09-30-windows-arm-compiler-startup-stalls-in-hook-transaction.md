@@ -30,6 +30,24 @@ gate; preparation's successful compile controls did not fix the separate
 runtime failures. Do not select it for a release solely because a small probe
 passes.
 
+## Production-shaped candidate and host corpus
+
+Candidate `ece47a5` prepares the exact five-byte overwrite or seven-byte
+hotpatch range before peer suspension, restoring each memory region's own
+protection. Distant hotpatch targets use the overwrite range. Windows x64
+C compilation passes with warnings treated as errors except the same
+pre-existing unused `emit_jmp_rel8` warning at parent `78f144a`; Windows Nim
+type checking passes.
+
+Shared `68acdfb`, run `36790224207`, runs the complete unchanged 26-test
+Windows host corpus. x64 passes all 26. The ARM host passes 25, but the
+slow-call fixture's first park returns `epsTimedOut` before any borrowed hook
+initialization. This cannot establish a failure of the new page-preparation
+code in that child. Original/prepared comparison `36790952581` at `a386525`
+is pending. The separate ComSpec architecture assumption now has its own
+issue; no timeout or assertion has been relaxed. No RunQuota pin selects this
+candidate yet, and the complete graph remains required.
+
 ## Observed
 
 [Failure-only trace](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/36695470313)

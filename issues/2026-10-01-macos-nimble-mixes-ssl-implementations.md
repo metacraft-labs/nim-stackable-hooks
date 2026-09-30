@@ -1,11 +1,11 @@
 # macOS Nimble mixes OpenSSL and system LibreSSL before running tests
 
-| | |
-| --- | --- |
-| Status | in-progress; select the dev shell's OpenSSL runtime |
-| Recorded | 2026-10-01 |
-| Observed in | nim-stackable-hooks `5cadd95` and `8f33762` |
-| Area | `flake.nix`, the native macOS `nimble test` environment |
+|             |                                                         |
+| ----------- | ------------------------------------------------------- |
+| Status      | in-progress; select the dev shell's OpenSSL runtime     |
+| Recorded    | 2026-10-01                                              |
+| Observed in | nim-stackable-hooks `5cadd95` and `8f33762`             |
+| Area        | `flake.nix`, the native macOS `nimble test` environment |
 
 ## Observed
 
@@ -44,3 +44,12 @@ Logs: `/tmp/hooks-5cadd-macos-native-tests.log`,
 Nimble: `/nix/store/7lb1xi8xz9d5504d07l0aqn5avndprcn-nimble-0.20.1/bin/nimble`.
 Fetched `agents` and `dev`; searched current issues and issue history for
 Nimble and `libssl.43` before recording. No earlier helper issue found.
+
+## Validation
+
+Native macOS test jobs pass at `78f144a` in run `36788574319` and at
+`f3a9dc1` in run `36790688338`. The latter also passes local
+`repro exec -- just build` and the complete `repro exec -- just test` on
+macOS 26.5.2 with 23 host test executables. Logs are
+`/tmp/hooks-f3-repro-just-build.log` and `/tmp/hooks-f3-repro-just-test.log`.
+The source closure and original Nimble task stay intact; full PR CI is pending.

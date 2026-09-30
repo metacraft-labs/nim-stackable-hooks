@@ -2,6 +2,34 @@
 
 Status: open. Hooks `8f4d806`, io-mon `5e71adf`, RunQuota `8cf662c`.
 
+## Current candidate plan, 2026-10-01
+
+The unchanged ordinary RunQuota `a173baf` retry again finishes 102 of 103
+compilations and fails a GCC child launch with error 1460 (run `36765565687`,
+attempt 2). It has no phase trace, so it does not establish that this new
+failure stopped in `VirtualProtect`. The earlier exact-child phase-130
+observations below remain the evidence for that blocked operation.
+
+Test a production-shaped candidate for the already exercised preparation
+intervention: while the transaction lock is held and peers can still run,
+transition each queued install's actual patch range to writable and back.
+Restore each memory region's own original protection, including a patch that
+crosses a region boundary. Preserve the later suspension, patch bytes,
+instruction-cache flush, original protection transitions during the patch,
+rollback and borrowed-call deadlines. A preparation failure must stop the
+transaction before any hook bytes are written. Do not add initialization
+I/O or diagnostics to the shipping library.
+
+This remains a candidate, not a proven repair. Both earlier prepared full
+graphs compiled successfully, while rebuilt paired controls also passed with
+original protection and therefore did not reproduce the failure. Validate
+the candidate with the existing real Windows transaction, injection, TLS,
+slow-call, propagation and poisoned-child controls on both host architectures,
+then the complete RunQuota `f93855c` graph. Keep ordinary CI and every runtime
+gate; preparation's successful compile controls did not fix the separate
+runtime failures. Do not select it for a release solely because a small probe
+passes.
+
 ## Observed
 
 [Failure-only trace](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/36695470313)

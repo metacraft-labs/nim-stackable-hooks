@@ -32,3 +32,22 @@ for SIGTRAP, raw-syscall exit 127 and monitor interactions; the existing
 recipe comment is the prior record. Observe the exact failing operation and
 process handler state with the same pinned monitor. Preserve the native
 control, assertions and complete test inventory.
+
+## Fixture assumption and repair plan
+
+The C fixture `stackable_test_sigtrap_install_uninstall_smoke` calls
+`stackable_linux_chain_sigtrap(SIGTRAP, NULL, NULL)` and expects
+`TRAP_CHAIN_UNAVAILABLE`. That expectation requires an absent prior handler.
+The monitor installs one, so the fixture instead forwards null signal data
+to an unrelated live handler. This source-level finding explains why the
+native control and monitored run exercise different code paths; a paired
+runtime control is still required to establish the resulting repair.
+
+Give the fixture explicit prior dispositions: test `SIG_DFL` and `SIG_IGN`
+for the unavailable result, and a real installed `SA_SIGINFO` fixture handler
+for successful forwarding of exact signal/context pointers. Verify the
+previous handler is restored after each uninstall, then restore the ambient
+handler on every exit path. Retain duplicate-install rejection, all existing
+live INT3 tests and automatic monitoring. This changes only fixture setup
+and strengthens chaining/restoration assertions; it does not change the
+shipping handler implementation or omit the outer monitor.

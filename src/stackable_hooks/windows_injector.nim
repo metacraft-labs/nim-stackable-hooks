@@ -534,7 +534,8 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
   ## Windows: Spawn `argv` in a CREATE_SUSPENDED state, inject the monitor
   ## shim DLL via CreateRemoteThread+LoadLibraryW, optionally invoke the
   ## shim's `repro_runtime_init` entry point, then resume the main thread.
-  ## Returns when the child process exits.
+  ## Returns when the root child process exits. Captured output already
+  ## buffered then is retained without waiting for descendant pipe writers.
   ##
   ## When ``captureStdio`` is true, the child's stdout+stderr (merged) are
   ## captured into a pipe owned by this proc and drained while waiting
@@ -1065,13 +1066,10 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
     releaseEntryPark(park)
     discard ResumeThread(pi.hThread)
 
-    # 7. Wait for the child to exit. In capture mode we close our write
-    # end first so the read returns EOF when the child closes its end,
-    # then drain in a poll loop alongside the WaitForSingleObject.
+    # 7. Poll root exit while draining bounded snapshots of captured output.
+    # A descendant may inherit stdout and outlive the root, so EOF is not
+    # a completion condition for this API.
     if captureStdio:
-      # Close the parent-side write end. The child still holds its
-      # inheritable copy so PeekNamedPipe / ReadFile on our read end
-      # will keep returning data until the child closes everything.
       if stdoutWritePipe != nil:
         discard CloseHandle(stdoutWritePipe)
         stdoutWritePipe = nil
@@ -1083,50 +1081,34 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
           captureOut = open(captureStdioPath, fmWrite)
         except IOError, OSError:
           captureOut = nil
+
+      template drainAvailableOnce() =
+        block:
+          var remaining: DWORD = 0
+          if PeekNamedPipe(stdoutReadPipe, nil, 0, nil, addr remaining, nil) != 0:
+            # Snapshot once: a concurrent producer must not prevent the next
+            # root-exit check by replenishing the pipe faster than we drain.
+            while remaining > 0:
+              var got: DWORD = 0
+              let wanted = min(DWORD(captureBuf.len), remaining)
+              if ReadFile(stdoutReadPipe, addr captureBuf[0], wanted,
+                          addr got, nil) == 0 or got == 0:
+                break
+              remaining -= got
+              if writeToFile and captureOut != nil:
+                try:
+                  discard captureOut.writeBuffer(addr captureBuf[0], int(got))
+                  captureOut.flushFile()
+                except IOError:
+                  discard
+
       while true:
-        # Drain everything PeekNamedPipe reports as available, then
-        # check process exit. WaitForSingleObject with 50ms timeout
-        # caps the drain latency so we don't spin.
-        while true:
-          var avail: DWORD = 0
-          if PeekNamedPipe(stdoutReadPipe, nil, 0, nil, addr avail, nil) == 0:
-            break
-          if avail == 0:
-            break
-          var got: DWORD = 0
-          if ReadFile(stdoutReadPipe, addr captureBuf[0],
-                      DWORD(captureBuf.len), addr got, nil) == 0:
-            break
-          if got == 0:
-            break
-          if writeToFile and captureOut != nil:
-            try:
-              discard captureOut.writeBuffer(addr captureBuf[0], int(got))
-              captureOut.flushFile()
-            except IOError:
-              discard
-          # If no path was specified we just discard — the goal in
-          # tests is to mimic the engine's "drain to /dev/null" path
-          # (engine keeps the bytes in memory but tests rarely need
-          # them).
-        let waitStatus = WaitForSingleObject(pi.hProcess, 50'u32)
-        if waitStatus == WAIT_OBJECT_0:
+        drainAvailableOnce()
+        if WaitForSingleObject(pi.hProcess, 50'u32) == WAIT_OBJECT_0:
           break
-      # Final drain after exit — anything in the buffer that wasn't
-      # consumed during the 50ms slice.
-      while true:
-        var got: DWORD = 0
-        if ReadFile(stdoutReadPipe, addr captureBuf[0],
-                    DWORD(captureBuf.len), addr got, nil) == 0:
-          break
-        if got == 0:
-          break
-        if writeToFile and captureOut != nil:
-          try:
-            discard captureOut.writeBuffer(addr captureBuf[0], int(got))
-            captureOut.flushFile()
-          except IOError:
-            discard
+      # Retain the final buffered bytes, but never block for a surviving
+      # descendant to write more or close its inherited handle.
+      drainAvailableOnce()
       if writeToFile and captureOut != nil:
         try: captureOut.close()
         except IOError: discard

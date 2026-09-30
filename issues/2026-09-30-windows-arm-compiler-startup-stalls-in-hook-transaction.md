@@ -86,3 +86,26 @@ compilation/link pass locally against hooks `8f4d806` and io-mon `5e71adf`.
 The real ARM-host run is pending. No production patching change is selected.
 
 Refreshed dev `8f4d806` and agents `4fe105e` before extending this record.
+
+## All-thread and image-page comparisons
+
+Extended control `36720862528` at tooling `007dcb4` completes all 32 cases
+on native x64. On ARM, three cases hit the 30-second whole-batch bound near
+rounds 480, 483 and 511 of 512. Each reports phase 1, thread enumeration before
+suspension, including the active-worker control. These are not observations
+of a protection call deadlocking.
+
+Corrected [36722317016](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/36722317016)
+at tooling `0a917c9f1f29f8cad9f8d4161cac191fbe8baaa0` uses 128 rounds per
+batch and additionally exercises a real Kernel32 `GetFileAttributesW` code
+page. It completes all 48 cases on native x64 and all 48 on the ARM host,
+with every log reporting all rounds completed and every exit code zero. The
+comparison spans active/frozen workers, known workers/all other threads,
+private/custom-DLL/system-DLL executable pages, writable protection, cache
+flushing and code-page writes. System-page writes retain the original byte.
+Runtime checks verify the expected page type and executable protection.
+
+These real controls do not reproduce the compiler's hook-transaction stall.
+Keep the full `25c6ec2` trace pending and do not infer a production repair from
+the protection API name or thread suspension alone. Refreshed dev `8f4d806`
+and agents `9ac4b0c` before extending this record.

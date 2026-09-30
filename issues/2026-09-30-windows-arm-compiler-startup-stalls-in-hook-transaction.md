@@ -251,3 +251,23 @@ The parent and failure observer compile and link for Windows x64 against hooks
 `8f4d806` and io-mon `5e71adf`; workflow, Python and PowerShell syntax checks
 also pass at tooling `bec4778`. Runtime results are pending. Refreshed hooks
 dev `8f4d806` and agents `dc52095` before recording this experiment.
+
+Run `36757949371` at `bec4778` passes all 128 native and 128 directly injected
+assemblies, including every child-specific capture assertion. Median outer
+launch times are 0.241 s native and 1.405 s monitored; maxima are 0.754 s and
+2.000 s. The assembler is bootstrap GCC 16.1.0's `as.exe`, hash
+`2987CF23CC11F0790DA8D7C6B8F548B0BF7FEF389DE8996D5A41EB3D0342E48B`.
+The retained failing shim hash remains
+`7C2480628FAF63A8048BDDB3CFD9437096DDEEE1ADC87828BBA36AB462562274`.
+This control still does not reproduce the full compiler stall.
+
+There is another real boundary to test: compiler children are launched through
+an already-installed CreateProcess hook. Tooling `1090ee8` adds 128 assemblies
+whose parent first receives the retained shim and then uses ordinary
+`startProcess` to launch the assembler. The child's injection therefore goes
+through shim propagation. Its actual pid is recorded, and the same three
+capture assertions must belong to that assembler, not its parent. Direct and
+native controls remain. The Windows parent compiles and links against the same
+pinned sources. Run `36758986422` supplies the runtime comparison; the complete
+all-range graph remains active. Evidence for the completed direct control is
+`/tmp/windows-borrowed-assembler-bec-evidence`.

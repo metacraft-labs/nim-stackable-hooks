@@ -92,6 +92,10 @@ import ct_test_nim_unittest
 include "tests/corpus.nim"
 
 package stackable_hooks:
+  # `repro exec -- just test` must activate the same complete toolchain as
+  # the graph. Windows provisions archives; the POSIX hosts use Nix.
+  defaultToolProvisioning(when defined(windows): tarball else: nix)
+
   uses:
     # Toolchain floor — the PATH-resolvable binaries the build needs.
     # ``nim`` compiles every test binary (the ``buildNimUnittest.build``
@@ -103,6 +107,9 @@ package stackable_hooks:
     # resolver under ``nix develop``.
     "nim >=2.2 <3.0"
     "gcc >=12"
+    "just >=1"
+    "nimble"
+    "sh"
 
   # Library declaration — the ``src/`` tree ``config.nims`` puts on
   # ``--path`` is importable when this package is consumed via
@@ -150,6 +157,9 @@ package stackable_hooks:
       let executeEdge = edge.testBinary.run(
         actionId = "stackable_hooks.test_execute." & stem,
         registerImplicitName = false)
+      # The cross-target matrix and process-injection fixtures invoke the
+      # compiler at runtime. A BUILD edge's tools are not inherited by RUN.
+      appendRegisteredActionToolIdentityRefs(executeEdge.id, ["nim", "gcc"])
       executeActions.add(executeEdge)
 
     # One pair per corpus entry whose ``targets`` cover this host OS. The

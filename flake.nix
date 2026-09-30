@@ -53,16 +53,24 @@
             '';
           };
 
-          devShells.default = pkgs.mkShell {
-            inputsFrom = [ config.pre-commit.devShell ];
-            packages = [
-              pkgs.just
-              pkgs.nim2
-              pkgs.nimble
-              pkgs.git
-              pkgs.nixfmt
-            ];
-          };
+          devShells.default = pkgs.mkShell (
+            {
+              inputsFrom = [ config.pre-commit.devShell ];
+              packages = [
+                pkgs.just
+                pkgs.nim2
+                pkgs.nimble
+                pkgs.git
+                pkgs.nixfmt
+              ];
+            }
+            // pkgs.lib.optionalAttrs pkgs.stdenv.isDarwin {
+              # Nimble links OpenSSL but also loads SSL symbols dynamically.
+              # Keep both paths on the same implementation instead of Apple's
+              # incompatible LibreSSL, which crashes before the test task runs.
+              DYLD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ pkgs.openssl ];
+            }
+          );
         };
     };
 }

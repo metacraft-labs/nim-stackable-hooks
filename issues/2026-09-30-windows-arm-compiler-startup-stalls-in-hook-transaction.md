@@ -158,3 +158,26 @@ workflow lint pass. No production repair is inferred from the API-only controls.
 Artifacts: `/tmp/windows-protection-116-evidence` and
 `/tmp/windows-protection-7f-evidence`. Refreshed dev `8f4d806` and agents
 `12f8a82` before extending the record.
+
+## Actual installer and full-shim controls
+
+Actual-installer run `36736842930` at tooling `7c6167c` passes all 64 cases
+per host: 32 original and 32 prepared. Every log confirms a real intercepted
+call and successful restoration. Direct initialization of the exact retained
+shim in `36737795232`, tooling `9aac12d`, also passes all 64 cases per host.
+Every process reports `actual-shim-init=0`, performs a real file call, and exits
+normally. Its SHA-256 is
+`7c2480628faf63a8048bddb3cfd9437096ddeee1adc87828bba36ab462562274`,
+verified before use. Neither control reproduces borrowed initialization in
+the full compiler workload. Evidence is in `/tmp/windows-createfile-hook-7c-evidence`
+and `/tmp/windows-full-shim-9aa-evidence`.
+
+Tooling `5383510` compares the protection preparation in the complete ARM
+compiler graph at the original source revisions. Under the existing registry
+lock, it makes exactly the queued `CreateFileW` target writable and restores
+its original protection before the ordinary suspension. No instruction bytes
+change during preparation. Ordinary patching, suspension, instruction-cache
+flushing, hard deadlines and all tests remain. Failure traces include the
+successfully prepared target address. Exact-source transformation, Windows
+C compilation/link and workflow lint pass. This remains an experiment;
+production hook code is unchanged.

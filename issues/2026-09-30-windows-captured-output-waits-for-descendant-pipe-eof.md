@@ -45,3 +45,24 @@ The ARM hook-initialization stall is separately recorded in
 `2026-09-30-windows-arm-compiler-startup-stalls-in-hook-transaction.md`.
 This capture hypothesis does not explain its phase-130 traces and is not yet
 attributed as the cause of any RunQuota timeout.
+
+## Real reproduction and repair
+
+Control `36763019382` at tooling `f68d8cc` compares real processes on Windows
+x64 and the ARM host. Original hooks `8f4d806` fails the specific descendant-EOF
+assertion twice per host: root exit is 17 and `descendant-exited=true`.
+The repair at `b7a1cdd` passes twice per host, preserves all stdout/stderr bytes,
+returns 17 and reports `descendant-exited=false`. Each fixture bounds its
+surviving child and releases it during cleanup; no process or pipe mocks are used.
+
+At `b7a1cdd`, `just build`, lane registration and all 102 declared cross-target
+compilation checks pass. The regression compiles/links for Windows x64 and
+passes the ARM64 source check. Isolated PR 12 at `def2464` has the same runtime
+sources and tests; it also carries the previously validated TLS fixture repair.
+The ordinary Windows injection suite passes there. Mainline promotion is
+pending ordinary CI, whose Windows Reprobuild lane currently fails with the
+unprovisioned compiler rather than reaching tests.
+
+Evidence: `/tmp/windows-injector-capture-f68-x64` and
+`/tmp/windows-injector-capture-f68-arm`.
+PR: <https://github.com/metacraft-labs/nim-stackable-hooks/pull/12>.

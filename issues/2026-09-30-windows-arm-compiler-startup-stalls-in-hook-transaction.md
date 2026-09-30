@@ -298,3 +298,29 @@ An original failure must not prevent the prepared variant from running.
 The full all-range graph `36753037680` at `8fd4eff` remains active and is still
 required for final validation. Refreshed dev `8f4d806` and agents `af0134b`
 before recording this result; production hook code remains unchanged.
+
+## Paired rebuilt shims at `76bb59b`
+
+Run `36762174882` at tooling `76bb59b` passes both rebuilt variants:
+each completes 128 native, 512 directly monitored and 512 propagated assemblies,
+including the child-specific output and capture assertions. The original does
+not reproduce in this run, so prepared success does not establish a repair.
+Original DLL SHA-256 is
+`1D3287A2C567EA2FDEA0806201449F85E46C6D7A94635BC89435F94DC6B38DB9`;
+prepared is `C006FFA8B28BA80C3189C5F3F6FD27151D88E5C55254D3BB1DA957BF0849D798`.
+Evidence: `/tmp/windows-hook-page-preparation-76b`.
+
+That comparison pinned queue `5a8e43b` and gset `cf0adf2` from the earlier
+io-mon release lock. The full bootstrap instead clones their development
+branches. In particular, the later gset has a Windows platform implementation
+absent from that old pin. The next paired run selects queue `02f442a` and
+gset `1caac0e`, whose current dev tips were fetched and inspected. It still
+rebuilds both variants and records the exact source pins; neither rebuilt
+original is claimed to be byte-identical to the retained failing DLL.
+
+The complete current-candidate graph `36763970172` at tooling `f5a3d99`
+uses RunQuota `33add18` and hook sources `def2464` selected by the merged
+exact-hook bootstrap input. The hook runtime has the separately proven
+root-exit capture repair from `b7a1cdd`; all-range preparation remains a
+disposable diagnostic change. It keeps the full build/test graph and existing
+deadlines. The earlier `8fd4eff` graph against RunQuota `8cf662c` remains active.

@@ -368,3 +368,13 @@ Evidence is `/tmp/windows-arm-prepared-all-8fd-evidence`. The current-source
 comparison `36763970172` at `f5a3d99` remains active with RunQuota `33add18`
 and the separately validated root-exit capture repair at hooks `def2464`.
 The release candidate `a173baf` still uses original hook protection.
+
+The current-source run `36763970172` at `f5a3d99` also completes: all 103
+build actions pass, followed by 93 successful, 88 up-to-date, 14 failed and
+eight blocked test actions. The failures return 124 (nine), 137 (two) and
+1 (three), including daemon communication, SQLite spawn, publication,
+retention and export/merge. No phase-130 trace accompanies them. Evidence is
+`/tmp/windows-arm-prepared-f5-evidence`; RunQuota issue update `e8cac50`
+records the execution results and the focused comparison. This supplies a
+second complete compilation with prepared pages, but no passing complete
+release gate and no controlled reproduction establishing the repair.

@@ -84,3 +84,27 @@ Full CI is pending. Logs: `/tmp/hooks-5cadd-linux-repro.log`,
 `/tmp/hooks-5cadd-macos-repro.log`,
 `/tmp/hooks-5cadd-linux-native-repro.log`. These setup/launcher failures are
 independent of the repaired Windows root-exit capture behavior.
+
+## Declared tools missing from test execution and legacy cross-checks
+
+At `65720d2`, run `36787321087`, both Linux jobs compile the corpus but
+`test_cross_target_compile` cannot find `nim` on its execution PATH. The
+package declares Nim for compilation; the binary's execute edge does not
+name that runtime tool dependency. Windows x64 passes all 52 monitored
+actions and then `dev-exec just build` fails because `just` is not declared.
+The same cross-check failure appears at `bbbaee7` and `5cadd95`.
+At `8f33762`, legacy Linux job `110132305154` rejects implicit provisioning
+before running tests because the package sets no default provisioning mode.
+
+Repair the recipe's environment contract: select the established Nix default
+on POSIX and tarball default on Windows, declare Just, Nimble and its shell,
+and attach Nim/compiler tool identities to test execution edges that spawn
+compilers. Keep every corpus entry, assertion and monitor policy. Validate
+recipe extraction and the actual existing cross-check commands, then full CI.
+This follows `repro.nim`'s explicit runtime-compiler requirement and the
+shared typed-tool execution contract used by RunQuota. The distinct Linux
+raw-syscall exit 127 is recorded separately and remains a failing gate.
+
+Fetched dev `8f4d806` and agents `0738aa9`; searched current issues and full
+issue history for tool identities, absent Just and the monitored raw-syscall
+failure before extending this record.

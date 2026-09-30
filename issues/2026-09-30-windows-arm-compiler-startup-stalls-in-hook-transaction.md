@@ -201,3 +201,30 @@ Retained failure reports: `/tmp/runquota-48bb-arm-evidence` and
 `/tmp/io-mon-c01-arm-failure`. Refreshed hooks dev `8f4d806` and agents
 `2c9f0f8` before extending this existing investigation. Prepared full graph
 `36738909519` at tooling `5383510` is still running.
+
+## Prepared CreateFileW moves the observed failure to a different page
+
+Full controlled run `36738909519` at tooling `5383510` completes 98 of 100
+compilations. Two assembler children expire with the same reason 2 and phase
+130, but the patch target is now exactly `Ws2_32!connect` at module offset
+`0x2bd0`, with `PAGE_EXECUTE_WRITECOPY` protection. Both traces also record the
+successfully prepared `Kernel32!CreateFileW` target. The stopped main thread
+is again at `ntdll+0x176784`; two or three peers are frozen. The affected
+programs are `t_extension_rows_do_not_query_the_registry` and
+`t_observation_store_round_trip`. The test stage does not run.
+
+This is evidence against treating the failure as specific to CreateFileW.
+It supports comparing protection preparation for every queued install range
+while peers remain active. Tooling `8fd4eff` does that under the existing
+registry lock, including the upstream padding of a detected hotpatch. Each
+range has its original protection restored before ordinary thread suspension;
+no instruction bytes change during preparation. The diagnostic exports the
+number of prepared ranges and refuses an unexpected hook source revision.
+All patch writes, restoration, cache flushes, tests and hard deadlines remain.
+This is still an experiment, not a production repair.
+
+Exact-source transformation and Windows C compilation/link pass against hooks
+`8f4d806` with the all-range intervention. The earlier single-range DLL has
+SHA-256 `A2B62B00CACD9BADBC14DFC19AD1FEB520AF48687CF7FA0A9127A9F257658CE6`;
+its artifact is `/tmp/windows-arm-prepared-538-evidence`. Refreshed hooks dev
+`8f4d806` and agents `6be90c1` before extending this record.

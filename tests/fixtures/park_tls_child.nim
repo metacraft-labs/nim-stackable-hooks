@@ -1,35 +1,12 @@
-## Child fixture for ``tests/test_windows_entry_park_thread_locals.nim``.
+## Real child of the entry-parking fixture. Exit codes identify the failing
+## property: 3 = no DLL/exports, 4 = wrong initializing thread, 5 = broken
+## thread-local state or worker lifecycle, 6 = failed container growth.
 ##
-## An ordinary console program. By the time ``main`` runs, the test has
-## already injected ``park_tls_lib.dll`` into it -- either by borrowing this
-## very thread (the technique under test) or with a remote thread (the
-## control). Everything below is measured ON THE MAIN THREAD, because that
-## is the thread that matters: it is the one that runs the whole program and
-## outlives every helper.
-##
-## Exit codes are distinct so a failure says WHICH half broke:
-##
-##   0  every check passed
-##   3  the fixture DLL is not mapped, or its exports are missing -- nothing
-##      was injected, so the run proves nothing either way and must not be
-##      read as a pass on either arm
-##   4  the DLL's module initialisation ran on some OTHER thread. Its
-##      process-global container is therefore owned by a `MemRegion` that
-##      belongs to a thread this process does not control and may already
-##      have destroyed; every later free of it from here is a use-after-free
-##      whose visibility is a matter of heap layout
-##   5  this thread's copy of the DLL's threadvar sits at a different offset
-##      from the module's TLS block than a thread created after the
-##      injection sees, i.e. this thread's `_tls_index` slot does not point
-##      at this module's block
-##   6  the container the DLL allocated at init did not survive being grown
-##      from here
-##
-## A crash (0xC0000005, or Nim's SIGSEGV handler turning it into 1) is
-## another way to fail, and the test accepts it on the control arm for the
-## same reason: it means the main thread could not safely use the DLL.
+## Native TLS and GCC emulated TLS both satisfy the value/address isolation
+## contract. Neither requires assumptions about offsets in Windows' TEB.
 
 import std/os
+import ./park_tls_values
 
 when not defined(windows):
   {.error: "park_tls_child is a Windows fixture".}
@@ -60,15 +37,18 @@ proc toWide(s: string): seq[uint16] =
   result[s.len] = 0'u16
 
 var
-  offsetProc {.global.}: proc(): uint {.cdecl.}
-  freshOffset {.global.}: uint
+  addressProc {.global.}: proc(): uint {.cdecl.}
+  readProc {.global.}: proc(): int {.cdecl.}
+  writeProc {.global.}: proc(value: int) {.cdecl.}
+  freshAddress {.global.}: uint
+  freshInitial, freshStored {.global.}: int
 
 proc freshThreadMain(p: pointer): DWORD {.stdcall.} =
-  ## A thread created AFTER the injection. The loader provisions those
-  ## correctly whatever technique was used, so its offset is the reference
-  ## the main thread is compared against.
   discard p
-  freshOffset = offsetProc()
+  freshAddress = addressProc()
+  freshInitial = readProc()
+  writeProc(FreshProbeValue)
+  freshStored = readProc()
   0
 
 when isMainModule:
@@ -79,9 +59,12 @@ when isMainModule:
     quit(3)
 
   let initTidSym = GetProcAddress(h, "park_tls_init_tid")
-  let offsetSym = GetProcAddress(h, "park_tls_offset")
+  let addressSym = GetProcAddress(h, "park_tls_probe_address")
+  let readSym = GetProcAddress(h, "park_tls_probe_read")
+  let writeSym = GetProcAddress(h, "park_tls_probe_write")
   let growSym = GetProcAddress(h, "park_tls_grow")
-  if initTidSym == nil or offsetSym == nil or growSym == nil:
+  if initTidSym == nil or addressSym == nil or readSym == nil or
+      writeSym == nil or growSym == nil:
     quit(3)
 
   # Reached the DLL and its exports, so the run is meaningful whatever
@@ -97,15 +80,23 @@ when isMainModule:
   if initTid != GetCurrentThreadId():
     quit(4)
 
-  offsetProc = cast[proc(): uint {.cdecl.}](offsetSym)
-  let mainOffset = offsetProc()
+  addressProc = cast[proc(): uint {.cdecl.}](addressSym)
+  readProc = cast[proc(): int {.cdecl.}](readSym)
+  writeProc = cast[proc(value: int) {.cdecl.}](writeSym)
+  let mainAddress = addressProc()
+  if mainAddress == 0 or readProc() != InitialProbeValue:
+    quit(5)
+  writeProc(MainProbeValue)
   var tid: DWORD = 0
   let t = CreateThread(nil, 0, freshThreadMain, nil, 0, addr tid)
-  if t != nil:
-    discard WaitForSingleObject(t, 30_000'u32)
-    discard CloseHandle(t)
-    if mainOffset != freshOffset:
-      quit(5)
+  if t == nil:
+    quit(5)
+  let waited = WaitForSingleObject(t, 30_000'u32)
+  discard CloseHandle(t)
+  if waited != 0 or freshAddress == 0 or freshAddress == mainAddress or
+      freshInitial != 0 or freshStored != FreshProbeValue or
+      addressProc() != mainAddress or readProc() != MainProbeValue:
+    quit(5)
 
   # 300 distinct keys rehash the table repeatedly; the first rehash frees
   # the array the DLL allocated in its module body.

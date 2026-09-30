@@ -2,7 +2,7 @@
 
 | | |
 | --- | --- |
-| Status | open; real-process regression being prepared |
+| Status | in-progress; validated repair awaits PR 12 promotion |
 | Recorded | 2026-09-30 |
 | Observed in | nim-stackable-hooks at `8f4d806ce1ae58e6b4292fed92944171eff4f7a2` |
 | Area | `runWithMonitorShim`, captured stdout/stderr |
@@ -13,8 +13,8 @@ Source inspection at `8f4d806` finds a blocking `ReadFile` loop after
 `WaitForSingleObject(pi.hProcess, ...)` reports root exit. The final loop reads
 until EOF without first checking available bytes. A descendant may still own
 an inherited writer. In that case root exit does not imply pipe EOF, and the
-read can wait for the descendant. This is a source-level defect hypothesis;
-a real child/grandchild reproduction is required before claiming a runtime fix.
+read can wait for the descendant. The real child/grandchild comparison below
+reproduces this behavior on both Windows hosts and verifies the repair.
 The earlier polling drain can also postpone checking root exit indefinitely
 if a writer continuously replenishes the pipe.
 
@@ -43,7 +43,7 @@ No existing issue records this capture-path defect.
 
 The ARM hook-initialization stall is separately recorded in
 `2026-09-30-windows-arm-compiler-startup-stalls-in-hook-transaction.md`.
-This capture hypothesis does not explain its phase-130 traces and is not yet
+This capture defect does not explain its phase-130 traces and is not yet
 attributed as the cause of any RunQuota timeout.
 
 ## Real reproduction and repair
@@ -60,8 +60,10 @@ compilation checks pass. The regression compiles/links for Windows x64 and
 passes the ARM64 source check. Isolated PR 12 at `def2464` has the same runtime
 sources and tests; it also carries the previously validated TLS fixture repair.
 The ordinary Windows injection suite passes there. Mainline promotion is
-pending ordinary CI, whose Windows Reprobuild lane currently fails with the
-unprovisioned compiler rather than reaching tests.
+pending ordinary CI. At `def2464`, its Windows Reprobuild lane fails with the
+unprovisioned compiler before reaching tests. PR commit `3554385` activates
+the pinned source-bootstrap toolchain; its ordinary checks are active and its
+native Windows injection suite passes. Runtime sources remain unchanged.
 
 Evidence: `/tmp/windows-injector-capture-f68-x64` and
 `/tmp/windows-injector-capture-f68-arm`.

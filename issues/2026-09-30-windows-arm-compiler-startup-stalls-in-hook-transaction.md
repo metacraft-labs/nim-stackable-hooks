@@ -338,3 +338,13 @@ parents instead of eight, recording the host's processor count and physical
 memory. Sample counts, assembly/capture assertions and all production deadlines
 are unchanged. This is a load comparison to look for the intermittent stall;
 only the same phase-130 failure would tie its result to the compiler defect.
+
+That load comparison, run `36766673957` at `c6d33db`, also passes both
+variants: each completes 128 native, 512 direct and 512 propagated children
+with no failed outcome. The host reports four logical processors and
+17,169,428,480 bytes of physical memory. The original DLL hash is
+`732EB2DBA40BFBA6343C7724FFC017DE622AD42C6B26D79832E727E577E110D5`;
+prepared is `8049FFFD014E4F9D8A79E182B3F2D8000533F35D35DD97E27AF6449E945CAF3D`.
+Evidence is `/tmp/windows-hook-page-preparation-c6d`. Increasing parent
+concurrency did not reproduce the defect, so it supplies no causal evidence
+for the experimental repair. The complete candidate graph remains pending.

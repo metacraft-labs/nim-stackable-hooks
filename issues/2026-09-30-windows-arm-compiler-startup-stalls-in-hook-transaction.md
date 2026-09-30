@@ -109,3 +109,27 @@ These real controls do not reproduce the compiler's hook-transaction stall.
 Keep the full `25c6ec2` trace pending and do not infer a production repair from
 the protection API name or thread suspension alone. Refreshed dev `8f4d806`
 and agents `9ac4b0c` before extending this record.
+
+## Exact target and frozen threads at `25c6ec2`
+
+Full diagnostic `36720335981` finishes with 95 successful and five failed
+compilations against hooks `8f4d806`, io-mon `5e71adf` and RunQuota `8cf662c`.
+Every failure records phase 130, immediately before the writable protection
+call, with the exact target `Kernel32!CreateFileW` (module offset `0xf32f0`,
+protection `PAGE_EXECUTE_WRITECOPY`). GCC, cc1 and assembler children are
+represented. All stopped main threads are at `ntdll+0x176784` and retain the
+entry park; three or four peers are frozen. Their recorded instruction
+pointers are `ntdll+0x176874`, `+0x16d1a4`, `+0x16d824`, or `+0x19e408`.
+The runtime unwind returns only its initial frame. Executable stack candidates
+remain separate and do not identify the synchronization owner.
+
+The earlier standalone control targets `GetFileAttributesW` and changes its
+protection once before suspending peers. It therefore does not exercise the
+first protection change on the exact failing target. Compare fresh processes
+at `CreateFileW` with active peers, suspended peers before the first protection
+change, and a protection change prepared while peers remain active. Preserve
+patch-write suspension and the production hard deadline. This is a diagnostic
+comparison, not an established production repair.
+
+Evidence: `/tmp/windows-arm-trace25-evidence`. Refreshed dev `8f4d806` and
+agents `8601e4b`; the same issue owns the repeated observation.

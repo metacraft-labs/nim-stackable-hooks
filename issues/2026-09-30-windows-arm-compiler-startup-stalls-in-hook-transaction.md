@@ -324,3 +324,17 @@ exact-hook bootstrap input. The hook runtime has the separately proven
 root-exit capture repair from `b7a1cdd`; all-range preparation remains a
 disposable diagnostic change. It keeps the full build/test graph and existing
 deadlines. The earlier `8fd4eff` graph against RunQuota `8cf662c` remains active.
+
+The updated-source comparison `36764449507` at tooling `8272646` also passes
+both variants: each completes 128 native, 512 direct and 512 propagated
+assemblies with no failed outcome. The original DLL hash is
+`5BC0D52D88DB49ADEFCBBE105A3AB6507CD6DD3B1D1737A7CFC2FCBB7B032BE4`;
+prepared is `8D3191C180D238E1A5065DB0C7D743A41267B1FFEFFF0CEB3B396838864513CF`.
+Evidence is `/tmp/windows-hook-page-preparation-827`. This remains a negative
+control for the intermittent defect, not proof of a preparation repair.
+
+Tooling `c6d33db` repeats the same current-source pair with 32 concurrent real
+parents instead of eight, recording the host's processor count and physical
+memory. Sample counts, assembly/capture assertions and all production deadlines
+are unchanged. This is a load comparison to look for the intermittent stall;
+only the same phase-130 failure would tie its result to the compiler defect.

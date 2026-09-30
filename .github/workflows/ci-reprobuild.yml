@@ -15,6 +15,9 @@ name: CI (reprobuild)
 # host without any other repo-side change.
 
 on:
+  workflow_dispatch:
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [main, dev, stable]
   pull_request:
@@ -29,7 +32,35 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Shared public-repository routing with the existing self-hosted fallback.
+  # Owner: zah. Follow-up: metacraft-specs/issues/
+  # 2026-10-01-macos-ephemeral-runners-lose-job-communication.md
+  choose-linux:
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@cd73eba732b9190499ec78e1e65b0dd784507440
+    with:
+      preferred: ubuntu-24.04
+      fallback: '["self-hosted","linux","x64"]'
+
+  choose-macos:
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@cd73eba732b9190499ec78e1e65b0dd784507440
+    with:
+      preferred: macos-26
+      fallback: '["self-hosted","macos","arm64"]'
+
+  choose-windows:
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@cd73eba732b9190499ec78e1e65b0dd784507440
+    with:
+      preferred: windows-2025
+      fallback: '["self-hosted","windows","x64"]'
+
+  choose-windows-arm:
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@cd73eba732b9190499ec78e1e65b0dd784507440
+    with:
+      preferred: windows-11-arm
+      fallback: '["self-hosted","windows","arm64"]'
+
   reprobuild:
+    needs: [choose-linux, choose-macos, choose-windows, choose-windows-arm]
     name: ${{ matrix.os }}-${{ matrix.arch }} — repro build/test
     strategy:
       fail-fast: false
@@ -50,7 +81,10 @@ jobs:
           - os: windows
             arch: arm64
             runner: [self-hosted, windows, arm64]
-    runs-on: ${{ matrix.runner }}
+    # Native Linux ARM64 keeps the existing release-migration route.
+    # Owner: zah. See metacraft-specs/issues/
+    # 2026-09-28-release-linux-arm64-runner-migration.md.
+    runs-on: ${{ matrix.os == 'windows' && matrix.arch == 'arm64' && fromJSON(needs.choose-windows-arm.outputs.runs_on) || matrix.os == 'windows' && fromJSON(needs.choose-windows.outputs.runs_on) || matrix.os == 'macos' && fromJSON(needs.choose-macos.outputs.runs_on) || matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || fromJSON(needs.choose-linux.outputs.runs_on) }}
     env:
       # The ARM host exercises x64 injection through Windows emulation.
       # Native ARM64 source coverage remains in the cross-target matrix.

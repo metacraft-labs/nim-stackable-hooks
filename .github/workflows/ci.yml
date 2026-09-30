@@ -1,6 +1,9 @@
 name: CI
 
 on:
+  workflow_dispatch:
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [main, dev, stable, io-mon-fixes]
   pull_request:
@@ -18,9 +21,25 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Shared public-repository routing with the existing self-hosted fallback.
+  # Owner: zah. Follow-up: metacraft-specs/issues/
+  # 2026-10-01-macos-ephemeral-runners-lose-job-communication.md
+  choose-linux:
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@cd73eba732b9190499ec78e1e65b0dd784507440
+    with:
+      preferred: ubuntu-24.04
+      fallback: '["self-hosted","linux","x64"]'
+
+  choose-macos:
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@cd73eba732b9190499ec78e1e65b0dd784507440
+    with:
+      preferred: macos-26
+      fallback: '["self-hosted","macos","arm64"]'
+
   lint:
+    needs: [choose-linux]
     name: Lint
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ${{ fromJSON(needs.choose-linux.outputs.runs_on) }}
     steps:
       - name: Generate CI token
         id: app-token
@@ -56,8 +75,9 @@ jobs:
           retention-days: 30
 
   build:
+    needs: [choose-linux, choose-macos]
     name: Build
-    runs-on: ${{ matrix.runs-on }}
+    runs-on: ${{ contains(matrix.runs-on, 'macos') && fromJSON(needs.choose-macos.outputs.runs_on) || fromJSON(needs.choose-linux.outputs.runs_on) }}
     strategy:
       fail-fast: false
       matrix:
@@ -100,8 +120,9 @@ jobs:
           retention-days: 30
 
   test:
+    needs: [choose-linux, choose-macos]
     name: Test
-    runs-on: ${{ matrix.runs-on }}
+    runs-on: ${{ contains(matrix.runs-on, 'macos') && fromJSON(needs.choose-macos.outputs.runs_on) || fromJSON(needs.choose-linux.outputs.runs_on) }}
     strategy:
       fail-fast: false
       matrix:

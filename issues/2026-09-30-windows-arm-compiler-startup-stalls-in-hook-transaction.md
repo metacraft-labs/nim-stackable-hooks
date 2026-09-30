@@ -39,3 +39,26 @@ Fetched dev `8f4d806` and agents `e995df7`; dev is already an ancestor.
 Searched current issues and their complete history for transaction, suspension
 and deadlock reports. The existing running-context and lock-readiness issues
 cover distinct defects; neither has been shown to cause this stalled commit.
+
+## Protection-call checkpoint at `5c332cc`
+
+Finer diagnostic [36706329422](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/36706329422)
+at shared actions `5c332cc55f8ad8222ad0a49c8e3ca2e72319405f` completes
+99 of 100 monitored compilations against hooks `8f4d806` and io-mon
+`5e71adf`. The assembler for `t_observation_extension_write_path` expires
+with borrowed-call reason 2 and `init-phase=130`: immediately before the
+first `VirtualProtect(..., PAGE_EXECUTE_READWRITE, ...)` in `write_patch`.
+Checkpoint 131, immediately after that call, is not reached. The transaction
+has already suspended its other threads. The main instruction pointer is
+again `ntdll+0x176784`, and the child entry remains `EB FE`. The report's
+executable-address scan still is not an unwound stack and does not identify
+a lock owner. No missing compiler or timeout adjustment explains this result.
+
+This narrows the stopped operation; it does not yet prove which suspended
+thread or lock prevents completion. Compare real protection/cache-flush
+calls with active and suspended protection workers on native Windows x64
+and the ARM host before choosing a repair. Keep protected patch writes,
+cache coherency, complete capture, and the existing poison/deadline rules.
+Microsoft's [SuspendThread contract](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-suspendthread)
+warns of deadlock when a suspended thread owns a synchronization object.
+Refreshed dev `8f4d806` and agents `71f2aae` before extending this record.

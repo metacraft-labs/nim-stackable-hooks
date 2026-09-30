@@ -51,6 +51,10 @@ jobs:
             arch: arm64
             runner: [self-hosted, windows, arm64]
     runs-on: ${{ matrix.runner }}
+    env:
+      # The ARM host exercises x64 injection through Windows emulation.
+      # Native ARM64 source coverage remains in the cross-target matrix.
+      WINDOWS_DIY_ARCH_OVERRIDE: x64
     steps:
       - uses: actions/checkout@v4
 
@@ -75,9 +79,16 @@ jobs:
         # setup-dev-env clones the siblings listed in .github/sibling-repos
         # (codetracer-trace-format, codetracer-trace-format-nim) at the
         # workspace-lock-pinned revisions before materialising the env.
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@41d0680bd78ca59ad110a261a20bcaa93a38fffd
         with:
           env-flavor: reprobuild
+          # Source bootstrap activates its hash-verified Nim/GCC toolchain.
+          # The ambient Windows gcc cannot compile even the CRT headers.
+          repro-from-source: ${{ matrix.os == 'windows' }}
+          repro-build-pin: c14b1e618d7c4b64476d89792e80b8e8f10b8a52
+          repro-runquota-pin: 292e578d57eb85d6037f9e2d3a03f0bcb0489dbb
+          repro-io-mon-pin: 5e71adf033b860c0fdbe13dda4320cf4a580f632
+          repro-stackable-hooks-pin: def2464b2d282c7c1a982689a25953e1d4501f93
           gh-token: ${{ steps.ci_token.outputs.token }}
 
       - name: repro build

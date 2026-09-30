@@ -674,6 +674,37 @@ int ct_inline_hook_abort_transaction(void)
 static int install_locked(void *target, void *hook, void **out_trampoline);
 static int uninstall_locked(void *target);
 
+/* Exercise the code-page protection transition while peer threads can run.
+ * Windows x64 emulation has stalled on the first writable transition to an
+ * image page after peers were suspended. No patch bytes are written here;
+ * the ordinary protected write still happens inside the frozen transaction.
+ * VirtualProtect reports only the first page's old protection, so split at
+ * VirtualQuery region boundaries before restoring the original protection. */
+static int prepare_patch_range(uint8_t *from, size_t len)
+{
+    uintptr_t cursor = (uintptr_t)from;
+    if (len == 0 || cursor > UINTPTR_MAX - len) return -1;
+    const uintptr_t end = cursor + len;
+    while (cursor < end) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery((void *)cursor, &mbi, sizeof(mbi)) == 0 ||
+            mbi.State != MEM_COMMIT)
+            return -1;
+        const uintptr_t base = (uintptr_t)mbi.BaseAddress;
+        if (mbi.RegionSize > UINTPTR_MAX - base) return -1;
+        const uintptr_t region_end = base + mbi.RegionSize;
+        if (cursor < base || cursor >= region_end) return -1;
+        const size_t span = (size_t)((end < region_end ? end : region_end) - cursor);
+        DWORD old_prot, ignored;
+        if (!VirtualProtect((void *)cursor, span, PAGE_EXECUTE_READWRITE, &old_prot))
+            return -1;
+        if (!VirtualProtect((void *)cursor, span, old_prot, &ignored))
+            return -1;
+        cursor += span;
+    }
+    return 0;
+}
+
 int ct_inline_hook_commit_transaction(void)
 {
     ensure_cs_initialised();
@@ -681,6 +712,29 @@ int ct_inline_hook_commit_transaction(void)
     if (!g_txn.active || g_txn.owner_tid != GetCurrentThreadId()) {
         LeaveCriticalSection(&g_hooks_cs);
         return -1;
+    }
+
+    for (size_t i = 0; i < g_txn.count; i++) {
+        const ct_queued_op_t *op = &g_txn.ops[i];
+        if (op->kind != 0 || op->target == NULL || op->hook == NULL ||
+            find_hook(op->target) != NULL)
+            continue;
+        uint8_t *from = (uint8_t *)op->target;
+        size_t len = 5;
+        /* A distant hook falls back from hotpatch to a five-byte overwrite. */
+        const int64_t hotpatch_disp = (int64_t)(uintptr_t)op->hook -
+                                     (int64_t)(uintptr_t)from;
+        if (detect_hotpatch(from) && hotpatch_disp >= (int64_t)INT32_MIN &&
+            hotpatch_disp <= (int64_t)INT32_MAX) {
+            from -= 5;
+            len = 7;
+        }
+        if (prepare_patch_range(from, len) != 0) {
+            g_txn.active = 0;
+            g_txn.count = 0;
+            LeaveCriticalSection(&g_hooks_cs);
+            return -7;
+        }
     }
 
     /* Suspend other threads once for the whole batch (atomic

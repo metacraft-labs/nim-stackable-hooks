@@ -66,7 +66,19 @@ x64 job `109815014368` with all 100 compilations passing. Two of the 98 test
 programs fail: `t_observation_socket_write_path` sees one dropped row where it
 expects at least two, and `t_stats_table_publication` does not observe the key
 within ten seconds. The remaining test graph records 93 successful, 95 cached,
-two failed and eight blocked actions. Its ARM-host job is still running as of
-2026-09-30 10:05 UTC. These failures do not establish a regression caused by
+two failed and eight blocked actions. These failures do not establish a regression caused by
 balanced parking; the same complete graph has no original-parking comparison
 in this run. The change remains diagnostic only.
+
+The ARM-host job `109815014096` finishes on 2026-09-30 with 99 successful
+compilations and one failure in `t_stats_table_concurrency`; tests never run.
+The existing `as.exe` child stalls during the borrowed shim-init call, with
+its stopped IP in `ntdll.dll` at offset `176784`, exactly the offset observed
+with original parking in `36682315614`. Balanced sampling has not eliminated
+the compiler-startup defect. Do not select it as that defect's repair.
+
+The retained `hooks-sha.txt` in both full-graph artifacts records `8f4d806`,
+whose runtime source is identical to `72f5782` (only CI workflows differ).
+The earlier references to disposable `72f5782` describe that source equality;
+the actual full-graph checkout was `8f4d806`. The separate short TLS baseline
+control explicitly checks out `72f5782`.

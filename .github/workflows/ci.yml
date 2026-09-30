@@ -189,6 +189,7 @@ jobs:
           nim -v
           gcc --version
           $tests = @(
+            'test_windows_injector_capture',
             'test_windows_entry_park_slow_call',
             'test_windows_entry_park_thread_locals',
             'test_propagation_windows_smoke',

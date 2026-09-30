@@ -228,3 +228,26 @@ Exact-source transformation and Windows C compilation/link pass against hooks
 SHA-256 `A2B62B00CACD9BADBC14DFC19AD1FEB520AF48687CF7FA0A9127A9F257658CE6`;
 its artifact is `/tmp/windows-arm-prepared-538-evidence`. Refreshed hooks dev
 `8f4d806` and agents `6be90c1` before extending this record.
+
+## Smaller reproduction through the borrowed main thread
+
+The earlier standalone shim control calls initialization from ordinary `main`.
+It does not reproduce the entry-park context of a compiler child. Tooling
+`bec4778` adds a smaller real-image experiment: 128 native assembler launches,
+then up to 128 monitored launches with eight concurrent fresh parents. Each
+monitored parent uses the pinned `runWithMonitorShim` path, including entry
+parking and borrowed initialization, with the retained DLL from failing run
+`36720335981`. A failed sample stops queued work and retains active outcomes.
+No production injection deadline is shortened.
+
+The assembler processes a real input and must produce an x64 COFF object.
+A monitored pass additionally requires that child's process-start, source-read
+and object-write records, decoded from complete fragment frames. Source pins,
+assembler/DLL hashes, per-launch logs and the existing failure-only context
+observer are retained. This is supplemental diagnosis; it does not replace the
+complete graph currently testing all-range preparation at `8fd4eff`.
+
+The parent and failure observer compile and link for Windows x64 against hooks
+`8f4d806` and io-mon `5e71adf`; workflow, Python and PowerShell syntax checks
+also pass at tooling `bec4778`. Runtime results are pending. Refreshed hooks
+dev `8f4d806` and agents `dc52095` before recording this experiment.

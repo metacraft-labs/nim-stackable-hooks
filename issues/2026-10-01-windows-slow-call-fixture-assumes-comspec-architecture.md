@@ -34,3 +34,25 @@ supporting evidence rather than treating the inference as a measurement.
 Fetched dev `8f4d806` and agents `2d697ce`; searched open issues and complete
 issue history for ComSpec, ARM cmd and slow-call child assumptions. The
 running-context issue covers a separate production API contract.
+
+## Paired runtime control
+
+Shared `94359a5`, run `36791403406`, compares original `f3a9dc1` and
+matched-child `6342a21` with identical production hooks. Native x64 passes
+both variants' five cases. On the ARM host, the original fails its initial
+park and the matched child passes all five slow/poison/propagation cases.
+Both test executables and their real fixture DLLs have AMD64 PE machine
+`0x8664`. No deadline, production context sampling or page protection changes.
+
+The auxiliary `IsWow64Process2` observation reports process-machine `0`
+and native-machine `0xaa64` for both ComSpec and its observer. The observer's
+own PE machine is `0x8664`, so this API result does not distinguish the
+child's architecture here and is not proof that ComSpec ran as native ARM64.
+The paired fixture result establishes the practical fix independently.
+Artifacts: `/tmp/hooks-6342-matched-arm`, `/tmp/hooks-6342-matched-x64`.
+
+The ordinary helper ARM-host job at `5cadd95`, run `36787069280`, also
+fails only the same initial slow-call park after monitored compilation;
+log `/tmp/hooks-5cadd-arm-test.log`. This links the fixture correction to
+the actual failing CI gate. Complete CI with the corrected fixture remains
+required before promotion.

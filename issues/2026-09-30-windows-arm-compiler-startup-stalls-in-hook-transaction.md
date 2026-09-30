@@ -62,3 +62,27 @@ cache coherency, complete capture, and the existing poison/deadline rules.
 Microsoft's [SuspendThread contract](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-suspendthread)
 warns of deadlock when a suspended thread owns a synchronization object.
 Refreshed dev `8f4d806` and agents `71f2aae` before extending this record.
+
+## Real protection controls and next observation
+
+Standalone [36718424230](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/36718424230)
+at shared actions `fdd7a68fa5f7ed5c2aa53eb2678073b05ea643e8` completes all
+16 cases on native x64 and all 16 on the ARM host. Each case executes 512
+rounds. The active-worker control, writable protection under suspension,
+cache flushing under suspension and writes to an already writable code page
+all finish. No timeout or nonzero exit is recorded in either results file.
+This does not reproduce the installer stall: it freezes only the four known
+protection workers and changes private executable pages, while the installer
+freezes every other process thread and patches executable image pages.
+
+Full graph [36720335981](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/36720335981)
+at shared actions `25c6ec20fbd1dd1bb17f663e7650931985767242` retains all
+100 compile actions and captures the exact patch target, frozen peer thread
+ids and contexts, and runtime stack unwind results only after the existing
+fatal deadline. Nearest exports are explicitly labeled as approximate; the
+older executable-address scan remains distinct from unwound frames. It
+prints no raw stack contents. Exact-source transforms and Windows x64 C
+compilation/link pass locally against hooks `8f4d806` and io-mon `5e71adf`.
+The real ARM-host run is pending. No production patching change is selected.
+
+Refreshed dev `8f4d806` and agents `4fe105e` before extending this record.

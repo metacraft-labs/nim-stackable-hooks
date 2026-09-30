@@ -133,3 +133,28 @@ comparison, not an established production repair.
 
 Evidence: `/tmp/windows-arm-trace25-evidence`. Refreshed dev `8f4d806` and
 agents `8601e4b`; the same issue owns the repeated observation.
+
+## Fresh target controls and real installer comparison
+
+Fresh-process control `36735253958` at tooling `11655e2` passes all 48 cases
+on each Windows host: 16 active, 16 suspended before the first writable
+protection change, and 16 with that change prepared before suspension.
+Every exit is zero. The ARM processes have two runtime peers; native x64 has
+one. Control `36736311622` at tooling `7f8fe0c` first loads the six exact DLLs
+from io-mon `5e71adf`'s `forceLoadObservedModules`; it also passes all 48 cases
+per host with the same peer counts. Neither reproduces the compiler stall,
+whose frozen peer counts are three or four.
+
+Tooling `7c6167c` exercises hooks `8f4d806`'s actual C installer in fresh
+processes. It installs a real `CreateFileW` hook through the transaction API,
+opens `NUL` through its original trampoline, requires exactly one intercepted
+call, removes the hook through another transaction, and verifies the restored
+API. Original and prepared-protection modes run 32 times each on both hosts.
+Two volatile stores expose entry/return of the actual `write_patch` protection
+call if the disposable probe times out. All patch writes retain production
+thread suspension. Local Windows C compilation/link, PowerShell syntax and
+workflow lint pass. No production repair is inferred from the API-only controls.
+
+Artifacts: `/tmp/windows-protection-116-evidence` and
+`/tmp/windows-protection-7f-evidence`. Refreshed dev `8f4d806` and agents
+`12f8a82` before extending the record.

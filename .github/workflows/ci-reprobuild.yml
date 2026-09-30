@@ -55,6 +55,10 @@ jobs:
       # The ARM host exercises x64 injection through Windows emulation.
       # Native ARM64 source coverage remains in the cross-target matrix.
       WINDOWS_DIY_ARCH_OVERRIDE: x64
+      # dev-exec activates ordinary commands through repro exec. Its default
+      # provisioning mode otherwise selects Nix, which cannot run on Windows.
+      # Share the declared tarball toolchain across build, test and cross-checks.
+      REPRO_TOOL_PROVISIONING: ${{ matrix.os == 'windows' && 'tarball' || '' }}
     steps:
       - uses: actions/checkout@v4
 

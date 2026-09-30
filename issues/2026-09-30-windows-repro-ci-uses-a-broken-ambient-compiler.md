@@ -44,3 +44,19 @@ well. The single failed action instead contains host-dependent matrix assertions
 recorded in `2026-09-30-cross-target-coverage-assertions-assume-a-posix-host.md`.
 The original header/ambient-compiler failure is not reproduced. PR 12 at
 `eb40f51` carries the separate assertion repair; ordinary promotion is pending.
+
+## The full monitored suite passes; cross-check activation selects Nix
+
+At `eb40f51`, run `36776479786`, Windows x64 job `110095572571`,
+passes compilation and all 52 monitored test actions. The host-aware matrix
+assertion and real capture regression now pass. The next `dev-exec just build`
+step fails before invoking Just: `repro exec` tries Nix provisioning and
+reports `bakForeignProvision is not supported on Windows`. No cross-check
+test executes. The log is `/tmp/hooks-eb40-windows-repro-job.log`.
+
+Set `REPRO_TOOL_PROVISIONING=tarball` for the Windows workflow environment.
+This existing override is read by Reprobuild before dispatch and covers both
+the direct build/test commands and `dev-exec`'s environment activation for
+Just. Keep non-Windows mode selection unchanged. This retains every test and
+uses the declared toolchain; it does not add a PATH bypass. Fetched dev
+`8f4d806` and agents `aba22b9` before extending this existing workflow issue.

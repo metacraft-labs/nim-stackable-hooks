@@ -48,26 +48,11 @@
 ## why the corpus exists and what
 ## ``tests/test_lane_registration.nim`` enforces about it.
 ##
-## **KNOWN RED IN THIS LANE, PRE-EXISTING AND NOT INTRODUCED HERE.**
-## ``stackable_hooks.test_execute.test_linux_raw_syscalls`` exits **127**
-## under reprobuild's ``dgAutomaticMonitor`` dependency policy, so
-## ``repro test`` exits 1 on Linux. It is not flaky and it is not a gating
-## decision made here: it reproduces identically at the commit before the
-## corpus landed (22 actions, 21 succeeded, that one failed, three runs) and
-## after it (40 actions, 39 succeeded, the same one failed). The binary
-## itself is healthy — run directly it exits 0 with 38 ``[OK]``.
-##
-## What the monitor costs is silent: under it the run dies after
-## ``ucontext register helpers and raw register replay are exported through
-## C ABI`` with only 35 ``[OK]``, so THREE cases never execute in this lane —
-## ``SIGTRAP install/uninstall substrate restores process handler without
-## raising trap``, ``live INT3 handler replays raw syscall and advances saved
-## RIP`` and ``memory scanner describes callsites in a controlled executable
-## buffer``. The io-mon shim and this repo's live SIGTRAP/INT3 patching do
-## not coexist; both want the trap. Recorded here rather than tolerated
-## quietly, because a lane whose exit code is always 1 stops being read, and
-## because the three skipped cases are a coverage loss the ``[OK]`` count
-## alone does not show. Fixing it is out of scope for the corpus work.
+## The Linux signal fixtures preserve the outer monitor: lifecycle checks
+## own and restore their prior dispositions, and live INT3 replay permits
+## nested delivery while forwarding foreign traps. All 38 raw-syscall cases
+## execute both natively and under automatic monitoring. The original-fail,
+## repaired-pass signal control is shared-actions run 36795427990.
 
 import repro_project_dsl
 import repro_dsl_stdlib/foreign_env

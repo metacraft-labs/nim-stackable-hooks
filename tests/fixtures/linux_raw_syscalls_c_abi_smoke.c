@@ -253,8 +253,10 @@ static void stackable_live_int3_handler(int signo, siginfo_t *info, void *uctx) 
   int rc = stackable_linux_capture_syscall_regs_from_ucontext(uctx, &regs);
   if (rc != 0 ||
       regs.syscall_address != (unsigned long)(uintptr_t)stackable_live_int3_site) {
-    stackable_live_int3_failures++;
-    (void)stackable_linux_chain_sigtrap(signo, info, uctx);
+    /* The outer monitor owns other patched sites, including raw replay.
+     * Successful forwarding is expected; only an unhandled trap fails. */
+    if (stackable_linux_chain_sigtrap(signo, info, uctx) != 0)
+      stackable_live_int3_failures++;
     return;
   }
   long result = stackable_linux_replay_syscall_regs(&regs);
@@ -510,8 +512,10 @@ long stackable_test_live_int3_getpid_continuation(void) {
     return -1002;
   }
 
+  /* Replay can enter a raw-syscall site patched by the outer monitor.
+   * Let its nested SIGTRAP reach the forwarding branch above. */
   rc = stackable_linux_install_sigtrap_handler(
-      (void *)&stackable_live_int3_handler, 0);
+      (void *)&stackable_live_int3_handler, SA_NODEFER);
   if (rc != 0) {
     int ignored_errno = 0;
     (void)stackable_linux_restore_int3_syscall(

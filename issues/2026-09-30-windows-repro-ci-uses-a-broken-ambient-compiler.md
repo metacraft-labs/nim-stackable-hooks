@@ -138,3 +138,17 @@ compilation and execution edges must carry their compiler identity, including
 the runtime cross-target checks. Preserve every existing workflow command,
 corpus entry and monitoring policy. Validate the resulting graph's compiler
 closure and the full ordinary matrix, rather than only legacy cross-checks.
+
+Candidate `9fcaf89` makes those declarations and passes local macOS
+`repro build --tool-provisioning=nix --daemon=off` (23 compile actions)
+and `repro test --tool-provisioning=nix --daemon=off` (46 total actions).
+Its graph identifies Clang on every compile edge and Nim/Clang on every
+execution edge; Clang resolves to the Nix wrapper with its SDK closure.
+Workflow validation and commit checks pass. Logs:
+`/tmp/hooks-explicit-toolchain-build.log`,
+`/tmp/hooks-explicit-toolchain-test.log`; graph:
+`/tmp/hooks-explicit-toolchain-graph.json`. The build/graph were measured
+before the final comment-only recipe edit; the complete test graph was run
+at committed `9fcaf89`. Remote ordinary CI is still required. This candidate
+also selects already published hooks `d36cab8` as its Windows monitor input,
+so the next complete matrix exercises page preparation and the matched child.

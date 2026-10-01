@@ -93,3 +93,34 @@ failure fails the run. The unchanged-fixture raw-status control
 `36801009503` continues separately. Both drivers compile/link for Windows
 x64 locally; workflow and Python syntax checks pass. No runtime result is
 claimed until those Windows controls complete.
+
+## Raw-status results and diagnostic capture repair
+
+At tooling `6b2415e`, Windows x64 job `110175120165` in run `36801009503`
+preserves the real `0xC0000005` exit in both native and monitored controls.
+All twelve monitored repetitions of the unchanged `4371fae` fixture exit
+zero and retain both passing assertion groups. All twelve native children
+also exit zero, but their logs contain only the suite heading. Those native
+results do not establish complete assertion-output coverage.
+
+The native driver calls `Stream.readAll` before waiting. Nim's implementation
+stops after a short pipe read, so it loses later output chunks. This is a
+capture defect in the diagnostic driver. Tooling `5336c54` drains explicit
+reads until pipe EOF and adds a real child that writes two separately
+flushed lines 100 milliseconds apart, then exits 17. Both capture modes
+must retain both lines and the exit code, in addition to the high-bit exit
+control. Windows x64 cross-compilation/linking and Python/workflow syntax
+checks pass at this tooling commit.
+
+Corrected raw run `36802560298` and paired run `36802560317` retain the
+same source pins and stress assertions. The prior paired run `36801505047`
+uses the same incomplete native capture and cannot establish complete native
+assertion output. Its raw statuses and monitored output remain evidence.
+The corrected raw and paired drivers run 28 and 56 cases per host,
+respectively. Evidence for the first raw x64 run is under
+`/tmp/hooks-raw-stress-6b2-x64`.
+
+The complete native matrix `36801305772` passes all seven jobs at helper
+`43b1835`. Its complete Reprobuild matrix remains active. These observations
+still do not establish the lazy permit lock as the cause of the original
+ARM-host numeric-exit failure.

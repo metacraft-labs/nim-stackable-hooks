@@ -206,3 +206,19 @@ matches `43b1835`. This repairs the independently demonstrated lazy permit
 lock race. The earlier numeric exit still lacks its raw status and failure
 phase, so this issue remains open for that attribution rather than claiming
 every earlier symptom was explained by the lock.
+
+### Corrected unchanged-fixture run retains two waits before its step limit
+
+The independent raw-status run `36802560298` at tooling `5336c54` ends
+on ARM at its 75-minute step limit. It retains eleven completed samples:
+all four real output/status controls pass; three native and two monitored
+stress repetitions pass with complete assertion output; native repetition
+one and monitored repetition two each hit the 1,500-second outer bound.
+Monitored repetition four is still waiting when the workflow interrupts the
+step, so no completed result is claimed for it or later repetitions.
+
+This run uses the unchanged `4371fae` fixture and lazy lock, not the merged
+repair. Evidence is `/tmp/hooks-raw-stress-533-arm` and
+`/tmp/hooks-raw-stress-533-arm-job.log`. The complete paired run above is the
+validation for `43b1835`; this partial original-source run is additional
+evidence and is not a reason to rerun the same original stress unchanged.

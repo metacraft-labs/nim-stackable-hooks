@@ -83,3 +83,24 @@ checks the executable before running. A Nix dry run confirms exactly one
 output, `/nix/store/r1mzfs885is8zv9z769wf216dyi313cn-strace-7.0`.
 Corrected run `36795427990` is active, with all fixture variants and the
 same monitor pins retained. First-run artifacts: `/tmp/hooks-linux-signal-c8a`.
+
+## Positive paired control
+
+Corrected run `36795427990` at tooling `2d5a582` completes all six cases.
+Every native variant passes. Under the same real monitor, original `f3a9dc1`
+exits 127 after 36 passing assertions; its signal trace shows a second
+SIGTRAP while the live fixture handler is active, followed by death from
+SIGTRAP. The monitor wrapper reports 127. Adding `SA_NODEFER` allows that
+delivery and advances to 37 passes, but the live case returns `-1006` because
+the fixture counts a successfully chained foreign trap as its own failure.
+Allowing nested delivery and counting only failed foreign chaining passes
+all 38 cases with exit zero, including the original one-hit/getpid checks.
+
+Each variant's native and monitored run uses the same SHA-256-verified
+binary. The corrected binary is
+`6065b5bbe0066f045e3a4ee741d46d556bb654d490551ec7fb30f37181b21b53`.
+Artifacts: `/tmp/hooks-linux-signal-2d5`, including all C variants, output
+and kernel signal traces. Both original failures are retained as controls.
+Select these two fixture changes, update the stale recipe failure note, and
+run the full ordinary matrix. The shipping signal-handler API is unchanged;
+automatic monitoring, every corpus entry and every existing assertion stay.

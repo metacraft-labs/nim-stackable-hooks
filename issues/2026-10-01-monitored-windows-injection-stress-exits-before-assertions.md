@@ -188,3 +188,21 @@ These waits occur in both native and monitored execution. They are not
 evidence that every stress hang requires the monitor. The corrected ARM
 comparison at tooling `5336c54` remains active; its result will supplement
 the complete ordinary candidate CI and the earlier paired ARM result.
+
+### Corrected ARM comparison and merged lock repair
+
+Corrected paired run `36802560317` at tooling `5336c54` completes on ARM.
+The original `4371fae` lock times out in native repetition one and monitored
+repetition four. Each timeout reaches the 1,500-second outer bound without
+a root-result record, and the driver stops further original repetitions in
+that mode. The initialized `43b1835` lock passes all twelve native and all
+twelve monitored repetitions. Every stress result retains both assertion
+groups and raw status zero. All four repaired split-output/high-bit exit
+controls also pass. The complete ARM run retains 37 samples, including both
+original timeouts; evidence is `/tmp/hooks-lock-pair-533-arm`.
+
+The exact validated candidate is merged by PR 12 as `59a2bac`. Its tree
+matches `43b1835`. This repairs the independently demonstrated lazy permit
+lock race. The earlier numeric exit still lacks its raw status and failure
+phase, so this issue remains open for that attribution rather than claiming
+every earlier symptom was explained by the lock.

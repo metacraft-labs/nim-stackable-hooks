@@ -74,3 +74,22 @@ gate that releases workers after all threads have been created; keep all 32
 threads, 2,048 attempts, assertions and time bounds. Compare the original and
 repaired source on real Windows hosts before selecting it. The unchanged raw
 status control at tooling `6b2415e`, run `36801009503`, remains independent.
+
+## Candidate and controls
+
+Candidate `43b1835`, above `4371fae`, initializes the permit lock at module
+load and adds the worker start gate. Windows Nim source checking and full
+Windows x64 cross-compilation/linking of the stress fixture pass, using Nim
+2.2.4 and Zig 0.13.0. Logs: `/tmp/hooks-injection-lock-windows-check.log` and
+`/tmp/hooks-injection-lock-build.log`. Ordinary native `36801305772` and
+Reprobuild `36801308347` runs are active; the native Windows injection job
+already passes at this SHA.
+
+Paired tooling `bf169cf`, run `36801505047`, compiles both permit-lock
+implementations against the same strengthened fixture and exact monitor. It
+records twelve native and twelve monitored stress repetitions per variant,
+plus real DWORD-exit controls. Original failures are retained; any repaired
+failure fails the run. The unchanged-fixture raw-status control
+`36801009503` continues separately. Both drivers compile/link for Windows
+x64 locally; workflow and Python syntax checks pass. No runtime result is
+claimed until those Windows controls complete.

@@ -124,3 +124,19 @@ The complete native matrix `36801305772` passes all seven jobs at helper
 `43b1835`. Its complete Reprobuild matrix remains active. These observations
 still do not establish the lazy permit lock as the cause of the original
 ARM-host numeric-exit failure.
+
+### Complete baseline and corrected x64 pair
+
+Baseline `4371fae` now passes every job in native `36797913117` and
+Reprobuild `36797913098`, including monitored build/test and both native
+cross-checks on the Windows ARM host. The earlier numeric-exit failure is
+intermittent across these ordinary runs, not established as repaired.
+
+Corrected paired run `36802560317` at tooling `5336c54` passes all 56 x64
+cases: twelve native and twelve monitored stress repetitions for each lock
+variant, plus each mode's split-output and high-bit exit controls. Both lock
+variants use the same `43b1835` start-gated fixture. All expected statuses
+and assertion output are retained; no timeout occurs. This confirms
+compatibility and complete diagnostic capture, not original-fail/repaired-pass
+causality. Source pins and complete evidence are retained in
+`/tmp/hooks-lock-pair-533-x64`. ARM results remain pending.

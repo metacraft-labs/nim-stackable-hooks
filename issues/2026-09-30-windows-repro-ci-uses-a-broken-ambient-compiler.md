@@ -152,3 +152,18 @@ before the final comment-only recipe edit; the complete test graph was run
 at committed `9fcaf89`. Remote ordinary CI is still required. This candidate
 also selects already published hooks `d36cab8` as its Windows monitor input,
 so the next complete matrix exercises page preparation and the matched child.
+
+## Complete macOS CI confirms the explicit compiler closure
+
+At `9fcaf89`, ordinary Reprobuild job `110157488672` in run
+`36795362092` passes the monitored build, full test graph, native build
+and native test cross-check. This exercises the exact CI wrapper commands
+that previously lost the SDK closure. Linux ARM64 and Windows x64 also pass
+at that commit; Linux x64 still has the separately diagnosed live INT3
+fixture failure, and the Windows ARM job remains active. Log:
+`/tmp/hooks-9fc-macos-repro.log`.
+
+PR 12 now carries `4371fae`, adding only the controlled Linux fixture repair
+and its recipe note above `9fcaf89`. All six native jobs pass at that SHA;
+its legacy and full Reprobuild checks remain active. Keep this record open
+until the complete helper candidate qualifies and reaches dev.

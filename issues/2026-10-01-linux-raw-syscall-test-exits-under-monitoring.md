@@ -74,3 +74,12 @@ failure accounting for unhandled signals. These are diagnostic fixture
 variants, not a selected production change. Observe native success and the
 monitor's real signal sequence before choosing a repair; do not suppress the
 monitor or mark incomplete evidence cacheable.
+
+The first control `36792965005` at tooling `c8aa902` compiles the original
+fixture but stops before execution: Nix returns `strace`'s manual and binary
+outputs, and the harness incorrectly combines them into one path. It supplies
+no signal comparison. Tooling `2d5a582` explicitly selects `strace.out` and
+checks the executable before running. A Nix dry run confirms exactly one
+output, `/nix/store/r1mzfs885is8zv9z769wf216dyi313cn-strace-7.0`.
+Corrected run `36795427990` is active, with all fixture variants and the
+same monitor pins retained. First-run artifacts: `/tmp/hooks-linux-signal-c8a`.

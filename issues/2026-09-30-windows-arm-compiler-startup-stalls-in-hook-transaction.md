@@ -58,6 +58,15 @@ RunQuota `7fd57f4` changes only the hook pin above `f93855c`, selecting
 running; no timeout or assertion has been relaxed. The complete graph remains
 required before release selection.
 
+Ordinary helper `f3a9dc1`, using original-protection hooks `def2464`,
+also fails two ARM-host compiles in job `110142647750` of `36790688346`:
+`test_safe_tls` cannot launch `as.exe`; `test_windows_injector_fork_runtime`
+cannot launch `cc1.exe`. Both report `CreateProcess: No such file or directory`.
+There is no hook phase trace, so these launch failures are not proof of the
+phase-130 cause. Evidence: `/tmp/hooks-f3-arm-repro.log`. Complete helper
+`9fcaf89` CI (`36795359104`, `36795362092`) now selects prepared hooks
+`d36cab8`, alongside the matched-child fixture and explicit toolchain repair.
+
 ## Observed
 
 [Failure-only trace](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/36695470313)

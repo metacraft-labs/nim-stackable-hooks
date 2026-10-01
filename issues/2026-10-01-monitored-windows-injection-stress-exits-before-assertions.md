@@ -140,3 +140,28 @@ and assertion output are retained; no timeout occurs. This confirms
 compatibility and complete diagnostic capture, not original-fail/repaired-pass
 causality. Source pins and complete evidence are retained in
 `/tmp/hooks-lock-pair-533-x64`. ARM results remain pending.
+
+### ARM original wait and repaired monitored repetitions
+
+The earlier paired run `36801505047` at tooling `bf169cf` now completes
+on ARM. With the same `43b1835` start-gated fixture, the original `4371fae`
+lock passes three monitored stress repetitions, then hangs in repetition
+four. The target retains only its suite heading; no root result is written.
+The outer 1,500-second bound expires and the driver and target are terminated.
+The initialized-lock variant subsequently passes all twelve monitored
+repetitions, each with zero root status and both assertion groups retained.
+Both variants' high-bit exit controls pass in both modes.
+
+This is an observed original-timeout/repaired-pass comparison on the ARM
+host. It does not establish a stack location for the timeout or explain the
+earlier numeric exit. Both native variants return zero in all twelve stress
+repetitions, but `bf169cf`'s already-recorded output-capture defect loses
+their assertion lines, so native assertion coverage is not claimed from
+that driver. The corrected `5336c54` ARM pair remains active. Evidence:
+`/tmp/hooks-lock-pair-bf1-arm`, especially `original-monitored-4` and the
+twelve `initialized-monitored-*` stress directories.
+
+Complete `43b1835` Reprobuild CI now passes both Linux jobs, macOS and
+Windows x64. The ARM job passes monitored build and test, then native build;
+its final native test cross-check remains active. Native CI already passes
+all seven jobs at this same source commit.

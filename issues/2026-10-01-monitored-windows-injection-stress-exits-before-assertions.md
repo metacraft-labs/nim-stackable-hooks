@@ -48,3 +48,29 @@ Fetched dev `8f4d806` and agents `1bee6b7`; searched current issues and their
 full history for fork-bomb and numeric-exit reports before filing. The
 compiler-startup issue covers a different observed phase and is not assigned
 this failure without evidence.
+
+## Source-inspected first-call race
+
+At `4371fae`, `ensureInFlightLock` checks the ordinary Boolean
+`inFlightLockInit`, initializes the global critical section, then sets the
+Boolean. Two first callers can both observe false and initialize the same
+object; one can reset it while another is using it. This is a definite source
+race, but the ordinary exit report does not establish that it caused this
+particular failure. It is separate from the C hook registry's early-ready
+publication issue.
+
+Microsoft's [initialization contract](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-initializecriticalsection)
+forbids reinitializing a live critical section. Its
+[DLL initialization guidance](https://learn.microsoft.com/en-us/windows/win32/dlls/dynamic-link-library-best-practices)
+permits creation and initialization of synchronization objects during module
+initialization. This repository already initializes `wow64StateLock` at
+module scope in `windows_injector.nim`.
+
+Initialize the propagation permit lock once at module initialization, before
+injection callers can enter. Remove the racy lazy Boolean and both redundant
+first-call checks. Preserve the same lock-protected cap/count operations and
+all injection behavior. Strengthen the existing stress fixture with a start
+gate that releases workers after all threads have been created; keep all 32
+threads, 2,048 attempts, assertions and time bounds. Compare the original and
+repaired source on real Windows hosts before selecting it. The unchanged raw
+status control at tooling `6b2415e`, run `36801009503`, remains independent.

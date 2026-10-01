@@ -44,9 +44,19 @@ Windows host corpus. x64 passes all 26. The ARM host passes 25, but the
 slow-call fixture's first park returns `epsTimedOut` before any borrowed hook
 initialization. This cannot establish a failure of the new page-preparation
 code in that child. Original/prepared comparison `36790952581` at `a386525`
-is pending. The separate ComSpec architecture assumption now has its own
-issue; no timeout or assertion has been relaxed. No RunQuota pin selects this
-candidate yet, and the complete graph remains required.
+exposes a harness error: its explicit compiler cache is outside the checkout,
+correctly failing the locality assertion. The corrected control uses caches
+inside the checkout. The separate ComSpec fixture issue records the original
+failure and matched-child success at tooling `94359a5` on the ARM host.
+
+Hooks `d36cab8` combines page preparation and matched-child fixture `6342a21`.
+Corrected control `36792017491` at tooling `6875d29` passes all 52 paired
+original/prepared cases on each Windows host, 104 total. Both variants pass,
+so this is compatibility evidence rather than a reproduced compiler repair.
+RunQuota `7fd57f4` changes only the hook pin above `f93855c`, selecting
+`d36cab8`. Full native `36792986046` and Reprobuild `36792989240` CI are
+running; no timeout or assertion has been relaxed. The complete graph remains
+required before release selection.
 
 ## Observed
 

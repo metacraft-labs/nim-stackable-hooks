@@ -117,7 +117,24 @@ cross-check commands pass locally. PR 12 at `f3a9dc1` is running complete
 CI `36790688338` / `36790688346`.
 
 The old `65720d2` macOS job `110131791732` fails every compile for missing
-`string.h`: its implicit provisioning selected the standalone compiler archive
-without a macOS SDK closure. The Nix default supplies that closure; the local
-full cross-check passes with it. Native Linux and macOS tests both pass at
-`f3a9dc1`; monitored Linux validation remains pending.
+`string.h`: its compiler has no macOS SDK closure. The Nix default supplies
+that closure for local cross-checks. Native Linux and macOS tests both pass
+at `f3a9dc1`; its Windows x64 complete Reprobuild job now also passes.
+
+## The CI wrapper overrides the package's Nix default
+
+At `f3a9dc1`, macOS job `110142647642` in `36790688346` still fails
+all 23 compiles with missing `string.h`. The log prints the exact shared
+`dev-exec` wrapper: it appends `--tool-provisioning=path` to `repro build`
+and `repro test` unless the caller supplies an explicit mode. That command
+line overrides both the package default and the environment. Thus the local
+`repro exec -- just build/test` control did not cover these two CI calls.
+Evidence: `/tmp/hooks-f3-macos-repro.log`.
+
+Match the existing RunQuota workflow: explicitly pass Nix provisioning on
+POSIX and tarball provisioning on Windows to the two graph commands. Declare
+Clang on macOS, matching Nim's actual backend; retain GCC elsewhere. Both
+compilation and execution edges must carry their compiler identity, including
+the runtime cross-target checks. Preserve every existing workflow command,
+corpus entry and monitoring policy. Validate the resulting graph's compiler
+closure and the full ordinary matrix, rather than only legacy cross-checks.

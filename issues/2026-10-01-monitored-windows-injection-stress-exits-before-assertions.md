@@ -165,3 +165,26 @@ Complete `43b1835` Reprobuild CI now passes both Linux jobs, macOS and
 Windows x64. The ARM job passes monitored build and test, then native build;
 its final native test cross-check remains active. Native CI already passes
 all seven jobs at this same source commit.
+
+### Complete candidate CI and unchanged-fixture ARM waits
+
+Helper `43b1835` now passes all seven native jobs in run `36801305772`
+and all five Reprobuild platform jobs in `36801308347`, including the
+complete monitored and native cross-checks on the ARM host. PR 12 now
+contains this exact candidate. Its fresh native run `36806650765` also
+passes all seven jobs; its additional Reprobuild run remains active.
+
+The earlier raw-status run `36801009503` at tooling `6b2415e` now completes
+on ARM. Using the unchanged `4371fae` fixture and lock, native repetition
+one and monitored repetition three each hit the outer 1,500-second limit
+without a root-result record. The other eleven monitored stress repetitions
+retain both passing assertion groups and zero root status. The other eleven
+native repetitions return zero but retain only the suite heading because of
+the already-recorded diagnostic capture defect. Both modes preserve the
+real `0xC0000005` control status. Evidence is retained under
+`/tmp/hooks-raw-stress-6b2-arm`.
+
+These waits occur in both native and monitored execution. They are not
+evidence that every stress hang requires the monitor. The corrected ARM
+comparison at tooling `5336c54` remains active; its result will supplement
+the complete ordinary candidate CI and the earlier paired ARM result.

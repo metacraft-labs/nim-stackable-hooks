@@ -104,3 +104,11 @@ and kernel signal traces. Both original failures are retained as controls.
 Select these two fixture changes, update the stale recipe failure note, and
 run the full ordinary matrix. The shipping signal-handler API is unchanged;
 automatic monitoring, every corpus entry and every existing assertion stay.
+
+The selected fixture repair is `4371fae`, above explicit-toolchain candidate
+`9fcaf89`. The C tokens match the passing control, differing only in comments
+and whitespace; Linux C compilation with warnings as errors and Nim checking
+pass. PR 12 now carries that head and runs complete native `36797913117`
+and Reprobuild `36797913098` CI. The production `src/` tree is unchanged
+from prepared Windows helper `d36cab8`. The issue remains open until full
+validation and promotion.

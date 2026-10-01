@@ -48,6 +48,13 @@ These functions are mechanism-only helpers. The caller must ensure that no other
 `stackable_hooks/windows_injector` is an opt-in helper module providing host-side Windows process creation and DLL injection logic using the standard suspended creation + `CreateRemoteThread` + `LoadLibraryW` pattern.
 It includes process handle-whitelisting via `STARTUPINFOEX` to prevent handle-leak deadlocks on parent-inherited resources.
 
+`runWithMonitorShim` returns the root child's actual exit code when that child
+exits. With stdout/stderr capture enabled, it preserves output buffered at that
+point without waiting for surviving descendants to close inherited pipe writers.
+Each drain consumes a bounded snapshot of available bytes, so a continuing
+writer cannot postpone the next root-exit check indefinitely. This return
+boundary does not assert that all descendants or their I/O capture have finished.
+
 ## Windows Entry-Point Park
 
 `stackable_hooks/windows_entry_park` is the attach primitive the propagation

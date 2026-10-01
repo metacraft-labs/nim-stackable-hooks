@@ -25,9 +25,9 @@
 ## status; nothing in-process can see it.
 ##
 ## The host's own target is skipped because the run lane already compiles
-## and runs it; everything else -- the macOS arm on Linux, both Windows CPUs
-## everywhere, linux/arm64's AArch64 body-patch code on an amd64 host -- is
-## checked here.
+## and runs it; everything else -- the macOS arm on Linux, each non-host
+## Windows CPU, linux/arm64's AArch64 body-patch code on an amd64 host -- is
+## checked here. A singleton host-only entry is still checked by the fallback.
 ##
 ## NO MOCKS: this shells out to the real ``nim`` binary against the real
 ## sources. That is the point.
@@ -149,6 +149,11 @@ proc runJobs(jobs: seq[CheckJob]; parallel: int): seq[CheckOutcome] =
       sleep(20)
 
 let jobs = crossTargetJobs()
+let hostTarget = CheckTarget(os: $hostOs(), cpu: hostCpuName())
+let expectedWindowsTargets =
+  if hostTarget == tWindowsAmd64: @[tWindowsArm64]
+  elif hostTarget == tWindowsArm64: @[tWindowsAmd64]
+  else: @[tWindowsAmd64, tWindowsArm64]
 
 template reportFailures(outcomes: seq[CheckOutcome]) =
   ## A ``template``, not a ``proc``: ``check`` inside a plain ``proc`` prints
@@ -183,28 +188,34 @@ suite "cross-target compile matrix":
     check missing.len == 0
     check filesInMatrix.len == moduleCorpus.len + testCorpus.len
     check jobs.len > 0
-    # `targetsToCheck`'s fallback arm never fires on THIS host (no corpus entry
-    # here declares the host as its only target), so it is asserted on the
-    # function with literals instead of waiting for the macOS runner where it
-    # does. Without this, deleting the fallback reddens nothing on Linux and
-    # the coverage assertion above silently becomes host-dependent again.
-    let hostT = CheckTarget(os: $hostOs(), cpu: hostCpuName())
-    check targetsToCheck(@[hostT]) == @[hostT]
-    check targetsToCheck(@[hostT, tWindowsArm64]) == @[tWindowsArm64]
-    check targetsToCheck(@[tWindowsArm64, hostT]) == @[tWindowsArm64]
+    # Check singleton fallback and host exclusion on every host. The second
+    # target must differ from the host, including on Windows ARM64.
+    let otherTarget =
+      if hostTarget == tWindowsArm64: tWindowsAmd64 else: tWindowsArm64
+    check otherTarget != hostTarget
+    check targetsToCheck(@[hostTarget]) == @[hostTarget]
+    check targetsToCheck(@[hostTarget, otherTarget]) == @[otherTarget]
+    check targetsToCheck(@[otherTarget, hostTarget]) == @[otherTarget]
     check targetsToCheck(@[tWindowsAmd64, tWindowsArm64]) ==
-      @[tWindowsAmd64, tWindowsArm64]
+      expectedWindowsTargets
 
-  test "the Windows injector is in the matrix for both Windows CPUs":
+  test "the Windows injector declares both CPUs and checks every non-host CPU":
     # Named explicitly because it is the file whose absence from every
     # automated lane motivated this whole test, and because it is the file
     # the io-mon decomposed-host-API work changed.
-    var seen: HashSet[string]
+    var declared, seen: HashSet[string]
+    for m in moduleCorpus:
+      if m.path == "src/stackable_hooks/windows_injector.nim":
+        for target in m.targets:
+          declared.incl target.os & "/" & target.cpu
+    check "windows/amd64" in declared
+    check "windows/arm64" in declared
     for j in jobs:
       if j.file == "src/stackable_hooks/windows_injector.nim":
         seen.incl j.os & "/" & j.cpu
-    check "windows/amd64" in seen
-    check "windows/arm64" in seen
+    check seen.len == expectedWindowsTargets.len
+    for target in expectedWindowsTargets:
+      check target.os & "/" & target.cpu in seen
 
   test "every declared cross-target compiles":
     let outcomes = runJobs(jobs, parallel = 12)

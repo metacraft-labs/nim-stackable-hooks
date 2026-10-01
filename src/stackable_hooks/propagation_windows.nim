@@ -366,18 +366,16 @@ proc defaultInjectionConfig*(): InjectionConfig =
 var
   inFlightLock {.global.}: Lock
   inFlightCount {.global.}: int
-  inFlightLockInit {.global.} = false
 
-proc ensureInFlightLock() =
-  if not inFlightLockInit:
-    initLock(inFlightLock)
-    inFlightLockInit = true
+# Initialize before injection callers can enter. A lazy Boolean lets concurrent
+# first callers reset the same critical section while another thread owns it.
+# Module initialization also supplies windows_injector's wow64StateLock.
+initLock(inFlightLock)
 
 proc tryAcquireInFlight(cap: int): bool =
   ## Cheap CAS-style admission control: hold the lock for the cap check
   ## only. The actual injection runs OUTSIDE the lock so concurrent
   ## injections proceed in parallel up to the cap.
-  ensureInFlightLock()
   acquire(inFlightLock)
   defer: release(inFlightLock)
   if inFlightCount >= cap:
@@ -386,7 +384,6 @@ proc tryAcquireInFlight(cap: int): bool =
   true
 
 proc releaseInFlight() =
-  ensureInFlightLock()
   acquire(inFlightLock)
   defer: release(inFlightLock)
   if inFlightCount > 0:

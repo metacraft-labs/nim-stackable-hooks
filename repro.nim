@@ -48,26 +48,11 @@
 ## why the corpus exists and what
 ## ``tests/test_lane_registration.nim`` enforces about it.
 ##
-## **KNOWN RED IN THIS LANE, PRE-EXISTING AND NOT INTRODUCED HERE.**
-## ``stackable_hooks.test_execute.test_linux_raw_syscalls`` exits **127**
-## under reprobuild's ``dgAutomaticMonitor`` dependency policy, so
-## ``repro test`` exits 1 on Linux. It is not flaky and it is not a gating
-## decision made here: it reproduces identically at the commit before the
-## corpus landed (22 actions, 21 succeeded, that one failed, three runs) and
-## after it (40 actions, 39 succeeded, the same one failed). The binary
-## itself is healthy — run directly it exits 0 with 38 ``[OK]``.
-##
-## What the monitor costs is silent: under it the run dies after
-## ``ucontext register helpers and raw register replay are exported through
-## C ABI`` with only 35 ``[OK]``, so THREE cases never execute in this lane —
-## ``SIGTRAP install/uninstall substrate restores process handler without
-## raising trap``, ``live INT3 handler replays raw syscall and advances saved
-## RIP`` and ``memory scanner describes callsites in a controlled executable
-## buffer``. The io-mon shim and this repo's live SIGTRAP/INT3 patching do
-## not coexist; both want the trap. Recorded here rather than tolerated
-## quietly, because a lane whose exit code is always 1 stops being read, and
-## because the three skipped cases are a coverage loss the ``[OK]`` count
-## alone does not show. Fixing it is out of scope for the corpus work.
+## The Linux signal fixtures preserve the outer monitor: lifecycle checks
+## own and restore their prior dispositions, and live INT3 replay permits
+## nested delivery while forwarding foreign traps. All 38 raw-syscall cases
+## execute both natively and under automatic monitoring. The original-fail,
+## repaired-pass signal control is shared-actions run 36795427990.
 
 import repro_project_dsl
 import repro_dsl_stdlib/foreign_env
@@ -92,17 +77,26 @@ import ct_test_nim_unittest
 include "tests/corpus.nim"
 
 package stackable_hooks:
+  # `repro exec -- just test` must activate the same complete toolchain as
+  # the graph. Windows provisions archives; the POSIX hosts use Nix.
+  defaultToolProvisioning(when defined(windows): tarball else: nix)
+
   uses:
     # Toolchain floor — the PATH-resolvable binaries the build needs.
     # ``nim`` compiles every test binary (the ``buildNimUnittest.build``
     # edges below) and is ALSO invoked at run time by
-    # ``test_cross_target_compile`` as ``nim check --os:… --cpu:…``; ``gcc``
-    # is the C back-end ``nim c`` shells out to (and, for
+    # ``test_cross_target_compile`` as ``nim check --os:… --cpu:…``; Clang on
+    # macOS and GCC elsewhere supply the C backend (and, for
     # ``test_windows_inline_hook_api`` on Linux, the compiler for the
-    # ``{.compile.}``d ``install_windows.c``). Sufficient for the path-mode
-    # resolver under ``nix develop``.
+    # ``{.compile.}``d ``install_windows.c``).
     "nim >=2.2 <3.0"
-    "gcc >=12"
+    when defined(macosx):
+      "clang"
+    else:
+      "gcc >=12"
+    "just >=1"
+    "nimble"
+    "sh"
 
   # Library declaration — the ``src/`` tree ``config.nims`` puts on
   # ``--path`` is importable when this package is consumed via
@@ -128,6 +122,7 @@ package stackable_hooks:
     # explicit path flag here.
     var testBuildActions: seq[BuildActionDef] = @[]
     var testExecuteActions: seq[BuildActionDef] = @[]
+    const backendCompiler = (when defined(macosx): "clang" else: "gcc")
 
     proc emitTestPair(source, binary: string;
                       buildActions, executeActions: var seq[BuildActionDef]) =
@@ -142,6 +137,7 @@ package stackable_hooks:
         source = source,
         binary = binary,
         actionId = "stackable_hooks.test_build." & stem)
+      appendRegisteredActionToolIdentityRefs(edge.action.id, [backendCompiler])
       buildActions.add(edge.action)
       # ``registerImplicitName = false`` because the BUILD edge already owns
       # the binary basename as the implicit target name; the explicit
@@ -150,6 +146,9 @@ package stackable_hooks:
       let executeEdge = edge.testBinary.run(
         actionId = "stackable_hooks.test_execute." & stem,
         registerImplicitName = false)
+      # The cross-target matrix and process-injection fixtures invoke the
+      # compiler at runtime. A BUILD edge's tools are not inherited by RUN.
+      appendRegisteredActionToolIdentityRefs(executeEdge.id, ["nim", backendCompiler])
       executeActions.add(executeEdge)
 
     # One pair per corpus entry whose ``targets`` cover this host OS. The

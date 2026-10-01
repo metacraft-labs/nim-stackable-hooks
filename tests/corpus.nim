@@ -219,6 +219,10 @@ const testCorpus*: seq[TestEntry] = @[
          "the unconditional `import stackable_hooks/propagation_windows` " &
          "below it fails to COMPILE off Windows, so the runtime skip can " &
          "never be reached. Windows-only by construction."),
+  TestEntry(stem: "test_windows_injector_capture",
+    targets: WindowsOnlyTargets,
+    why: "Exercises real Windows process/pipe inheritance through the " &
+         "Windows-only injector, including a surviving descendant writer."),
   TestEntry(stem: "test_windows_injector_fork_runtime",
     targets: WindowsOnlyTargets,
     why: "Unconditionally imports stackable_hooks/windows_injector, whose " &

@@ -15,6 +15,9 @@ name: CI (reprobuild)
 # host without any other repo-side change.
 
 on:
+  workflow_dispatch:
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [main, dev, stable]
   pull_request:
@@ -29,7 +32,35 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Shared public-repository routing with the existing self-hosted fallback.
+  # Owner: zah. Follow-up: metacraft-specs/issues/
+  # 2026-10-01-macos-ephemeral-runners-lose-job-communication.md
+  choose-linux:
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@cd73eba732b9190499ec78e1e65b0dd784507440
+    with:
+      preferred: ubuntu-24.04
+      fallback: '["self-hosted","linux","x64"]'
+
+  choose-macos:
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@cd73eba732b9190499ec78e1e65b0dd784507440
+    with:
+      preferred: macos-26
+      fallback: '["self-hosted","macos","arm64"]'
+
+  choose-windows:
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@cd73eba732b9190499ec78e1e65b0dd784507440
+    with:
+      preferred: windows-2025
+      fallback: '["self-hosted","windows","x64"]'
+
+  choose-windows-arm:
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@cd73eba732b9190499ec78e1e65b0dd784507440
+    with:
+      preferred: windows-11-arm
+      fallback: '["self-hosted","windows","arm64"]'
+
   reprobuild:
+    needs: [choose-linux, choose-macos, choose-windows, choose-windows-arm]
     name: ${{ matrix.os }}-${{ matrix.arch }} — repro build/test
     strategy:
       fail-fast: false
@@ -50,7 +81,18 @@ jobs:
           - os: windows
             arch: arm64
             runner: [self-hosted, windows, arm64]
-    runs-on: ${{ matrix.runner }}
+    # Native Linux ARM64 keeps the existing release-migration route.
+    # Owner: zah. See metacraft-specs/issues/
+    # 2026-09-28-release-linux-arm64-runner-migration.md.
+    runs-on: ${{ matrix.os == 'windows' && matrix.arch == 'arm64' && fromJSON(needs.choose-windows-arm.outputs.runs_on) || matrix.os == 'windows' && fromJSON(needs.choose-windows.outputs.runs_on) || matrix.os == 'macos' && fromJSON(needs.choose-macos.outputs.runs_on) || matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || fromJSON(needs.choose-linux.outputs.runs_on) }}
+    env:
+      # The ARM host exercises x64 injection through Windows emulation.
+      # Native ARM64 source coverage remains in the cross-target matrix.
+      WINDOWS_DIY_ARCH_OVERRIDE: x64
+      # dev-exec activates ordinary commands through repro exec. Its default
+      # provisioning mode otherwise selects Nix, which cannot run on Windows.
+      # Share the declared tarball toolchain across build, test and cross-checks.
+      REPRO_TOOL_PROVISIONING: ${{ matrix.os == 'windows' && 'tarball' || '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -75,9 +117,16 @@ jobs:
         # setup-dev-env clones the siblings listed in .github/sibling-repos
         # (codetracer-trace-format, codetracer-trace-format-nim) at the
         # workspace-lock-pinned revisions before materialising the env.
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@41d0680bd78ca59ad110a261a20bcaa93a38fffd
         with:
           env-flavor: reprobuild
+          # The selected source bootstrap supplies the runtime closure on
+          # every host, including a usable macOS shell and Windows compiler.
+          repro-from-source: true
+          repro-build-pin: c14b1e618d7c4b64476d89792e80b8e8f10b8a52
+          repro-runquota-pin: 292e578d57eb85d6037f9e2d3a03f0bcb0489dbb
+          repro-io-mon-pin: 5e71adf033b860c0fdbe13dda4320cf4a580f632
+          repro-stackable-hooks-pin: d36cab880711c2f50f57079623a1ce89ba4a83dc
           gh-token: ${{ steps.ci_token.outputs.token }}
 
       - name: repro build
@@ -85,11 +134,11 @@ jobs:
         # `repro.nim`. Verifies the primary shipping artefact (the
         # recorder binary or extension) materialises through the
         # reprobuild engine identically to `just build`.
-        run: dev-exec repro build
+        run: dev-exec repro build --tool-provisioning=${{ matrix.os == 'windows' && 'tarball' || 'nix' }}
 
       - name: repro test
         # Materialises the `test` collection.
-        run: dev-exec repro test
+        run: dev-exec repro test --tool-provisioning=${{ matrix.os == 'windows' && 'tarball' || 'nix' }}
 
       - name: just build (cross-check)
         # Re-runs the legacy `just build` path inside the same env so

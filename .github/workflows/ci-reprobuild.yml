@@ -126,7 +126,7 @@ jobs:
           repro-build-pin: c14b1e618d7c4b64476d89792e80b8e8f10b8a52
           repro-runquota-pin: 292e578d57eb85d6037f9e2d3a03f0bcb0489dbb
           repro-io-mon-pin: 5e71adf033b860c0fdbe13dda4320cf4a580f632
-          repro-stackable-hooks-pin: def2464b2d282c7c1a982689a25953e1d4501f93
+          repro-stackable-hooks-pin: d36cab880711c2f50f57079623a1ce89ba4a83dc
           gh-token: ${{ steps.ci_token.outputs.token }}
 
       - name: repro build
@@ -134,11 +134,11 @@ jobs:
         # `repro.nim`. Verifies the primary shipping artefact (the
         # recorder binary or extension) materialises through the
         # reprobuild engine identically to `just build`.
-        run: dev-exec repro build
+        run: dev-exec repro build --tool-provisioning=${{ matrix.os == 'windows' && 'tarball' || 'nix' }}
 
       - name: repro test
         # Materialises the `test` collection.
-        run: dev-exec repro test
+        run: dev-exec repro test --tool-provisioning=${{ matrix.os == 'windows' && 'tarball' || 'nix' }}
 
       - name: just build (cross-check)
         # Re-runs the legacy `just build` path inside the same env so

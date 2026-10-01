@@ -100,13 +100,15 @@ package stackable_hooks:
     # Toolchain floor — the PATH-resolvable binaries the build needs.
     # ``nim`` compiles every test binary (the ``buildNimUnittest.build``
     # edges below) and is ALSO invoked at run time by
-    # ``test_cross_target_compile`` as ``nim check --os:… --cpu:…``; ``gcc``
-    # is the C back-end ``nim c`` shells out to (and, for
+    # ``test_cross_target_compile`` as ``nim check --os:… --cpu:…``; Clang on
+    # macOS and GCC elsewhere supply the C backend (and, for
     # ``test_windows_inline_hook_api`` on Linux, the compiler for the
-    # ``{.compile.}``d ``install_windows.c``). Sufficient for the path-mode
-    # resolver under ``nix develop``.
+    # ``{.compile.}``d ``install_windows.c``).
     "nim >=2.2 <3.0"
-    "gcc >=12"
+    when defined(macosx):
+      "clang"
+    else:
+      "gcc >=12"
     "just >=1"
     "nimble"
     "sh"
@@ -135,6 +137,7 @@ package stackable_hooks:
     # explicit path flag here.
     var testBuildActions: seq[BuildActionDef] = @[]
     var testExecuteActions: seq[BuildActionDef] = @[]
+    const backendCompiler = (when defined(macosx): "clang" else: "gcc")
 
     proc emitTestPair(source, binary: string;
                       buildActions, executeActions: var seq[BuildActionDef]) =
@@ -149,6 +152,7 @@ package stackable_hooks:
         source = source,
         binary = binary,
         actionId = "stackable_hooks.test_build." & stem)
+      appendRegisteredActionToolIdentityRefs(edge.action.id, [backendCompiler])
       buildActions.add(edge.action)
       # ``registerImplicitName = false`` because the BUILD edge already owns
       # the binary basename as the implicit target name; the explicit
@@ -159,7 +163,7 @@ package stackable_hooks:
         registerImplicitName = false)
       # The cross-target matrix and process-injection fixtures invoke the
       # compiler at runtime. A BUILD edge's tools are not inherited by RUN.
-      appendRegisteredActionToolIdentityRefs(executeEdge.id, ["nim", "gcc"])
+      appendRegisteredActionToolIdentityRefs(executeEdge.id, ["nim", backendCompiler])
       executeActions.add(executeEdge)
 
     # One pair per corpus entry whose ``targets`` cover this host OS. The

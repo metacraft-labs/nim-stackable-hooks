@@ -41,3 +41,8 @@ format-nix:
 
 alias t := test
 alias fmt := format
+
+# Entering the dev shell from another git repository must write nothing there.
+# Runs `nix develop`, so it is not part of the in-shell test recipes.
+test-dev-shell:
+    bash tests/dev_shell_writes_nothing_elsewhere.sh

@@ -1,3 +1,7 @@
+## Real raw-syscall integration tests use executable memory and the host kernel.
+## No mocks. The C ABI fixture checks SIGTRAP with explicit previous handlers,
+## verifies forwarding and restoration, then restores the caller's disposition.
+## Live INT3 cases still execute under the normal outer monitor when present.
 import std/unittest
 
 import stackable_hooks/platform/linux_raw_syscalls

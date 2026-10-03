@@ -25,12 +25,13 @@
 ##   a real DLL whose ``DllMain`` sleeps for as long as the child's
 ##   environment says.
 ##
-## Each is run both ways round against a real ``cmd.exe /c exit 42`` child:
+## Each runs against this same executable in an early child mode that exits 42.
+## Its architecture therefore matches the test on native and emulated hosts.
 ##
 ## * SLOWER THAN THE OLD 5 s DEADLINE, WITHIN THE HARD ONE. The injection
 ##   must succeed, and the child must then run its own ``main`` to its own
 ##   exit code, 42. A corrupted hand-back of the thread cannot produce 42:
-##   ``cmd`` would fault on the borrowed stack first.
+##   the child would fault on the borrowed stack first.
 ## * SLOWER THAN A SHORT HARD DEADLINE. The borrow must report the child
 ##   POISONED, and the child must already be dead with
 ##   ``InjectionAbandonedExitCode``. The test then does what every caller
@@ -113,6 +114,9 @@ when defined(windows) and defined(amd64):
     ShortHardDeadlineMs = 1_500'u32
     ChildRunBudgetMs = 60_000'u32
 
+  if paramCount() == 1 and paramStr(1) == "--slow-call-child":
+    quit(int(ChildExitCode))
+
   proc CreateProcessW(lpApplicationName: LPCWSTR, lpCommandLine: LPWSTR,
                       lpProcessAttributes: pointer,
                       lpThreadAttributes: pointer,
@@ -146,13 +150,8 @@ when defined(windows) and defined(amd64):
       result[i] = uint16(c)
     result[s.len] = 0'u16
 
-  proc comSpec(): string =
-    result = getEnv("ComSpec")
-    if result.len == 0:
-      result = getEnv("SystemRoot", r"C:\Windows") / "System32" / "cmd.exe"
-
   proc childCommandLine(): string =
-    "\"" & comSpec() & "\" /c exit " & $ChildExitCode
+    "\"" & getAppFilename() & "\" --slow-call-child"
 
   proc spawnSuspended(): PROCESS_INFORMATION =
     var cmdW = toWide(childCommandLine())

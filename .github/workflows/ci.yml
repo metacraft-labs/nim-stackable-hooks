@@ -1,6 +1,9 @@
 name: CI
 
 on:
+  workflow_dispatch:
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [main, dev, stable, io-mon-fixes]
   pull_request:
@@ -18,9 +21,25 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Shared public-repository routing with the existing self-hosted fallback.
+  # Owner: zah. Follow-up: metacraft-specs/issues/
+  # 2026-10-01-macos-ephemeral-runners-lose-job-communication.md
+  choose-linux:
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@cd73eba732b9190499ec78e1e65b0dd784507440
+    with:
+      preferred: ubuntu-24.04
+      fallback: '["self-hosted","linux","x64"]'
+
+  choose-macos:
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@cd73eba732b9190499ec78e1e65b0dd784507440
+    with:
+      preferred: macos-26
+      fallback: '["self-hosted","macos","arm64"]'
+
   lint:
+    needs: [choose-linux]
     name: Lint
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ${{ fromJSON(needs.choose-linux.outputs.runs_on) }}
     steps:
       - name: Generate CI token
         id: app-token
@@ -56,8 +75,9 @@ jobs:
           retention-days: 30
 
   build:
+    needs: [choose-linux, choose-macos]
     name: Build
-    runs-on: ${{ matrix.runs-on }}
+    runs-on: ${{ contains(matrix.runs-on, 'macos') && fromJSON(needs.choose-macos.outputs.runs_on) || fromJSON(needs.choose-linux.outputs.runs_on) }}
     strategy:
       fail-fast: false
       matrix:
@@ -100,8 +120,9 @@ jobs:
           retention-days: 30
 
   test:
+    needs: [choose-linux, choose-macos]
     name: Test
-    runs-on: ${{ matrix.runs-on }}
+    runs-on: ${{ contains(matrix.runs-on, 'macos') && fromJSON(needs.choose-macos.outputs.runs_on) || fromJSON(needs.choose-linux.outputs.runs_on) }}
     strategy:
       fail-fast: false
       matrix:
@@ -128,9 +149,14 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Dev Environment
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@41d0680bd78ca59ad110a261a20bcaa93a38fffd
         with:
           env-flavor: ${{ matrix.env }}
+          repro-from-source: ${{ matrix.env == 'reprobuild' }}
+          repro-build-pin: c14b1e618d7c4b64476d89792e80b8e8f10b8a52
+          repro-runquota-pin: 292e578d57eb85d6037f9e2d3a03f0bcb0489dbb
+          repro-io-mon-pin: 5e71adf033b860c0fdbe13dda4320cf4a580f632
+          repro-stackable-hooks-pin: def2464b2d282c7c1a982689a25953e1d4501f93
           gh-token: ${{ steps.app-token.outputs.token }}
 
       - name: Run tests

@@ -1,3 +1,9 @@
+/* Real C ABI integration fixtures: executable mappings, raw syscalls and
+ * process signal dispositions; no mocks. The SIGTRAP lifecycle case owns its
+ * previous disposition for each scenario, verifies forwarding and restoration,
+ * and restores the ambient handler on every return path. This lets it run under
+ * a monitor without forwarding invented signal data into the monitor handler.
+ */
 #define _GNU_SOURCE
 #include <stdint.h>
 #include <stddef.h>
@@ -223,6 +229,19 @@ static void stackable_test_sigtrap_handler(int signo, siginfo_t *info, void *uct
   (void)uctx;
 }
 
+static volatile sig_atomic_t stackable_chain_calls;
+static volatile sig_atomic_t stackable_chain_arguments_match;
+static siginfo_t *stackable_chain_expected_info;
+static void *stackable_chain_expected_context;
+
+static void stackable_test_prior_sigtrap_handler(
+    int signo, siginfo_t *info, void *uctx) {
+  stackable_chain_calls++;
+  stackable_chain_arguments_match = signo == SIGTRAP &&
+      info == stackable_chain_expected_info &&
+      uctx == stackable_chain_expected_context;
+}
+
 static void *stackable_live_int3_site;
 static volatile sig_atomic_t stackable_live_int3_hits;
 static volatile sig_atomic_t stackable_live_int3_failures;
@@ -234,8 +253,10 @@ static void stackable_live_int3_handler(int signo, siginfo_t *info, void *uctx) 
   int rc = stackable_linux_capture_syscall_regs_from_ucontext(uctx, &regs);
   if (rc != 0 ||
       regs.syscall_address != (unsigned long)(uintptr_t)stackable_live_int3_site) {
-    stackable_live_int3_failures++;
-    (void)stackable_linux_chain_sigtrap(signo, info, uctx);
+    /* The outer monitor owns other patched sites, including raw replay.
+     * Successful forwarding is expected; only an unhandled trap fails. */
+    if (stackable_linux_chain_sigtrap(signo, info, uctx) != 0)
+      stackable_live_int3_failures++;
     return;
   }
   long result = stackable_linux_replay_syscall_regs(&regs);
@@ -403,23 +424,67 @@ long stackable_test_replay_getpid(void) {
 }
 
 int stackable_test_sigtrap_install_uninstall_smoke(void) {
-  int rc = stackable_linux_install_sigtrap_handler(
-      (void *)&stackable_test_sigtrap_handler, 0);
-  if (rc != 0) return -1;
-  rc = stackable_linux_install_sigtrap_handler(
-      (void *)&stackable_test_sigtrap_handler, 0);
-  if (rc != 5) {
-    (void)stackable_linux_uninstall_sigtrap_handler();
-    return -4;
+  struct sigaction ambient, prior, observed;
+  int outcome = 0;
+  int installed = 0;
+  if (sigaction(SIGTRAP, NULL, &ambient) != 0) return -10;
+
+  for (int mode = 0; mode < 3; mode++) {
+    memset(&prior, 0, sizeof(prior));
+    sigemptyset(&prior.sa_mask);
+    sigaddset(&prior.sa_mask, SIGUSR1);
+    if (mode == 2) {
+      prior.sa_flags = SA_SIGINFO;
+      prior.sa_sigaction = &stackable_test_prior_sigtrap_handler;
+    } else {
+      prior.sa_handler = mode == 0 ? SIG_DFL : SIG_IGN;
+    }
+    if (sigaction(SIGTRAP, &prior, NULL) != 0) {
+      outcome = -11; goto cleanup;
+    }
+    int rc = stackable_linux_install_sigtrap_handler(
+        (void *)&stackable_test_sigtrap_handler, 0);
+    if (rc != 0) { outcome = -1; goto cleanup; }
+    installed = 1;
+    rc = stackable_linux_install_sigtrap_handler(
+        (void *)&stackable_test_sigtrap_handler, 0);
+    if (rc != 5) { outcome = -4; goto cleanup; }
+
+    siginfo_t info;
+    ucontext_t context;
+    memset(&info, 0, sizeof(info));
+    memset(&context, 0, sizeof(context));
+    info.si_signo = SIGTRAP;
+    info.si_code = SI_USER;
+    stackable_chain_calls = 0;
+    stackable_chain_arguments_match = 0;
+    stackable_chain_expected_info = &info;
+    stackable_chain_expected_context = &context;
+    rc = stackable_linux_chain_sigtrap(SIGTRAP, &info, &context);
+    if (mode == 2) {
+      if (rc != 0 || stackable_chain_calls != 1 ||
+          !stackable_chain_arguments_match) {
+        outcome = -12; goto cleanup;
+      }
+    } else if (rc != 16 || stackable_chain_calls != 0) {
+      outcome = -2; goto cleanup;
+    }
+    rc = stackable_linux_uninstall_sigtrap_handler();
+    if (rc != 0) { outcome = -3; goto cleanup; }
+    installed = 0;
+    if (sigaction(SIGTRAP, NULL, &observed) != 0 ||
+        (observed.sa_flags & SA_SIGINFO) != (prior.sa_flags & SA_SIGINFO) ||
+        sigismember(&observed.sa_mask, SIGUSR1) != 1 ||
+        (mode == 2 ? observed.sa_sigaction != prior.sa_sigaction :
+                     observed.sa_handler != prior.sa_handler)) {
+      outcome = -13; goto cleanup;
+    }
   }
-  rc = stackable_linux_chain_sigtrap(SIGTRAP, NULL, NULL);
-  if (rc != 16) {
-    (void)stackable_linux_uninstall_sigtrap_handler();
-    return -2;
-  }
-  rc = stackable_linux_uninstall_sigtrap_handler();
-  if (rc != 0) return -3;
-  return 0;
+cleanup:
+  if (installed && stackable_linux_uninstall_sigtrap_handler() != 0)
+    outcome = -14;
+  if (sigaction(SIGTRAP, &ambient, NULL) != 0) outcome = -15;
+  return outcome;
 }
 
 long stackable_test_live_int3_getpid_continuation(void) {
@@ -447,8 +512,10 @@ long stackable_test_live_int3_getpid_continuation(void) {
     return -1002;
   }
 
+  /* Replay can enter a raw-syscall site patched by the outer monitor.
+   * Let its nested SIGTRAP reach the forwarding branch above. */
   rc = stackable_linux_install_sigtrap_handler(
-      (void *)&stackable_live_int3_handler, 0);
+      (void *)&stackable_live_int3_handler, SA_NODEFER);
   if (rc != 0) {
     int ignored_errno = 0;
     (void)stackable_linux_restore_int3_syscall(

@@ -1,8 +1,24 @@
 # Windows ARM-host compiler startup stalls in the hook transaction
 
-Status: open. Hooks `8f4d806`, io-mon `5e71adf`, RunQuota `8cf662c`.
+Status: open for downstream full-graph validation and unattributed launch failures.
+Observed with hooks `8f4d806`, io-mon `5e71adf`, RunQuota `8cf662c`.
 
-## Current candidate plan, 2026-10-01
+## Current validation, 2026-10-01
+
+PR 12 merges helper `43b1835` as `59a2bac`, with identical trees. It includes
+prepared patch pages, the matched-child fixture and the independently verified
+injection-permit lock initialization. All seven CI jobs and five Reprobuild
+platform jobs pass at `43b1835`, including fresh PR runs `36806650765` and
+`36806650803`. The paired page-preparation corpus below remains compatibility
+evidence: both original and prepared variants pass. Do not attribute every
+compiler-launch failure to the earlier measured protection stall.
+
+RunQuota `d6ee458` selects that same immutable helper source. Its complete
+Reprobuild run `36823482913` is still compiling on Windows ARM as of 07:20 UTC.
+Earlier consumer `2d3897c` passed all compilation but failed separate runtime
+checks. Keep the downstream result distinct from the helper's completed CI.
+
+## Earlier candidate plan, 2026-10-01
 
 The unchanged ordinary RunQuota `a173baf` retry again finishes 102 of 103
 compilations and fails a GCC child launch with error 1460 (run `36765565687`,

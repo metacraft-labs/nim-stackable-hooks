@@ -77,19 +77,27 @@
             '';
           };
 
-          devShells.default = pkgs.mkShell {
-            # Not `inputsFrom = [ config.pre-commit.devShell ]`: that shell's
-            # hook installs the git hooks without `ownRepoOnly`.
-            shellHook = ownRepoOnly config.pre-commit.installationScript;
-            packages = config.pre-commit.settings.enabledPackages ++ [
-              config.pre-commit.settings.package
-              pkgs.just
-              pkgs.nim2
-              pkgs.nimble
-              pkgs.git
-              pkgs.nixfmt
-            ];
-          };
+          devShells.default = pkgs.mkShell (
+            {
+              # Not `inputsFrom = [ config.pre-commit.devShell ]`: that shell's
+              # hook installs the git hooks without `ownRepoOnly`.
+              shellHook = ownRepoOnly config.pre-commit.installationScript;
+              packages = config.pre-commit.settings.enabledPackages ++ [
+                config.pre-commit.settings.package
+                pkgs.just
+                pkgs.nim2
+                pkgs.nimble
+                pkgs.git
+                pkgs.nixfmt
+              ];
+            }
+            // pkgs.lib.optionalAttrs pkgs.stdenv.isDarwin {
+              # Nimble links OpenSSL but also loads SSL symbols dynamically.
+              # Keep both paths on the same implementation instead of Apple's
+              # incompatible LibreSSL, which crashes before the test task runs.
+              DYLD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ pkgs.openssl ];
+            }
+          );
         };
     };
 }

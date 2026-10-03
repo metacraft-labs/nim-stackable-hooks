@@ -20,6 +20,7 @@ when defined(windows):
 
   import std/atomics
   import std/monotimes
+  import std/os
   import std/times
   import std/unittest
 
@@ -34,9 +35,12 @@ when defined(windows):
   var outcomes {.global.}: array[InjectionOutcome, Atomic[int]]
     ## One counter per InjectionOutcome. Worker threads write the
     ## counters and the main thread reads them after join.
+  var workersMayStart {.global.}: Atomic[bool]
 
   proc injectionWorker(threadIdx: int) {.thread, gcsafe.} =
     discard threadIdx
+    while not workersMayStart.load():
+      sleep(1)
     let bogus = cast[pointer](cast[uint](0xDEAD_BEEF_BAD0_F00D'u))
     let cfg = InjectionConfig(maxInFlight: Cap,
                               waitDeadlineMs: Deadline,
@@ -52,11 +56,15 @@ when defined(windows):
     test "32x64 concurrent injections complete in bounded time":
       for outcome in InjectionOutcome:
         outcomes[outcome].store(0)
+      workersMayStart.store(false)
 
       let start = getMonoTime()
       var threads: array[Threads, Thread[int]]
       for threadIndex in 0 ..< Threads:
         createThread(threads[threadIndex], injectionWorker, threadIndex)
+      # Release first callers together; otherwise an early worker can finish
+      # initialization before the next thread has even been created.
+      workersMayStart.store(true)
       joinThreads(threads)
       let elapsed = inMilliseconds(getMonoTime() - start)
 

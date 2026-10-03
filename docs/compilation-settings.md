@@ -2,7 +2,7 @@
 
 `nim-stackable-hooks` is used to build **injected shims** — libraries loaded into
 an arbitrary host process via `DYLD_INSERT_LIBRARIES` (macOS), `LD_PRELOAD`
-(Linux), or DLL injection (Windows) — whose hook functions run *inside* that host.
+(Linux), or DLL injection (Windows) — whose hook functions run _inside_ that host.
 
 This document does **not** outlaw any Nim compilation setting. It explains the
 hazards each one carries in the injected-shim environment so an adopter can choose
@@ -30,7 +30,7 @@ deliberately. The single organizing idea:
 A Nim `{.threadvar.}`, or a C `__thread` / `_Thread_local` — with **any**
 `tls_model`, including `initial-exec` — is, in a dlopen'd / inserted image:
 
-- **macOS:** a dyld **TLV**. The *first* access on a given thread calls
+- **macOS:** a dyld **TLV**. The _first_ access on a given thread calls
   `tlv_get_addr → tlv_allocate_and_initialize_for_key → malloc`.
 - **Windows:** an image-TLS-directory slot that the loader must patch into each
   live thread's TLS array; threads created outside the loader's view (CLR) can
@@ -50,24 +50,24 @@ in a hostile context needs per-thread state. Create the key once at constructor
 time. `reentrancy.nim` uses the Windows `TlsAlloc` form of the same idea.
 
 Note that `--tlsEmulation:on|off` does **not** save you on macOS: emulated TLS is a
-function call that lazily `malloc`s, and native macOS TLS is a TLV that *also*
+function call that lazily `malloc`s, and native macOS TLS is a TLV that _also_
 lazily `malloc`s. Both are unsafe from inside libmalloc.
 
 ## Per-setting hazards
 
-| Setting | What it injects | Hazard in a hostile context |
-|---|---|---|
-| `--exceptions:goto` (default) | `nimErr_ = nimErrorFlag()` at proc entry; `nimErrorFlag()` reads the `nimInErrorMode` **threadvar** | Entering *any* such proc touches a threadvar → macOS TLV first-touch `malloc`. |
-| `--exceptions:setjmp` | `setjmp`/`longjmp` frames | No error-flag threadvar, but `setjmp` buffers and unwinding are heavier; avoid raising across a hostile hook. |
-| `--exceptions:quirky` | *nothing* — no error propagation | Removes the `nimInErrorMode` threadvar access. Appropriate for a shim that does not rely on exceptions; but raised exceptions are then silently unsound, so hot paths must be `{.raises: [].}` and error-free. |
-| `--stackTrace:on` / `--lineTrace:on` | `framePtr` **threadvar** push/pop per proc | Same threadvar-first-touch hazard as above. A shim rarely needs Nim stack traces. |
-| `--mm:orc` (default) | reference counting + cycle collector; allocations touch GC state | Allocating in a hostile context is unsafe (it calls `malloc`). A background collector adds threads. |
-| `--mm:arc` | reference counting, no cycle collector | More C-like; still allocates. |
-| `--mm:none` / `--os:standalone` | no GC; allocation forbidden | Safest, but the shim may not use `seq`/`string`/heap types on any path. |
-| `--tlsEmulation:on/off` | emulated vs native TLS | Neither is safe from inside libmalloc on macOS (see above). |
-| `-d:noSignalHandler` | *removes* Nim's SIGSEGV/… handlers | **Recommended on.** A shim must not install signal handlers — it would clobber the host's (e.g. rustc's stack-overflow handler). |
-| `--threads:on` | thread-aware runtime + thread-locals | Required for per-thread correctness; interacts with all of the above. |
-| `-d:danger` | disables checks + stack traces | Removes overflow/bounds checks (which call `raiseX`), but does **not** change `--exceptions`, so `nimErrorFlag` remains unless combined with `quirky`. |
+| Setting                              | What it injects                                                                                     | Hazard in a hostile context                                                                                                                                                                                    |
+| ------------------------------------ | --------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--exceptions:goto` (default)        | `nimErr_ = nimErrorFlag()` at proc entry; `nimErrorFlag()` reads the `nimInErrorMode` **threadvar** | Entering _any_ such proc touches a threadvar → macOS TLV first-touch `malloc`.                                                                                                                                 |
+| `--exceptions:setjmp`                | `setjmp`/`longjmp` frames                                                                           | No error-flag threadvar, but `setjmp` buffers and unwinding are heavier; avoid raising across a hostile hook.                                                                                                  |
+| `--exceptions:quirky`                | _nothing_ — no error propagation                                                                    | Removes the `nimInErrorMode` threadvar access. Appropriate for a shim that does not rely on exceptions; but raised exceptions are then silently unsound, so hot paths must be `{.raises: [].}` and error-free. |
+| `--stackTrace:on` / `--lineTrace:on` | `framePtr` **threadvar** push/pop per proc                                                          | Same threadvar-first-touch hazard as above. A shim rarely needs Nim stack traces.                                                                                                                              |
+| `--mm:orc` (default)                 | reference counting + cycle collector; allocations touch GC state                                    | Allocating in a hostile context is unsafe (it calls `malloc`). A background collector adds threads.                                                                                                            |
+| `--mm:arc`                           | reference counting, no cycle collector                                                              | More C-like; still allocates.                                                                                                                                                                                  |
+| `--mm:none` / `--os:standalone`      | no GC; allocation forbidden                                                                         | Safest, but the shim may not use `seq`/`string`/heap types on any path.                                                                                                                                        |
+| `--tlsEmulation:on/off`              | emulated vs native TLS                                                                              | Neither is safe from inside libmalloc on macOS (see above).                                                                                                                                                    |
+| `-d:noSignalHandler`                 | _removes_ Nim's SIGSEGV/… handlers                                                                  | **Recommended on.** A shim must not install signal handlers — it would clobber the host's (e.g. rustc's stack-overflow handler).                                                                               |
+| `--threads:on`                       | thread-aware runtime + thread-locals                                                                | Required for per-thread correctness; interacts with all of the above.                                                                                                                                          |
+| `-d:danger`                          | disables checks + stack traces                                                                      | Removes overflow/bounds checks (which call `raiseX`), but does **not** change `--exceptions`, so `nimErrorFlag` remains unless combined with `quirky`.                                                         |
 
 ## Guidance
 
@@ -79,7 +79,7 @@ lazily `malloc`s. Both are unsafe from inside libmalloc.
 - **Shrink the threadvar surface** by compiling the shim as C-like as your feature
   set allows: at minimum `--stackTrace:off --lineTrace:off -d:noSignalHandler`; add
   `--exceptions:quirky` (or make hot procs `{.raises: [].}`) if you do not depend on
-  Nim exceptions; consider `--mm:arc`. This does not by itself make a *specific*
+  Nim exceptions; consider `--mm:arc`. This does not by itself make a _specific_
   hostile hook safe — an application `{.threadvar.}` on that path is still unsafe —
   but it removes the compiler-injected threadvars from every other hook.
 - **`nim-stackable-hooks` mandates none of this.** It provides the safe primitives

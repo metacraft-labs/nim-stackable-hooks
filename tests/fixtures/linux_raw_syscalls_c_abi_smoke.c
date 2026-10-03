@@ -181,7 +181,7 @@ extern long stackable_linux_replay_syscall_regs(
 extern int stackable_linux_install_sigtrap_handler(void *handler, int extra_flags);
 extern int stackable_linux_uninstall_sigtrap_handler(void);
 extern int stackable_linux_chain_sigtrap(int signum, void *siginfo_ptr,
-                                         void *ucontext_ptr);
+                                          void *ucontext_ptr);
 extern int stackable_linux_locate_vdso_image(
     struct stackable_linux_vdso_image *out);
 extern int stackable_linux_parse_vdso_image_at(
@@ -476,7 +476,7 @@ int stackable_test_sigtrap_install_uninstall_smoke(void) {
         (observed.sa_flags & SA_SIGINFO) != (prior.sa_flags & SA_SIGINFO) ||
         sigismember(&observed.sa_mask, SIGUSR1) != 1 ||
         (mode == 2 ? observed.sa_sigaction != prior.sa_sigaction :
-                     observed.sa_handler != prior.sa_handler)) {
+                      observed.sa_handler != prior.sa_handler)) {
       outcome = -13; goto cleanup;
     }
   }

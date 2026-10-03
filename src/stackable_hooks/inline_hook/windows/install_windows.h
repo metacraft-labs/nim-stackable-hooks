@@ -164,8 +164,8 @@ int ct_inline_hook_install_noreturn(void *target, void *record_callback,
  * See ct_inline_hook_install_no_suspend for the required caller-proved
  * single-thread/no-executing-prologue invariant. */
 int ct_inline_hook_install_noreturn_no_suspend(void *target,
-                                               void *record_callback,
-                                               void **out_trampoline);
+                                                void *record_callback,
+                                                void **out_trampoline);
 
 /* Uninstall the hook at `target`, restoring the original prologue
  * bytes.  Returns 0 on success, <0 on failure:

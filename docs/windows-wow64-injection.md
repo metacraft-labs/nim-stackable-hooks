@@ -14,7 +14,7 @@ not match the loading process and returns NULL. The child is left running and
 unmonitored.
 
 **The address is wrong.** The injector resolves `LoadLibraryW` with
-`GetProcAddress` in *its own* process. That is sound between processes of the
+`GetProcAddress` in _its own_ process. That is sound between processes of the
 same bitness, where `kernel32.dll` is loaded at a shared base — and it is what
 the same-bitness path still does. A WOW64 process instead loads
 `C:\Windows\SysWOW64\kernel32.dll` at an unrelated base, so the 64-bit address
@@ -42,12 +42,12 @@ and no possibility of truncation.
 
 Contract:
 
-| | |
-|---|---|
-| exit code | the address of the requested proc in a 32-bit process |
-| exit code `0` | resolution failed — unambiguous, since no proc lives at address 0 |
-| `argv[1]` | proc to resolve; defaults to `LoadLibraryW` |
-| `argv[1] argv[2]` | a DLL path and a proc name — exit code is that export's **RVA** |
+|                   |                                                                   |
+| ----------------- | ----------------------------------------------------------------- |
+| exit code         | the address of the requested proc in a 32-bit process             |
+| exit code `0`     | resolution failed — unambiguous, since no proc lives at address 0 |
+| `argv[1]`         | proc to resolve; defaults to `LoadLibraryW`                       |
+| `argv[1] argv[2]` | a DLL path and a proc name — exit code is that export's **RVA**   |
 
 ## Getting the shim initialised once it is loaded
 
@@ -61,13 +61,13 @@ process cannot `LoadLibraryW` a 32-bit image, for the same machine-type reason
 the child cannot load the 64-bit one.
 
 This failure is the quietest in the whole mechanism, and worth recognising by
-its shape. `LoadLibraryW` in the child *succeeded*, so nothing errors. The shim
+its shape. `LoadLibraryW` in the child _succeeded_, so nothing errors. The shim
 is present in the child, correctly mapped, and completely inert: no hooks
 installed, not one record emitted. What it looks like from outside is a process
 with no dependencies.
 
 The probe's second mode answers it: an RVA is bitness-agnostic once something
-that *can* read the image reports it. The DLL is opened with
+that _can_ read the image reports it. The DLL is opened with
 `DONT_RESOLVE_DLL_REFERENCES`, so its `DllMain` does not run — resolving an
 export needs only the mapped image, and running a monitor shim's initialiser
 inside the probe would install hooks there and emit stray records into whatever
@@ -77,7 +77,7 @@ The same correction applies to `propagation_windows`, where a **64-bit** shim
 propagating into a WOW64 grandchild injects `<name>32.dll` — a different binary
 whose exports sit at different offsets — so its own in-module RVA does not
 transfer either. A 32-bit shim propagating into a 32-bit child needs no probe:
-it *is* the image being injected.
+it _is_ the image being injected.
 
 ## Export names must match across bitnesses
 
@@ -162,7 +162,7 @@ which the system resolves unconditionally.
 **Do not put the i686 toolchain on the global PATH.** The 64-bit build will
 then pick up the i686 compiler and fail on nimbase.h's pointer-size assertion.
 Scope it to the 32-bit invocations. Note also that the i686 `gcc.exe` needs its
-*own* `bin` directory on PATH to load `libwinpthread-1.dll` and
+_own_ `bin` directory on PATH to load `libwinpthread-1.dll` and
 `libgcc_s_dw2-1.dll`; without it the compiler fails to start, exits 1 and
 prints nothing, which reads as a compile error in whichever `.c` file happened
 to be first.
@@ -185,8 +185,8 @@ init entry point.
 **32-bit shim -> 64-bit child.** A WOW64 process cannot do this at all. Its
 `VirtualAllocEx` / `WriteProcessMemory` / `CreateRemoteThread` go through the
 WOW64 thunk layer, which does not address a 64-bit target, and it cannot
-resolve the 64-bit `kernel32` either. Where a *value* can be fetched from a
-process of the right bitness, an *operation* cannot -- so this case delegates
+resolve the 64-bit `kernel32` either. Where a _value_ can be fetched from a
+process of the right bitness, an _operation_ cannot -- so this case delegates
 the whole injection to `stackable_hooks_inject64.exe`, a 64-bit helper found
 beside the shim by convention and addressed by pid.
 
@@ -217,11 +217,11 @@ reported nothing but its process-start.
 now selects the mode from the build target, which is sound because this
 machinery only ever rewrites code already mapped in its own process. Three
 things change with it: REX is not consumed, `REX.W` cannot widen an immediate,
-and the one-byte opcodes that are `OP_INVALID` *because* 64-bit mode dropped
+and the one-byte opcodes that are `OP_INVALID` _because_ 64-bit mode dropped
 them (`PUSHA`, `DAA`, the segment pushes, far `CALL`/`JMP`, `AAM`/`AAD`, ...)
 are re-scored. The trampoline emitters and the rel32 fixup follow the same
 switch: `FF /4` takes an absolute operand rather than a RIP-relative one, and
-`mod=00 rm=101` is an absolute disp32 that must *not* be rewritten.
+`mod=00 rm=101` is an absolute disp32 that must _not_ be rewritten.
 
 Still 64-bit-only: `ct_inline_hook_install_noreturn`, whose entry stub is
 hand-assembled against the Win64 ABI. Nothing calls it on 32-bit, and the
@@ -251,7 +251,7 @@ i386, which is why reprobuild's `packages/make.nim` pins the 64-bit WinLibs
 `mingw32-make` instead.
 
 For a consumer that grades dependency evidence, an un-injectable child is not
-merely unmonitored: it is an *unknown-scope loss*, which can disqualify the
+merely unmonitored: it is an _unknown-scope loss_, which can disqualify the
 whole action from publishing to the action cache. One 32-bit trampoline on PATH
 is enough to make every build in that tree uncacheable.
 

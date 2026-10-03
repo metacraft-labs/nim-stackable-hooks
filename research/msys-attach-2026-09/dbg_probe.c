@@ -62,8 +62,8 @@ int wmain(int argc, wchar_t **argv) {
       DWORD w=WaitForSingleObject(th,15000);
       if(w==WAIT_TIMEOUT){ ts("*** remote thread timed out ***"); }
       else { DWORD ex=0; GetExitCodeThread(th,&ex);
-             fprintf(stderr,"LoadLibraryW low32=0x%08lX (%s)\n",ex,ex?"loaded":"FAILED");
-             VirtualFreeEx(pi.hProcess,rb,0,MEM_RELEASE); }
+              fprintf(stderr,"LoadLibraryW low32=0x%08lX (%s)\n",ex,ex?"loaded":"FAILED");
+              VirtualFreeEx(pi.hProcess,rb,0,MEM_RELEASE); }
       CloseHandle(th);
       ts("ResumeThread(main) -- user code starts now, shim already mapped");
       ResumeThread(mainThread);

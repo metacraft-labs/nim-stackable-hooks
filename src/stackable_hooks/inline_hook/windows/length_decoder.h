@@ -85,7 +85,7 @@ int ct_ild_decode(const unsigned char *code, size_t max_len);
  *                    (caller falls back to int3 patching).
  */
 int ct_ild_decode_to_cover(const unsigned char *code, size_t target_bytes,
-                           size_t max_len);
+                            size_t max_len);
 
 #ifdef __cplusplus
 }

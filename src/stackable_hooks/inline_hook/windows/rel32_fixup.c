@@ -184,9 +184,9 @@ static void store_le32(uint8_t *p, int32_t v)
 static int32_t load_le32(const uint8_t *p)
 {
     uint32_t u = (uint32_t)p[0]
-               | ((uint32_t)p[1] << 8)
-               | ((uint32_t)p[2] << 16)
-               | ((uint32_t)p[3] << 24);
+                | ((uint32_t)p[1] << 8)
+                | ((uint32_t)p[2] << 16)
+                | ((uint32_t)p[3] << 24);
     return (int32_t)u;
 }
 
@@ -236,8 +236,8 @@ int ct_thunk_arena_init(ct_thunk_arena_t *arena, uintptr_t near_addr)
     while ((int64_t)(hi - near_addr) < window || (int64_t)(near_addr - lo) < window) {
         if (hi != 0 && (int64_t)(hi - near_addr) < window) {
             got = VirtualAlloc((LPVOID)hi, CT_THUNK_ARENA_BYTES,
-                               MEM_RESERVE | MEM_COMMIT,
-                               PAGE_EXECUTE_READWRITE);
+                                MEM_RESERVE | MEM_COMMIT,
+                                PAGE_EXECUTE_READWRITE);
             if (got != NULL) break;
             hi += step;
         } else {
@@ -246,8 +246,8 @@ int ct_thunk_arena_init(ct_thunk_arena_t *arena, uintptr_t near_addr)
         if (lo > step && (int64_t)(near_addr - lo) < window) {
             lo -= step;
             got = VirtualAlloc((LPVOID)lo, CT_THUNK_ARENA_BYTES,
-                               MEM_RESERVE | MEM_COMMIT,
-                               PAGE_EXECUTE_READWRITE);
+                                MEM_RESERVE | MEM_COMMIT,
+                                PAGE_EXECUTE_READWRITE);
             if (got != NULL) break;
         } else if (lo <= step) {
             lo = 0;
@@ -261,8 +261,8 @@ int ct_thunk_arena_init(ct_thunk_arena_t *arena, uintptr_t near_addr)
          * case the caller's first allocation attempt will fail the
          * fits_int32 check and surface as a thunk-alloc failure. */
         got = VirtualAlloc(NULL, CT_THUNK_ARENA_BYTES,
-                           MEM_RESERVE | MEM_COMMIT,
-                           PAGE_EXECUTE_READWRITE);
+                            MEM_RESERVE | MEM_COMMIT,
+                            PAGE_EXECUTE_READWRITE);
         if (got == NULL) return -1;
     }
 
@@ -495,7 +495,7 @@ static int fixup_one_insn(const uint8_t *orig_bytes,
 
     if (fits_int32(new_disp_64)) {
         store_le32(tramp_bytes + insn_off + disp_off_in_insn,
-                   (int32_t)new_disp_64);
+                    (int32_t)new_disp_64);
         return 0;
     }
 
@@ -561,7 +561,7 @@ static int fixup_one_insn(const uint8_t *orig_bytes,
      * (delta is signed, may be negative). */
     if (!fits_int32(new_disp_from_thunk)) return -3;
     store_le32(tramp_bytes + insn_off + disp_off_in_insn,
-               (int32_t)new_disp_from_thunk);
+                (int32_t)new_disp_from_thunk);
     return 0;
 }
 

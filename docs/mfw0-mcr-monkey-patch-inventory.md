@@ -267,22 +267,22 @@ M-FW-1 implementation note:
 
 - [x] Each required MCR monkey-patch helper family is listed with source files.
 - [x] Linux `syscall(2)` wrapper patching includes
-  `recording/syscall_callsite_patch.nim` and `clone3_callsite_patch.c`.
+      `recording/syscall_callsite_patch.nim` and `clone3_callsite_patch.c`.
 - [x] Program-text raw syscall scan/INT3 trapping includes
-  `recording/program_syscall_scan.nim` and
-  `static_shim/program_syscall_scan.c`.
+      `recording/program_syscall_scan.nim` and
+      `static_shim/program_syscall_scan.c`.
 - [x] Linux vDSO patching includes `recording/vdso_patch.nim`.
 - [x] POSIX atomic/JIT callsite patching includes
-  `atomic_callsite_patch_posix.c` and `atomic_jit_patch_posix.c`.
+      `atomic_callsite_patch_posix.c` and `atomic_jit_patch_posix.c`.
 - [x] Windows inline/IAT coverage includes the already extracted helpers plus
-  MCR no-suspend/single-thread stage0 uses in `ntdll_detours_windows.nim` and
-  `ldrloaddll_detour_windows.nim`.
+      MCR no-suspend/single-thread stage0 uses in `ntdll_detours_windows.nim` and
+      `ldrloaddll_detour_windows.nim`.
 - [x] io-mon macOS bodypatch is recorded as a non-MCR source for M-FW-1.
 - [x] The document separates algorithmic helper candidates from
-  consumer-owned adapters, policy, record/replay, and stage0 composition.
+      consumer-owned adapters, policy, record/replay, and stage0 composition.
 - [x] Expected future consumers are named for every family.
 - [x] The stage0 boundary is explicit: helper primitives may be shared, but
-  stage0 architecture and composition stay MCR-owned.
+      stage0 architecture and composition stay MCR-owned.
 - [x] No later milestone is marked complete by this document.
 
 ## Automated Checks

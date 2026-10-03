@@ -459,3 +459,33 @@ retention and export/merge. No phase-130 trace accompanies them. Evidence is
 records the execution results and the focused comparison. This supplies a
 second complete compilation with prepared pages, but no passing complete
 release gate and no controlled reproduction establishing the repair.
+
+## GCC's "No such file or directory" is this failed spawn
+
+The ordinary `cc1.exe`/`as.exe` launch failures above were left unattributed
+because they lack a phase trace and could mean a missing compiler file.
+Checked on 2026-10-01, they do not:
+
+- GCC's driver (libiberty `pex_win32_exec_child`) reports every failed
+  `CreateProcess` as `ENOENT`. With the WinLibs 16.1.0 `gcc.exe` the ARM job
+  uses, `gcc -B<dir>/ -c t.c` where `<dir>/cc1.exe` exists but is not a PE
+  image prints `cannot execute '<dir>/cc1.exe': CreateProcess: No such file
+or directory`.
+- The prefix is complete: the pinned archive (re-downloaded, SHA-256
+  `62fb8588...e232` verified) contains both images, the same prefix id realized
+  on Windows x64 holds all 11,750 archive files, RunQuota `48bb701`'s ARM job
+  ran 101 cold compiles from it, and an `as.exe` failure follows a successful
+  `cc1.exe` launch in the same GCC invocation.
+
+So the message is the `FALSE` that `snoopCreateProcessW` returns after
+`failSpawnForTerminatedChild` (last error `ERROR_TIMEOUT`), seen through
+GCC rather than Nim. That attribution is inferred; the ordinary reports carry
+no last-error value or phase number.
+
+The five newest completed RunQuota ARM Reprobuild jobs select prepared hooks
+`d36cab8` or descendant `43b1835` (`36792989240`, `36795962975`,
+`36805849869`, `36809232981`, `36810843817`); all complete compilation.
+Eight of the eleven jobs before them fail a compiler launch. RunQuota's
+`issues/2026-09-30-windows-arm-compiler-startup-fails-in-full-monitored-build.md`
+holds the full tally. This is supporting, not controlled, evidence for the
+candidate. Refreshed agents `3cbca0a` before extending this record.

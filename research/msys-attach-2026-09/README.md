@@ -30,15 +30,15 @@ It is not an exit code. It is not `0xC0000020`. The shell wedges at its first
 
 One binary, seven modes, so each variable is removed one at a time:
 
-| mode | what it does | result on `heavy.sh` |
-| --- | --- | --- |
-| `plain` | `CreateProcessW`, nothing else | completes |
-| `susp` | `CREATE_SUSPENDED` + `ResumeThread` | completes |
-| `inject` | the framework's pre-park technique | **hangs** |
-| `injectfree` | as `inject`, then `VirtualFreeEx` | **hangs** |
-| `alloc` | `VirtualAllocEx` only, no thread | completes |
-| `thread` | `CreateRemoteThread` on `kernel32!GetCurrentProcessId` | **hangs** |
-| `post` | resume first, `Sleep(PROBE_DELAY_MS)`, then inject | 0 ms hangs, ≥1 ms passes |
+| mode         | what it does                                           | result on `heavy.sh`     |
+| ------------ | ------------------------------------------------------ | ------------------------ |
+| `plain`      | `CreateProcessW`, nothing else                         | completes                |
+| `susp`       | `CREATE_SUSPENDED` + `ResumeThread`                    | completes                |
+| `inject`     | the framework's pre-park technique                     | **hangs**                |
+| `injectfree` | as `inject`, then `VirtualFreeEx`                      | **hangs**                |
+| `alloc`      | `VirtualAllocEx` only, no thread                       | completes                |
+| `thread`     | `CreateRemoteThread` on `kernel32!GetCurrentProcessId` | **hangs**                |
+| `post`       | resume first, `Sleep(PROBE_DELAY_MS)`, then inject     | 0 ms hangs, ≥1 ms passes |
 
 The `thread` row is the decisive one. **No DLL, no section, nothing mapped**
 — just a remote thread calling a function that returns a `DWORD` — and the
@@ -58,7 +58,7 @@ harmless. The variable is **the thread**.
 
 The Windows loader initialises a process on whichever thread reaches
 `LdrInitializeThunk` first. Fire a `CreateRemoteThread` into a
-`CREATE_SUSPENDED` child that has never run and *that* thread executes
+`CREATE_SUSPENDED` child that has never run and _that_ thread executes
 `LdrpInitializeProcess` — every static import's `DLL_PROCESS_ATTACH`,
 `msys-2.0.dll`'s included — and then exits. The Cygwin runtime is left bound
 to a dead thread, and its `fork()` never completes.
@@ -94,12 +94,12 @@ public `injectShimIntoChild` rather than through these probes.
 
 ## The scripts
 
-* `nofork.sh` — builtins only, no `fork()`. Completes even under `inject`,
+- `nofork.sh` — builtins only, no `fork()`. Completes even under `inject`,
   which is how we know the wedge is in `fork()` and not in startup.
-* `forks.sh` / `forkmods.sh` — ten `$(...)` substitutions. Enough to wedge.
-* `delayfork.sh` — spins on `SECONDS` with no fork for three seconds first,
+- `forks.sh` / `forkmods.sh` — ten `$(...)` substitutions. Enough to wedge.
+- `delayfork.sh` — spins on `SECONDS` with no fork for three seconds first,
   to separate "startup wedged" from "fork wedged".
-* `heavy.sh` — 25 iterations of nested substitution and a pipeline, plus a
+- `heavy.sh` — 25 iterations of nested substitution and a pipeline, plus a
   subshell `cd`. The workload the 20/20 sweeps used.
 
 `inspect.ps1` dumps the process tree, thread states and two CPU samples of a

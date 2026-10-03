@@ -295,7 +295,7 @@ static unsigned int ct_ild_legacy32_entry(unsigned char op, int *out_known)
 #endif
 
 static int ct_ild_modrm_extras(unsigned char modrm, int has_addr_size_pfx,
-                               int *out_has_sib)
+                                int *out_has_sib)
 {
     unsigned mod = (modrm >> 6) & 0x3u;
     unsigned rm  = modrm & 0x7u;
@@ -473,7 +473,7 @@ int ct_ild_decode(const unsigned char *code, size_t max_len)
 }
 
 int ct_ild_decode_to_cover(const unsigned char *code, size_t target_bytes,
-                           size_t max_len)
+                            size_t max_len)
 {
     if (code == NULL || target_bytes == 0) return 0;
 

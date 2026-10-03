@@ -265,7 +265,7 @@ static int in_rel32_range(uintptr_t from, uintptr_t to)
     /* Leave 64 KB headroom: the disp32 must be reachable from any
      * instruction inside the trampoline slot, not just the slot base. */
     return d >= ((int64_t)INT32_MIN + 0x10000) &&
-           d <= ((int64_t)INT32_MAX - 0x10000);
+            d <= ((int64_t)INT32_MAX - 0x10000);
 }
 
 /* Find or allocate a trampoline slot within ±2 GB of `target_addr`. */
@@ -316,8 +316,8 @@ static uint8_t *alloc_tramp_slot(uintptr_t target_addr)
                             (uintptr_t)mbi.BaseAddress + mbi.RegionSize &&
                         (int64_t)(aligned - target_addr) < window) {
                         got = VirtualAlloc((LPVOID)aligned, CT_TRAMP_PAGE_BYTES,
-                                           MEM_RESERVE | MEM_COMMIT,
-                                           PAGE_EXECUTE_READWRITE);
+                                            MEM_RESERVE | MEM_COMMIT,
+                                            PAGE_EXECUTE_READWRITE);
                         if (got != NULL) break;
                     }
                     /* Advance past this region. */
@@ -343,8 +343,8 @@ static uint8_t *alloc_tramp_slot(uintptr_t target_addr)
                             (uintptr_t)mbi.BaseAddress + mbi.RegionSize &&
                         (int64_t)(target_addr - aligned) < window) {
                         got = VirtualAlloc((LPVOID)aligned, CT_TRAMP_PAGE_BYTES,
-                                           MEM_RESERVE | MEM_COMMIT,
-                                           PAGE_EXECUTE_READWRITE);
+                                            MEM_RESERVE | MEM_COMMIT,
+                                            PAGE_EXECUTE_READWRITE);
                         if (got != NULL) break;
                     }
                     dn_off = (int64_t)(base - (uintptr_t)mbi.BaseAddress) +
@@ -365,8 +365,8 @@ static uint8_t *alloc_tramp_slot(uintptr_t target_addr)
         /* Last-ditch: ask the OS for any address; check it lands in
          * range and reject if not. */
         got = VirtualAlloc(NULL, CT_TRAMP_PAGE_BYTES,
-                           MEM_RESERVE | MEM_COMMIT,
-                           PAGE_EXECUTE_READWRITE);
+                            MEM_RESERVE | MEM_COMMIT,
+                            PAGE_EXECUTE_READWRITE);
         if (got == NULL) return NULL;
         if (!in_rel32_range(target_addr, (uintptr_t)got)) {
             VirtualFree(got, 0, MEM_RELEASE);
@@ -723,7 +723,7 @@ int ct_inline_hook_commit_transaction(void)
         size_t len = 5;
         /* A distant hook falls back from hotpatch to a five-byte overwrite. */
         const int64_t hotpatch_disp = (int64_t)(uintptr_t)op->hook -
-                                     (int64_t)(uintptr_t)from;
+                                      (int64_t)(uintptr_t)from;
         if (detect_hotpatch(from) && hotpatch_disp >= (int64_t)INT32_MIN &&
             hotpatch_disp <= (int64_t)INT32_MAX) {
             from -= 5;
@@ -837,7 +837,7 @@ static int install_locked(void *target, void *hook, void **out_trampoline)
         uint8_t buf[7];
         /* 5-byte JMP rel32 in the upstream padding... */
         int64_t disp64 = (int64_t)(uintptr_t)hook -
-                         ((int64_t)(uintptr_t)(t - 5) + 5);
+                          ((int64_t)(uintptr_t)(t - 5) + 5);
         if (disp64 < (int64_t)INT32_MIN || disp64 > (int64_t)INT32_MAX) {
             /* Hook is too far for hot-patch.  Fall through to
              * overwrite mode. */
@@ -977,10 +977,10 @@ static int install_locked(void *target, void *hook, void **out_trampoline)
     uint8_t *body = slot + TRAMP_BODY_OFF;
     memcpy(body, t, (size_t)prologue_len);
     int frc = ct_rel32_fixup_prologue(t, (size_t)prologue_len,
-                                       body,
-                                       (uintptr_t)t,
-                                       (uintptr_t)body,
-                                       &pg->arena);
+                                        body,
+                                        (uintptr_t)t,
+                                        (uintptr_t)body,
+                                        &pg->arena);
     CT_DBG("[ct_inline_hook] rel32_fixup rc=%d\n", frc);
     if (frc != 0) {
         free_hook(entry);
@@ -989,14 +989,14 @@ static int install_locked(void *target, void *hook, void **out_trampoline)
 
     /* Append JMP rel32 back to target + prologue_len. */
     emit_jmp_rel32(body + prologue_len,
-                   (uintptr_t)(t + prologue_len));
+                    (uintptr_t)(t + prologue_len));
 
     /* The JMP rel32 we'll write at the target points to slot+0
      * (the forwarding stub), which is in the trampoline page and
      * therefore within ±2 GB of the target by construction. */
     int rng = in_rel32_range((uintptr_t)t + 5, (uintptr_t)slot);
     CT_DBG("[ct_inline_hook] checking rel32 range t+5=%p slot=%p rng=%d\n",
-           (void *)((uintptr_t)t + 5), slot, rng);
+            (void *)((uintptr_t)t + 5), slot, rng);
     if (!rng) {
         free_hook(entry);
         return -3;
@@ -1244,10 +1244,10 @@ static size_t emit_noreturn_entry_stub(uint8_t *at, void *callback)
  * forwarding stub; entry stub falls through to copied prologue
  * rather than being JMPed to by an external hook function). */
 static int install_locked_noreturn(void *target, void *record_callback,
-                                   void **out_trampoline)
+                                    void **out_trampoline)
 {
     CT_DBG("[ct_inline_hook] install_locked_noreturn target=%p cb=%p\n",
-           target, record_callback);
+            target, record_callback);
     if (target == NULL || record_callback == NULL) return -1;
     if (find_hook(target) != NULL) return -5;
 
@@ -1318,10 +1318,10 @@ static int install_locked_noreturn(void *target, void *record_callback,
     uint8_t *body = slot + stub_bytes;
     memcpy(body, t, (size_t)prologue_len);
     int frc = ct_rel32_fixup_prologue(t, (size_t)prologue_len,
-                                       body,
-                                       (uintptr_t)t,
-                                       (uintptr_t)body,
-                                       &pg->arena);
+                                        body,
+                                        (uintptr_t)t,
+                                        (uintptr_t)body,
+                                        &pg->arena);
     CT_DBG("[ct_inline_hook] noreturn rel32_fixup rc=%d\n", frc);
     if (frc != 0) {
         free_hook(entry);
@@ -1330,7 +1330,7 @@ static int install_locked_noreturn(void *target, void *record_callback,
 
     /* Append JMP rel32 back to target + prologue_len. */
     emit_jmp_rel32(body + prologue_len,
-                   (uintptr_t)(t + prologue_len));
+                    (uintptr_t)(t + prologue_len));
 
     /* The JMP rel32 we'll write at the target points to slot+0
      * (the entry stub). */
@@ -1395,8 +1395,8 @@ int ct_inline_hook_install_noreturn(void *target, void *record_callback,
 }
 
 int ct_inline_hook_install_noreturn_no_suspend(void *target,
-                                               void *record_callback,
-                                               void **out_trampoline)
+                                                void *record_callback,
+                                                void **out_trampoline)
 {
     ensure_cs_initialised();
     EnterCriticalSection(&g_hooks_cs);

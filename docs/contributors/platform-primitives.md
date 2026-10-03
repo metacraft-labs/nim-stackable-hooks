@@ -68,17 +68,17 @@ Why it exists: the loader initialises a process on whichever thread reaches
 `LdrInitializeThunk` first. A `CreateRemoteThread` into a never-run child
 therefore runs every static import's `DLL_PROCESS_ATTACH` — `msys-2.0.dll`'s
 included — on a thread that then exits, and an MSYS2/Cygwin child wedges at its
-first `fork()`. This is a *thread* problem, not an address-collision problem;
+first `fork()`. This is a _thread_ problem, not an address-collision problem;
 `research/msys-attach-2026-09/` carries the measurement that separates the two,
 along with the two plausible alternatives (the initial debug breakpoint, a fixed
 `Sleep`) that do not work.
 
 Two properties callers depend on:
 
-* **Suspend-count neutral.** The park resumes and re-suspends, so on return the
+- **Suspend-count neutral.** The park resumes and re-suspends, so on return the
   thread is suspended exactly once, as it was passed in. The caller's own
   `ResumeThread` remains the single wakeup.
-* **It runs the child's loader.** A caller who asked for `CREATE_SUSPENDED`
+- **It runs the child's loader.** A caller who asked for `CREATE_SUSPENDED`
   themselves is entitled to a child that has executed nothing — Cygwin's `fork()`
   copies the parent's address space into exactly such a child — so the park must
   not be applied to one. `propagation_windows.autoPropagateCreateProcessW`

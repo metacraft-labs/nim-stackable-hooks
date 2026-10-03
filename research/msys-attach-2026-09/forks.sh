@@ -1,5 +1,6 @@
+#!/usr/bin/env bash
 echo "PROBE: bash started pid=$$"
-for i in 1 2 3 4 5 6 7 8 9 10; do
+for ((i = 1; i <= 10; i++)); do
   x=$(/usr/bin/grep -c cmd /dev/null)
 done
 echo "TEN_FORKS_OK x=$x"

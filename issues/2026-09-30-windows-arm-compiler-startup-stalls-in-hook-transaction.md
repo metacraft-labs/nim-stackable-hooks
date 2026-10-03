@@ -470,7 +470,7 @@ Checked on 2026-10-01, they do not:
   `CreateProcess` as `ENOENT`. With the WinLibs 16.1.0 `gcc.exe` the ARM job
   uses, `gcc -B<dir>/ -c t.c` where `<dir>/cc1.exe` exists but is not a PE
   image prints `cannot execute '<dir>/cc1.exe': CreateProcess: No such file
-  or directory`.
+or directory`.
 - The prefix is complete: the pinned archive (re-downloaded, SHA-256
   `62fb8588...e232` verified) contains both images, the same prefix id realized
   on Windows x64 holds all 11,750 archive files, RunQuota `48bb701`'s ARM job

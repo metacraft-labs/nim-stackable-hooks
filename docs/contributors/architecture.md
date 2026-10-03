@@ -55,11 +55,11 @@ is absent from `tests/corpus.nim`.)
 
 Three runners execute this repo's tests:
 
-| Runner | Entry point |
-|---|---|
-| `just test` | delegates to `nimble test` |
-| `nimble test` | the `test` task in `stackable_hooks.nimble` |
-| `repro test` | the edges `repro.nim` emits (`.github/workflows/ci-reprobuild.yml`) |
+| Runner        | Entry point                                                         |
+| ------------- | ------------------------------------------------------------------- |
+| `just test`   | delegates to `nimble test`                                          |
+| `nimble test` | the `test` task in `stackable_hooks.nimble`                         |
+| `repro test`  | the edges `repro.nim` emits (`.github/workflows/ci-reprobuild.yml`) |
 
 **All three read one list: `tests/corpus.nim`.** Each entry declares the
 `nim` `(--os, --cpu)` targets its source compiles for, and that single list

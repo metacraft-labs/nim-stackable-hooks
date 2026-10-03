@@ -16,7 +16,7 @@
 
 typedef LONG NTSTATUS;
 typedef struct { NTSTATUS ExitStatus; PVOID PebBaseAddress; ULONG_PTR AffinityMask;
-                 LONG BasePriority; ULONG_PTR UniqueProcessId; ULONG_PTR ParentPid; } PBI;
+                  LONG BasePriority; ULONG_PTR UniqueProcessId; ULONG_PTR ParentPid; } PBI;
 typedef NTSTATUS (NTAPI *PFN_NTQIP)(HANDLE,ULONG,PVOID,ULONG,PULONG);
 
 static void ts(const char *w){SYSTEMTIME s;GetLocalTime(&s);
@@ -81,8 +81,8 @@ int wmain(int argc, wchar_t **argv){
     DWORD w=WaitForSingleObject(th,15000);
     if(w==WAIT_TIMEOUT) ts("*** remote thread timed out ***");
     else { DWORD ex=0; GetExitCodeThread(th,&ex);
-           fprintf(stderr,"LoadLibraryW low32=0x%08lX (%s)\n",ex,ex?"loaded":"FAILED");
-           VirtualFreeEx(pi.hProcess,rb,0,MEM_RELEASE); }
+            fprintf(stderr,"LoadLibraryW low32=0x%08lX (%s)\n",ex,ex?"loaded":"FAILED");
+            VirtualFreeEx(pi.hProcess,rb,0,MEM_RELEASE); }
     CloseHandle(th);
   }
 

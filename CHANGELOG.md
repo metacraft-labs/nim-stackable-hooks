@@ -124,7 +124,6 @@
   whose loader has finished, so `EnumProcessModulesEx` reports the real
   module list instead of the two or three entries a never-run process has.
 
-
 ## v0.1.0 — 2026-06-14
 
 Initial release. Cross-platform stackable hooks framework for Nim,

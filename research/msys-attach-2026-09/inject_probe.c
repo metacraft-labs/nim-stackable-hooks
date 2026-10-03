@@ -38,8 +38,8 @@ static int remoteLoadLibrary(const wchar_t *dll, BOOL freeBuf) {
   DWORD w = WaitForSingleObject(th, 15000);
   if (w == WAIT_TIMEOUT) { ts("*** REMOTE THREAD TIMED OUT (deadlock in LoadLibraryW) ***"); }
   else { DWORD ex = 1; GetExitCodeThread(th, &ex);
-         fprintf(stderr, "remote thread returned, LoadLibraryW low32=0x%08lX (%s)\n",
-                 ex, ex ? "loaded" : "FAILED"); }
+          fprintf(stderr, "remote thread returned, LoadLibraryW low32=0x%08lX (%s)\n",
+                  ex, ex ? "loaded" : "FAILED"); }
   CloseHandle(th);
   if (freeBuf) { VirtualFreeEx(gProc, gBuf, 0, MEM_RELEASE); ts("VirtualFreeEx(remote buf)"); }
   return 0;

@@ -6,7 +6,7 @@ point back here.
 
 ## Background
 
-`injectShimIntoChild` and `runWithMonitorShim` inject the shim by *borrowing*
+`injectShimIntoChild` and `runWithMonitorShim` inject the shim by _borrowing_
 the child's parked main thread (`windows_entry_park.callOnParkedThread`). They
 save its `CONTEXT`, point `RIP` at `LoadLibraryW` (and later at the shim's init
 export), resume the thread, and wait for it to return to the `EB FE` at the
@@ -39,48 +39,46 @@ into a corrupted one. The failure was reported as `ioInitFailed` or
 ## Rules
 
 R1. **A slow child is not a hung child.** While the borrowed call runs and the
-    child process is alive, the wait continues. The deadline is a last resort
-    for a genuinely wedged child, not a performance budget. The default
-    (`DefaultInjectDeadlineMs`) is 10 minutes, and `INFINITE` (`0xFFFFFFFF`)
-    means "wait as long as the child lives".
+child process is alive, the wait continues. The deadline is a last resort
+for a genuinely wedged child, not a performance budget. The default
+(`DefaultInjectDeadlineMs`) is 10 minutes, and `INFINITE` (`0xFFFFFFFF`)
+means "wait as long as the child lives".
 
 R2. **A thread whose context is lent out is never resumed.** If the hard
-    deadline expires mid-call, or the saved context cannot be restored after a
-    call, the child is *poisoned*. `windows_entry_park` itself then:
-    - suspends the thread a second time, so a caller's unconditional
-      `ResumeThread` still leaves it suspended, and
-    - terminates the child with `InjectionAbandonedExitCode`
-      (`0xC00000B5`, `STATUS_IO_TIMEOUT`) and waits for it to die.
+deadline expires mid-call, or the saved context cannot be restored after a
+call, the child is _poisoned_. `windows_entry_park` itself then: - suspends the thread a second time, so a caller's unconditional
+`ResumeThread` still leaves it suspended, and - terminates the child with `InjectionAbandonedExitCode`
+(`0xC00000B5`, `STATUS_IO_TIMEOUT`) and waits for it to die.
 
     The callers do not have to get this right for the child to be safe.
 
 R3. **The spawn fails cleanly and visibly.** A poisoned child is reported as
-    its own outcome (`bcsPoisoned` from the borrow, `ioChildTerminated` from
-    `injectShimIntoChild`), never folded into `ioInjectFailed` or
-    `ioInitFailed`. A `CreateProcess` hook that sees it must fail the
-    `CreateProcess` call. It returns `FALSE`, sets the last error to
-    `ERROR_TIMEOUT` (1460), closes the handles, and zeroes
-    `PROCESS_INFORMATION`, so the caller sees a spawn that failed rather than
-    a child that later dies. `runWithMonitorShim` raises, as it already did.
+its own outcome (`bcsPoisoned` from the borrow, `ioChildTerminated` from
+`injectShimIntoChild`), never folded into `ioInjectFailed` or
+`ioInitFailed`. A `CreateProcess` hook that sees it must fail the
+`CreateProcess` call. It returns `FALSE`, sets the last error to
+`ERROR_TIMEOUT` (1460), closes the handles, and zeroes
+`PROCESS_INFORMATION`, so the caller sees a spawn that failed rather than
+a child that later dies. `runWithMonitorShim` raises, as it already did.
 
 R4. **Every other failure stays sound.** If a borrow fails before the thread
-    ran (bad arguments, `SetThreadContext` failed, `ResumeThread` failed and
-    the context was restored), the child is intact. It is reported as a failed
-    injection, exactly as before, and the child runs unmonitored. A call that
-    returned but whose result could not be read also leaves the child intact,
-    provided the saved context was restored.
+ran (bad arguments, `SetThreadContext` failed, `ResumeThread` failed and
+the context was restored), the child is intact. It is reported as a failed
+injection, exactly as before, and the child runs unmonitored. A call that
+returned but whose result could not be read also leaves the child intact,
+provided the saved context was restored.
 
 R5. **The park itself uses the same deadline.** A park that misses its
-    deadline was already safe: the thread is suspended before it reaches user
-    code, and the entry bytes are restored under the suspension, so the child
-    runs unmonitored (`ioParkFailed`). Only the deadline value changes, so a
-    slow loader is no longer mistaken for a wedged one.
+deadline was already safe: the thread is suspended before it reaches user
+code, and the entry bytes are restored under the suspension, so the child
+runs unmonitored (`ioParkFailed`). Only the deadline value changes, so a
+slow loader is no longer mistaken for a wedged one.
 
 R6. **Slowness is observable.** `injectShimIntoChildReport` returns the time
-    spent waiting on the child. A consumer can annotate its records when that
-    time exceeds `SlowInjectionNoticeMs` (5 s), which is the old deadline.
-    Nothing is written to the child's or the parent's stdio, because a
-    monitored build's stderr is part of its observable output.
+spent waiting on the child. A consumer can annotate its records when that
+time exceeds `SlowInjectionNoticeMs` (5 s), which is the old deadline.
+Nothing is written to the child's or the parent's stdio, because a
+monitored build's stderr is part of its observable output.
 
 ## Test obligations
 

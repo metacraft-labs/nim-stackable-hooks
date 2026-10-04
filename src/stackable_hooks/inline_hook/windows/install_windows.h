@@ -196,7 +196,7 @@ int ct_inline_hook_begin_transaction(void);
 
 /* Commit a transaction.  Applies all queued installs/uninstalls inside
  * a single thread-suspend window. Before suspending peers, prepares each
- * install's code-page protection transition without writing patch bytes;
+ * distinct install page's protection transition once, without writing patch bytes;
  * returns -7 if that preparation fails, with no installs applied.
  * Returns 0 on success, <0 if a queued
  * operation failed (the same error code that install/uninstall would

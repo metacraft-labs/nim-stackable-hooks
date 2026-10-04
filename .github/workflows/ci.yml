@@ -216,6 +216,7 @@ jobs:
           gcc --version
           $tests = @(
             'test_cross_target_compile',
+            'test_windows_hook_page_preparation',
             'test_windows_injector_capture',
             'test_windows_entry_park_slow_call',
             'test_windows_entry_park_thread_locals',

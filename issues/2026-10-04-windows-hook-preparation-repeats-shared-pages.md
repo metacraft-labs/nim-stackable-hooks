@@ -33,8 +33,16 @@ and trampoline results, a resumed peer's calls, restored code and protections,
 one suspension round and 72 real protection calls per install transaction.
 It repeats the whole install/uninstall sequence. The original implementation
 should fail the call-count control while passing the functional checks.
-Both x64 and x86 executables need native qualification, including emulation
-on Windows ARM. Gosti must then pass its original monitored deadline and full CI.
+At candidate `10ed82a`, native comparison `37176379522` (shared `84ef14e`)
+passes x64 and x86 executables on both Windows x64 and Windows ARM hosts.
+Both transactions make 72 protection calls with the candidate and 132 with
+baseline `b197281`. The baseline returns the designated count failure only
+after all functional checks pass. Real loaded PE and host identities are
+retained with source and binary hashes. The complete macOS suite, including
+cross-target semantic checks, also passes at `10ed82a` (70 cases).
+The regression is included in the ordinary Windows injection job as well as
+the shared corpus. Gosti comparison `37176479700` is pending; it must pass its
+original monitored deadline and full CI before this release blocker closes.
 
 This serves the original-protection requirements in the existing
 [startup-stall record](2026-09-30-windows-arm-compiler-startup-stalls-in-hook-transaction.md)

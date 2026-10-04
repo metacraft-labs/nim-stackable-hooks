@@ -90,7 +90,7 @@ int ct_test_windows_hook_page_preparation(void)
     if (page_size < 1024) return 10;
     size_t size = page_size * 3;
     uint8_t *code = (uint8_t *)VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT,
-                                           PAGE_READWRITE);
+                                            PAGE_READWRITE);
     uint8_t *original = (uint8_t *)malloc(size);
     if (!code || !original) return 11;
     code_begin = (uintptr_t)code;
@@ -137,7 +137,7 @@ int ct_test_windows_hook_page_preparation(void)
          * calls), plus each hook's unchanged writable/restore write pair. */
         const unsigned long expected_calls = 3 * 2 + TARGET_COUNT * 2;
         printf("round=%d real-protection-calls=%lu expected=%lu\n",
-               round, protection_calls, expected_calls);
+                round, protection_calls, expected_calls);
         if (protection_calls != expected_calls) redundant_preparation = 1;
         if (ct_inline_hook_begin_transaction() != 0) return 26;
         for (int i = 0; i < TARGET_COUNT; ++i)
@@ -163,18 +163,18 @@ int main(int argc, char **argv)
 {
     typedef BOOL (WINAPI *machine_query)(HANDLE, USHORT *, USHORT *);
     machine_query query = (machine_query)GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
-                                                       "IsWow64Process2");
+                                                        "IsWow64Process2");
     USHORT process_machine = 0, native_machine = 0;
     if (argc != 2 || !query ||
         !query(GetCurrentProcess(), &process_machine, &native_machine)) return 80;
     USHORT expected_native = !strcmp(argv[1], "ARM64") ? 0xaa64 :
-                             !strcmp(argv[1], "X64") ? 0x8664 : 0;
+                              !strcmp(argv[1], "X64") ? 0x8664 : 0;
     uint8_t *image = (uint8_t *)GetModuleHandleW(NULL);
     IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)image;
     IMAGE_NT_HEADERS *pe = (IMAGE_NT_HEADERS *)(image + dos->e_lfanew);
     USHORT expected_pe = sizeof(void *) == 8 ? 0x8664 : 0x014c;
     printf("native-machine=%04x process-machine=%04x pe-machine=%04x\n",
-           native_machine, process_machine, pe->FileHeader.Machine);
+            native_machine, process_machine, pe->FileHeader.Machine);
     if (!expected_native || native_machine != expected_native ||
         pe->FileHeader.Machine != expected_pe) return 81;
     return ct_test_windows_hook_page_preparation();

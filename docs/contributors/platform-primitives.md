@@ -35,6 +35,15 @@ Consumers still own the exported wrapper symbols, target symbol set, hook-body d
 `stackable_hooks/inline_hook/windows_inline_hook` exposes the Windows inline hook installer backed by `src/stackable_hooks/inline_hook/windows/`.
 
 The default `inlineHookInstall`, `inlineHookInstallNoReturn`, and `inlineHookUninstall` entry points suspend other threads around patch writes.
+
+Transactions prepare each distinct install page's writable-and-back transition
+once before suspending peers. Windows protection changes apply to whole pages,
+so hooks sharing a page reuse that preparation within the same transaction.
+Later transactions prepare again. Actual patch writes retain their existing
+protection changes, suspension, rollback and instruction-cache flushing.
+The real Windows page-preparation test checks shared and crossing pages, target
+and trampoline calls, resumed peers, restored bytes/protections and bounded
+protection-call counts; no timing threshold substitutes for those checks.
 The module also exposes unsafe no-suspend variants:
 
 - `inlineHookInstallUnsafeNoSuspend`

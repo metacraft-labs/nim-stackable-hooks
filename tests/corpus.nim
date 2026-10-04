@@ -167,6 +167,10 @@ const testCorpus*: seq[TestEntry] = @[
     why: "stackable_hooks/windows_env_block is deliberately NOT " &
          "`when defined(windows)`-gated -- the lpEnvironment encoding is " &
          "pure string/UTF-16 work -- so this runs for real on every host."),
+  TestEntry(stem: "test_windows_hook_page_preparation", targets: AllHostTargets,
+    why: "Real executable pages, trampolines and peer threads on Windows x86. " &
+         "Other hosts compile the platform guard; native Windows ARM64 " &
+         "inline hooks remain deferred. Windows ARM CI runs the x64 binary."),
   TestEntry(stem: "test_windows_inline_hook_api", targets: AllHostTargets,
     why: "Off Windows its `else` arm compiles install_windows.c and runs " &
          "real C-ABI doAsserts, so it is genuine coverage everywhere."),

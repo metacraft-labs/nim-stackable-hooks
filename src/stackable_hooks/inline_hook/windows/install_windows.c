@@ -705,6 +705,46 @@ static int prepare_patch_range(uint8_t *from, size_t len)
     return 0;
 }
 
+typedef struct {
+    uintptr_t pages[CT_QUEUE_MAX * 2];
+    size_t count;
+    uintptr_t page_size;
+} ct_prepared_pages_t;
+
+/* VirtualProtect changes every whole page intersecting its byte range. Once
+ * a page has made the writable-and-back transition, another hook on that same
+ * page needs no second preparation. Keep this set local to one transaction:
+ * a later transaction must prepare its pages again. No patch bytes are changed
+ * here, and the ordinary frozen write/protection/cache-flush path stays intact.
+ * Two pages per queued operation cover the five-byte overwrite or seven-byte
+ * hotpatch; the capacity check still refuses an unexpected larger footprint. */
+static int prepare_patch_range_once(uint8_t *from, size_t len,
+                                    ct_prepared_pages_t *prepared)
+{
+    uintptr_t cursor = (uintptr_t)from;
+    if (prepared->page_size == 0 || len == 0 || cursor > UINTPTR_MAX - len)
+        return -1;
+    const uintptr_t end = cursor + len;
+    while (cursor < end) {
+        const uintptr_t page = cursor - cursor % prepared->page_size;
+        if (page > UINTPTR_MAX - prepared->page_size) return -1;
+        const uintptr_t next_page = page + prepared->page_size;
+        const uintptr_t span_end = end < next_page ? end : next_page;
+        size_t i;
+        for (i = 0; i < prepared->count; ++i)
+            if (prepared->pages[i] == page) break;
+        if (i == prepared->count) {
+            if (prepared->count >= sizeof(prepared->pages) / sizeof(prepared->pages[0]))
+                return -1;
+            if (prepare_patch_range((uint8_t *)cursor, (size_t)(span_end - cursor)) != 0)
+                return -1;
+            prepared->pages[prepared->count++] = page;
+        }
+        cursor = span_end;
+    }
+    return 0;
+}
+
 int ct_inline_hook_commit_transaction(void)
 {
     ensure_cs_initialised();
@@ -714,6 +754,10 @@ int ct_inline_hook_commit_transaction(void)
         return -1;
     }
 
+    SYSTEM_INFO system_info;
+    GetSystemInfo(&system_info);
+    ct_prepared_pages_t prepared = {0};
+    prepared.page_size = (uintptr_t)system_info.dwPageSize;
     for (size_t i = 0; i < g_txn.count; i++) {
         const ct_queued_op_t *op = &g_txn.ops[i];
         if (op->kind != 0 || op->target == NULL || op->hook == NULL ||
@@ -729,7 +773,7 @@ int ct_inline_hook_commit_transaction(void)
             from -= 5;
             len = 7;
         }
-        if (prepare_patch_range(from, len) != 0) {
+        if (prepare_patch_range_once(from, len, &prepared) != 0) {
             g_txn.active = 0;
             g_txn.count = 0;
             LeaveCriticalSection(&g_hooks_cs);

@@ -1,11 +1,11 @@
 # Windows hook freeze can report success with unfrozen threads
 
-| | |
-| --- | --- |
-| Status | open |
-| Recorded | 2026-10-04 |
-| Observed in | nim-stackable-hooks `fcac217396872eede718a57f49f91fecab41c4ac` |
-| Area | `inline_hook/windows/install_windows.c`, `suspend_other_threads` |
+|             |                                                                  |
+| ----------- | ---------------------------------------------------------------- |
+| Status      | open                                                             |
+| Recorded    | 2026-10-04                                                       |
+| Observed in | nim-stackable-hooks `fcac217396872eede718a57f49f91fecab41c4ac`   |
+| Area        | `inline_hook/windows/install_windows.c`, `suspend_other_threads` |
 
 ## Observed
 

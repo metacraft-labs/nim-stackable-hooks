@@ -183,6 +183,14 @@ const testCorpus*: seq[TestEntry] = @[
          "remote thread -- so the run lane is Windows only while the " &
          "cross-target lane still compile-verifies it from Linux and " &
          "macOS."),
+  TestEntry(stem: "test_windows_entry_park_shadow_stack",
+    targets: @[tLinuxAmd64, tMacosArm64, tWindowsAmd64, tWindowsArm64],
+    why: "Body is gated on `defined(windows) and defined(amd64)`, so it " &
+         "compiles everywhere and is a no-op off Windows/amd64. Its " &
+         "Windows arm borrows the parked main thread of a real " &
+         "`/CETCOMPAT` child (System32 curl.exe) twice, so the run lane is " &
+         "Windows only while the cross-target lane still compile-verifies " &
+         "it from Linux and macOS."),
   TestEntry(stem: "test_windows_wow64_injection",
     targets: @[tLinuxAmd64, tMacosArm64, tWindowsAmd64, tWindowsArm64],
     why: "Body is `when defined(windows)`-wrapped; compiles everywhere, " &

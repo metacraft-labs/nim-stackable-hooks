@@ -155,6 +155,13 @@ when defined(i386) or defined(amd64):
 
     StillActive = 259'u32
     PageExecuteReadWrite = 0x40'u32
+    # For `callOnParkedThread`'s call stub: written read-write, then flipped
+    # to execute-read before the thread is pointed at it.
+    PageReadWrite = 0x04'u32
+    PageExecuteRead = 0x20'u32
+    MemCommit = 0x00001000'u32
+    MemReserve = 0x00002000'u32
+    MemRelease = 0x00008000'u32
     SelfJump: array[2, byte] = [0xEB'u8, 0xFE'u8]
 
   proc NtQueryInformationProcess(hProcess: pointer; infoClass: uint32;
@@ -169,6 +176,12 @@ when defined(i386) or defined(amd64):
     {.importc, stdcall, dynlib: "kernel32".}
   proc VirtualProtectEx(hProcess: pointer; address: pointer; size: uint;
                         newProtect: uint32; oldProtect: ptr uint32): int32
+    {.importc, stdcall, dynlib: "kernel32".}
+  proc VirtualAllocEx(hProcess: pointer; address: pointer; size: uint;
+                      allocType: uint32; protect: uint32): pointer
+    {.importc, stdcall, dynlib: "kernel32".}
+  proc VirtualFreeEx(hProcess: pointer; address: pointer; size: uint;
+                     freeType: uint32): int32
     {.importc, stdcall, dynlib: "kernel32".}
   proc FlushInstructionCache(hProcess: pointer; base: pointer;
                              size: uint): int32
@@ -433,14 +446,54 @@ when defined(i386) or defined(amd64):
     ## thread's static-TLS block for the module as the mapping thread,
     ## rather than leaving it to the retrofit path.
     ##
-    ## HOW THE RETURN IS ARRANGED. The entry point still holds the park's
-    ## ``EB FE``, so it doubles as a return address: push it, point ``RIP``
-    ## at ``fn`` with ``RCX`` = ``arg`` (the Win64 first-argument register),
-    ## resume, and wait for the instruction pointer to come back to the
-    ## self-jump. That is the same proof the park itself waits on, so the
-    ## thread ends up suspended exactly where it started, with the same
-    ## suspend count, and the caller's single ``ResumeThread`` still owns
-    ## the wakeup.
+    ## HOW THE RETURN IS ARRANGED. A small stub is written into the child:
+    ##
+    ##   sub rsp, 20h ; mov rax, fn ; call rax ;
+    ##   mov rsp, <parked RSP> ; mov rcx, <parked RCX> ;
+    ##   mov r11, <entry point> ; jmp r11
+    ##
+    ## and the thread is pointed at it with ``RCX`` = ``arg`` (the Win64
+    ## first-argument register) and ``RSP`` a little below the parked frame.
+    ## Resume, and wait for the instruction pointer to come back to the
+    ## entry point, which still holds the park's ``EB FE``: the same proof
+    ## the park itself waits on. ``RAX`` there is ``fn``'s result. Then the
+    ## saved context is put back, so the thread ends up suspended exactly
+    ## where it started, with the same suspend count, and the caller's single
+    ## ``ResumeThread`` still owns the wakeup.
+    ##
+    ## THE ``call`` IS LOAD-BEARING: IT IS WHAT KEEPS THE SHADOW STACK SOUND.
+    ## This proc used to write the entry point onto the ordinary stack as a
+    ## return address and point ``RIP`` straight at ``fn``. No ``call`` ever
+    ## executed, so the hardware shadow stack (Intel CET, "Hardware-enforced
+    ## Stack Protection") received no matching entry, and in any child that
+    ## runs with one -- every ``/CETCOMPAT`` image on a host that enforces
+    ## it -- ``fn``'s ``ret`` raised ``#CP``: the child died with
+    ## ``STATUS_STACK_BUFFER_OVERRUN`` (0xC0000409), fast-fail subcode 0x39
+    ## ``FAST_FAIL_CONTROL_INVALID_RETURN_ADDRESS``. Measured on
+    ## ``pwsh.exe`` (a ``/CETCOMPAT`` .NET apphost) at
+    ## ``KERNELBASE!LoadLibraryExW``'s ``ret``. A real ``call`` pushes the
+    ## return address onto BOTH stacks and ``ret`` pops both, so the shadow
+    ## stack is balanced across the borrow; the stub then reaches the entry
+    ## point with a ``jmp``, which the shadow stack does not track. The
+    ## shadow-stack pointer is never touched, so the saved context is still
+    ## a true description of the thread when it is put back.
+    ## ``tests/test_windows_entry_park_shadow_stack.nim`` is the gate.
+    ##
+    ## WHY THE STUB ENDS AT THE ENTRY POINT, WITH THE PARKED ``RSP``. A
+    ## borrowed call can outlive ``timeoutMs`` -- a shim ``LoadLibraryW``
+    ## under a loaded host and an on-access scanner has been measured past
+    ## the default 5 s. This proc then gives up, the caller releases the
+    ## park and resumes the child, and the call finishes LATER, unwatched.
+    ## Wherever the thread goes next is where the child's program continues.
+    ## The stub therefore ends exactly where a completed borrow would have
+    ## left the thread: at the entry point (its ``EB FE`` restored to the
+    ## original bytes by then), on the parked stack pointer and with the
+    ## entry point's argument (``RCX``) as the loader passed it, so the entry
+    ## point's own return address and the shadow stack still agree and the
+    ## program runs normally, uninjected. A stub that instead parked itself
+    ## on a private self-jump was measured to strand ``gcc.exe`` spinning
+    ## there forever after exactly such a timeout -- the
+    ## slow-borrow case in the test above pins this.
     ##
     ## FAILURE IS NEVER SILENT. Every early return leaves ``ret`` at zero
     ## and answers ``false``; a caller must treat that as "the child was
@@ -468,28 +521,76 @@ when defined(i386) or defined(amd64):
       if savedRsp < 0x10000'u64:
         return false
 
-      # The return address goes just below the parked frame, on the
-      # thread's OWN stack, so the callee grows it through the guard page
-      # the ordinary way. How far below is not free: at the entry point
-      # only the pages the loader touched are committed, so a fixed gap can
-      # land in the guard page and the write fails. Try a few and take the
-      # first that lands -- a failure here is a refusal, not a guess.
-      var retAddr = uint64(cast[uint](park.entry))
-      var rsp: uint64 = 0
-      for gap in [0x200'u64, 0x100'u64, 0x80'u64, 0x20'u64]:
-        if savedRsp <= gap + 16'u64:
-          continue
-        # Win64 entry condition: RSP+8 is 16-byte aligned at the callee's
-        # first instruction, i.e. RSP itself is 16n+8 once the return
-        # address is in place.
-        let candidate = ((savedRsp - gap) and not 0xF'u64) - 8'u64
-        var wrote: uint = 0
-        if WriteProcessMemory(park.hProcess, cast[pointer](candidate),
-            addr retAddr, 8'u, addr wrote) != 0 and wrote == 8:
-          rsp = candidate
-          break
-      if rsp == 0:
+      # The stub runs just below the parked frame, on the thread's OWN
+      # stack, so the stub's `call` and the callee grow it through the guard
+      # page the ordinary way -- the child's own accesses, not ours, so the
+      # guard page commits as it does for any deep call. The gap leaves the
+      # parked frame untouched and stays well inside one page, so the first
+      # access can reach no further than the guard page.
+      #
+      # Win64 call condition: RSP is 16-byte aligned at the `call`, so the
+      # callee sees RSP+8 aligned. The stub's `sub rsp, 20h` (the callee's
+      # home space) preserves the alignment set here.
+      const StubGap = 0x200'u64
+      if savedRsp <= StubGap + 0x40'u64:
         return false
+      let rsp = (savedRsp - StubGap) and not 0xF'u64
+
+      # 0: sub rsp, 20h       48 83 EC 20
+      # 4: mov rax, imm64     48 B8 <fn>
+      # 14: call rax          FF D0
+      # 16: mov rsp, imm64    48 BC <savedRsp>
+      # 26: mov rcx, imm64    48 B9 <savedRcx>
+      # 36: mov r11, imm64    49 BB <entry>
+      # 46: jmp r11           41 FF E3
+      # `RAX` -- the callee's result -- is left alone for the caller to read.
+      # `RCX` is put back because it is the entry point's one argument (the
+      # PEB, from `BaseThreadInitThunk`) and the callee is free to clobber
+      # it: on the completed path the saved context restores it anyway, but
+      # on the late path below the thread enters the program from here.
+      # Measured with a `/ENTRY` image that checks its argument: without
+      # this it entered with a stale `RCX` after a timed-out borrow.
+      var stubCode: array[49, byte] = [
+        0x48'u8, 0x83, 0xEC, 0x20,
+        0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0,
+        0xFF, 0xD0,
+        0x48, 0xBC, 0, 0, 0, 0, 0, 0, 0, 0,
+        0x48, 0xB9, 0, 0, 0, 0, 0, 0, 0, 0,
+        0x49, 0xBB, 0, 0, 0, 0, 0, 0, 0, 0,
+        0x41, 0xFF, 0xE3]
+      proc putImm64(code: var array[49, byte]; at: int; value: uint64) =
+        for i in 0 ..< 8:
+          code[at + i] = byte((value shr (8 * i)) and 0xFF'u64)
+      let savedRcx = cast[ptr uint64](cast[uint](saved) +
+        ContextAmd64RcxOffset)[]
+      putImm64(stubCode, 6, uint64(cast[uint](fn)))
+      putImm64(stubCode, 18, savedRsp)
+      putImm64(stubCode, 28, savedRcx)
+      putImm64(stubCode, 38, uint64(cast[uint](park.entry)))
+      let stub = VirtualAllocEx(park.hProcess, nil, uint(stubCode.len),
+        MemCommit or MemReserve, PageReadWrite)
+      if stub == nil:
+        return false
+      # Owned by this frame until the thread is pointed at it; from then on
+      # only proof that the thread is back on the parked entry point gives it
+      # back. A thread that never came back may still be executing it, so
+      # that path leaks it on purpose: one page of the child's address
+      # space, reclaimed when the child exits, against unmapping code a live
+      # thread is running.
+      var stubOwned = true
+      defer:
+        if stubOwned:
+          discard VirtualFreeEx(park.hProcess, stub, 0'u, MemRelease)
+      var wroteStub: uint = 0
+      var stubProtect: uint32 = 0
+      if WriteProcessMemory(park.hProcess, stub, addr stubCode[0],
+          uint(stubCode.len), addr wroteStub) == 0 or
+          wroteStub != uint(stubCode.len):
+        return false
+      if VirtualProtectEx(park.hProcess, stub, uint(stubCode.len),
+          PageExecuteRead, addr stubProtect) == 0:
+        return false
+      discard FlushInstructionCache(park.hProcess, stub, uint(stubCode.len))
 
       var callRaw: array[ContextAmd64Size + 16, byte]
       let call = alignUp16(addr callRaw[0])
@@ -500,20 +601,28 @@ when defined(i386) or defined(amd64):
       cast[ptr uint64](cast[uint](call) + ContextAmd64RcxOffset)[] =
         uint64(cast[uint](arg))
       cast[ptr uint64](cast[uint](call) + ContextAmd64RipOffset)[] =
-        uint64(cast[uint](fn))
+        uint64(cast[uint](stub))
       if SetThreadContext(hThread, call) == 0:
         return false
 
       if ResumeThread(hThread) == high(uint32):
         discard SetThreadContext(hThread, saved)
         return false
+      # The thread may now be executing the stub.
+      stubOwned = false
 
       if not waitForParkedIp(park, hThread, childIsWow64, timeoutMs):
         # The child either died or never came back to the self-jump. Its
         # state is unknown; say so rather than restoring a context that may
-        # no longer describe anything.
+        # no longer describe anything. If the call does finish later, the
+        # stub delivers the thread to the entry point on the parked stack
+        # pointer -- see "WHY THE STUB ENDS AT THE ENTRY POINT" above.
         discard SuspendThread(hThread)
         return false
+
+      # Back on the parked entry point and suspended: nothing executes the
+      # stub any more.
+      stubOwned = true
 
       var doneRaw: array[ContextAmd64Size + 16, byte]
       let done = alignUp16(addr doneRaw[0])

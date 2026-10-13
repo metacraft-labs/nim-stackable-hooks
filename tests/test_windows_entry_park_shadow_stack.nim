@@ -76,6 +76,10 @@ when defined(windows) and defined(amd64):
       hStdOutput: HANDLE
       hStdError: HANDLE
 
+    STARTUPINFOEXW {.bycopy.} = object
+      StartupInfo: STARTUPINFOW
+      lpAttributeList: pointer
+
     PROCESS_INFORMATION {.bycopy.} = object
       hProcess: HANDLE
       hThread: HANDLE
@@ -99,6 +103,19 @@ when defined(windows) and defined(amd64):
                       lpEnvironment: pointer, lpCurrentDirectory: LPCWSTR,
                       lpStartupInfo: pointer,
                       lpProcessInformation: ptr PROCESS_INFORMATION): BOOL
+    {.importc, stdcall, dynlib: "kernel32".}
+  proc GetCurrentProcess(): HANDLE
+    {.importc, stdcall, dynlib: "kernel32".}
+  proc IsWow64Process2(process: HANDLE; processMachine, nativeMachine: ptr WORD): BOOL
+    {.importc, stdcall, dynlib: "kernel32".}
+  proc InitializeProcThreadAttributeList(attributes: pointer; count, flags: DWORD;
+                                        size: ptr uint): BOOL
+    {.importc, stdcall, dynlib: "kernel32".}
+  proc UpdateProcThreadAttribute(attributes: pointer; flags: DWORD;
+                                attribute: uint; value: pointer; size: uint;
+                                previous: pointer; returnedSize: ptr uint): BOOL
+    {.importc, stdcall, dynlib: "kernel32".}
+  proc DeleteProcThreadAttributeList(attributes: pointer)
     {.importc, stdcall, dynlib: "kernel32".}
   proc GetProcessMitigationPolicy(hProcess: HANDLE; policy: int32;
                                   buffer: pointer; length: uint): BOOL
@@ -157,9 +174,41 @@ when defined(windows) and defined(amd64):
     var si: STARTUPINFOW
     si.cb = DWORD(sizeof(si))
     var pi: PROCESS_INFORMATION
+    var processMachine, nativeMachine: WORD
+    if IsWow64Process2(GetCurrentProcess(), addr processMachine,
+        addr nativeMachine) == 0:
+      raise newException(OSError, "IsWow64Process2 failed")
+    var flags = CREATE_SUSPENDED or CREATE_NO_WINDOW
+    var startup: pointer = addr si
+    var extended: STARTUPINFOEXW
+    var attributes: seq[byte]
+    var attributesInitialized = false
+    defer:
+      if attributesInitialized:
+        DeleteProcThreadAttributeList(extended.lpAttributeList)
+    var machine = WORD(0x8664) # IMAGE_FILE_MACHINE_AMD64
+    if nativeMachine == WORD(0xaa64): # IMAGE_FILE_MACHINE_ARM64
+      # The entry-park implementation and this CET fixture are AMD64.
+      # System32's hybrid executable must be launched in its AMD64 view.
+      var size: uint = 0
+      discard InitializeProcThreadAttributeList(nil, 1, 0, addr size)
+      if size == 0:
+        raise newException(OSError, "Machine attribute size query failed")
+      attributes = newSeq[byte](int(size))
+      extended.lpAttributeList = addr attributes[0]
+      if InitializeProcThreadAttributeList(extended.lpAttributeList, 1, 0,
+          addr size) == 0:
+        raise newException(OSError, "Machine attribute initialization failed")
+      attributesInitialized = true
+      # winbase.h: ProcThreadAttributeValue(MachineType=25, input=true).
+      if UpdateProcThreadAttribute(extended.lpAttributeList, 0, 0x20019'u,
+          addr machine, uint(sizeof(machine)), nil, nil) == 0:
+        raise newException(OSError, "AMD64 machine selection failed")
+      extended.StartupInfo.cb = DWORD(sizeof(extended))
+      startup = addr extended
+      flags = flags or 0x00080000'u32 # EXTENDED_STARTUPINFO_PRESENT
     if CreateProcessW(nil, cast[LPWSTR](addr cmdW[0]), nil, nil, BOOL(0),
-        CREATE_SUSPENDED or CREATE_NO_WINDOW, nil, nil, addr si,
-        addr pi) == 0:
+        flags, nil, nil, startup, addr pi) == 0:
       raise newException(OSError,
         "CreateProcessW(" & exe & ") failed (err=" & $GetLastError() & ")")
     result.pid = pi.dwProcessId

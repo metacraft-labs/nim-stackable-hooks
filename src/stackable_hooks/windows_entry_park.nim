@@ -321,6 +321,17 @@ when defined(i386) or defined(amd64):
         cast[pointer](cast[uint](imageBase) + uint(lfanew)),
         addr signature, 4'u, addr got) == 0 or signature != NtSignature:
       return false
+    # The entry park and borrowed-call stubs execute x86 instructions. A
+    # native ARM64 image can share the parent's pointer width but cannot
+    # execute the two-byte self-jump. Refuse it before changing child memory.
+    var machine: uint16 = 0
+    if ReadProcessMemory(hProcess,
+        cast[pointer](cast[uint](imageBase) + uint(lfanew) + 4'u),
+        addr machine, 2'u, addr got) == 0 or got != 2'u:
+      return false
+    if machine notin [0x8664'u16, 0x014c'u16]:
+      # IMAGE_FILE_MACHINE_AMD64 / IMAGE_FILE_MACHINE_I386.
+      return false
     var entryRva: uint32 = 0
     if ReadProcessMemory(hProcess,
         cast[pointer](cast[uint](imageBase) + uint(lfanew) + EntryPointOffset),

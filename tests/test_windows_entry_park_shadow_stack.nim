@@ -24,14 +24,14 @@
 ##
 ## THE FIXTURE
 ## -----------
-## ``%SystemRoot%\System32\curl.exe`` -- shipped with every supported Windows
-## 10/11 and linked ``/CETCOMPAT`` -- run as ``curl.exe --version``, which
-## exits 0 without touching the network. Its main thread is parked, borrowed
-## TWICE (``injectShimIntoChild`` borrows it twice: ``LoadLibraryW`` and then
-## the shim's init export), released, and resumed. The borrowed callee is
-## ``kernel32!GetCurrentProcessId``, whose answer the test can check: a
-## returned value equal to the child's pid proves the call ran IN the child
-## and came back through its ``ret``.
+## A declared GCC/LLVM toolchain builds the repository's AMD64 C child and
+## links it with LLD's supported CET compatibility option. The fixture reads
+## the PE machine and real extended DLL-characteristics debug record before
+## spawning it, instead of assuming System32's curl has an AMD64 view on ARM.
+## Its main thread is parked, borrowed twice, released and resumed; the real
+## entry point then calls ExitProcess(0) without network or CRT dependencies.
+## GetCurrentProcessId must return the child's PID, proving each borrowed call
+## ran inside that child and returned through its genuine CALL/RET path.
 ##
 ## WHERE THIS DISCRIMINATES. Only where the fixture actually runs with a
 ## shadow stack, which needs CET-capable hardware and an OS that enables it
@@ -44,7 +44,7 @@
 
 when defined(windows) and defined(amd64):
 
-  import std/[os, strutils, unittest]
+  import std/[os, osproc, strutils, tempfiles, unittest]
 
   import stackable_hooks/windows_entry_park
 
@@ -166,10 +166,80 @@ when defined(windows) and defined(amd64):
       hung: bool
       exitCode: DWORD
 
+  proc peWord(data: string; offset: int): uint16 =
+    doAssert offset >= 0 and offset + 2 <= data.len
+    uint16(ord(data[offset])) or (uint16(ord(data[offset + 1])) shl 8)
+
+  proc peDword(data: string; offset: int): uint32 =
+    uint32(peWord(data, offset)) or (uint32(peWord(data, offset + 2)) shl 16)
+
+  proc requireAmd64CetImage(path: string) =
+    let data = readFile(path)
+    doAssert data.len >= 64 and data[0 .. 1] == "MZ"
+    let pe = int(peDword(data, 0x3c))
+    doAssert pe >= 0 and pe + 24 <= data.len
+    doAssert data[pe .. pe + 3] == "PE\0\0"
+    doAssert peWord(data, pe + 4) == 0x8664, "CET child must be AMD64"
+    let optional = pe + 24
+    doAssert peWord(data, optional) == 0x20b, "CET child must be PE32+"
+    let optionalSize = int(peWord(data, pe + 20))
+    doAssert optionalSize >= 112 + 7 * 8 and optional + optionalSize <= data.len
+    let sections = optional + optionalSize
+    doAssert sections + int(peWord(data, pe + 6)) * 40 <= data.len
+    proc fileOffset(rva: uint32): int =
+      for index in 0 ..< int(peWord(data, pe + 6)):
+        let section = sections + index * 40
+        let address = peDword(data, section + 12)
+        let size = peDword(data, section + 16)
+        if rva >= address and rva - address < size:
+          let offset = int(peDword(data, section + 20)) + int(rva - address)
+          doAssert offset >= 0 and offset < data.len
+          return offset
+      raise newException(ValueError, "CET debug directory is outside image sections")
+    let debugRva = peDword(data, optional + 112 + 6 * 8)
+    let debugSize = int(peDword(data, optional + 112 + 6 * 8 + 4))
+    doAssert debugRva != 0 and debugSize >= 28
+    let debug = fileOffset(debugRva)
+    doAssert debugSize mod 28 == 0 and debug + debugSize <= data.len
+    var cet = false
+    for index in 0 ..< debugSize div 28:
+      let entry = debug + index * 28
+      if peDword(data, entry + 12) == 20: # IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS
+        doAssert peDword(data, entry + 16) >= 4
+        let payload = int(peDword(data, entry + 24))
+        doAssert payload >= 0 and payload + int(peDword(data, entry + 16)) <= data.len
+        cet = (peDword(data, payload) and 1) != 0 # CET_COMPAT
+    doAssert cet, "Declared linker did not emit real CET compatibility metadata"
+
+  proc buildCetChild(directory: string): string =
+    let gcc = findExe("gcc")
+    let clang = findExe("clang")
+    doAssert gcc.len > 0 and clang.len > 0, "Declared GCC and LLVM toolchains required"
+    let source = currentSourcePath.parentDir / "fixtures" / "cet_child.c"
+    let objectFile = directory / "cet_child.o"
+    result = directory / "cet_child.exe"
+    let imports = execCmdEx(quoteShell(gcc) & " -print-file-name=libkernel32.a")
+    doAssert imports.exitCode == 0
+    let kernel32 = imports.output.strip()
+    doAssert kernel32.isAbsolute() and fileExists(kernel32)
+    let compile = execCmdEx(quoteShell(gcc) & " -c -O2 " & quoteShell(source) &
+      " -o " & quoteShell(objectFile))
+    doAssert compile.exitCode == 0, compile.output
+    let objectBytes = readFile(objectFile)
+    doAssert peWord(objectBytes, 0) == 0x8664,
+      "Declared GCC default target did not produce an AMD64 COFF object"
+    let link = execCmdEx(quoteShell(clang) &
+      " --target=x86_64-w64-windows-gnu -fuse-ld=lld -nostdlib" &
+      " -Wl,-e,cetChildEntry -Wl,-Xlink=-cetcompat " & quoteShell(objectFile) &
+      " " & quoteShell(kernel32) & " -o " & quoteShell(result))
+    doAssert link.exitCode == 0, link.output
+    requireAmd64CetImage(result)
+
   proc runBorrowedCalls(exe, args: string; borrows: int;
                         callee = "GetCurrentProcessId"; arg: pointer = nil;
                         timeoutMs = 10_000'u32;
                         childString = ""): Outcome =
+    requireAmd64CetImage(exe)
     var cmdW = toWide("\"" & exe & "\" " & args)
     var si: STARTUPINFOW
     si.cb = DWORD(sizeof(si))
@@ -189,7 +259,7 @@ when defined(windows) and defined(amd64):
     var machine = WORD(0x8664) # IMAGE_FILE_MACHINE_AMD64
     if nativeMachine == WORD(0xaa64): # IMAGE_FILE_MACHINE_ARM64
       # The entry-park implementation and this CET fixture are AMD64.
-      # System32's hybrid executable must be launched in its AMD64 view.
+      # The declared fixture is independently verified as an AMD64 CET image.
       var size: uint = 0
       discard InitializeProcThreadAttributeList(nil, 1, 0, addr size)
       if size == 0:
@@ -256,68 +326,73 @@ when defined(windows) and defined(amd64):
     discard CloseHandle(pi.hThread)
     discard CloseHandle(pi.hProcess)
 
-  suite "Windows entry park: a borrowed call must keep the shadow stack":
-    let curl = getEnv("SystemRoot", r"C:\Windows") / "System32" / "curl.exe"
+  proc runCetSuite() =
+    suite "Windows entry park: a borrowed call must keep the shadow stack":
+      let fixtureDirectory = createTempDir("stackable-cet-child-", "")
+      defer: removeDir(fixtureDirectory)
+      let child = buildCetChild(fixtureDirectory)
 
-    test "a /CETCOMPAT child survives two borrowed calls and exits 0":
-      require fileExists(curl)
-      let outcome = runBorrowedCalls(curl, "--version", borrows = 2)
-      checkpoint("fixture runs with a user shadow stack: " &
-        $outcome.shadowStack & (if outcome.shadowStack: "" else:
-          " -- this host cannot discriminate the shadow-stack hazard"))
-      checkpoint("child exit code: 0x" & outcome.exitCode.int64.toHex(8) &
-        " (0xC0000409 = shadow-stack violation in the borrowed call)")
-      check outcome.parked
-      check outcome.calls == @[true, true]
-      # The borrowed callee ran IN the child, on its main thread, and its
-      # `ret` came back: GetCurrentProcessId answered the CHILD's pid.
-      check outcome.answers == @[uint64(outcome.pid), uint64(outcome.pid)]
-      check not outcome.hung
-      check outcome.exitCode == 0
+      test "a /CETCOMPAT child survives two borrowed calls and exits 0":
+        require fileExists(child)
+        let outcome = runBorrowedCalls(child, "", borrows = 2)
+        checkpoint("fixture runs with a user shadow stack: " &
+          $outcome.shadowStack & (if outcome.shadowStack: "" else:
+            " -- this host cannot discriminate the shadow-stack hazard"))
+        checkpoint("child exit code: 0x" & outcome.exitCode.int64.toHex(8) &
+          " (0xC0000409 = shadow-stack violation in the borrowed call)")
+        check outcome.parked
+        check outcome.calls == @[true, true]
+        # The borrowed callee ran IN the child, on its main thread, and its
+        # `ret` came back: GetCurrentProcessId answered the CHILD's pid.
+        check outcome.answers == @[uint64(outcome.pid), uint64(outcome.pid)]
+        check not outcome.hung
+        check outcome.exitCode == 0
 
-    test "a borrowed call that outlives its hard deadline poisons the child":
-      ## The slow path, under R2 of docs/windows-borrowed-call-deadline.md:
-      ## a thread whose context is lent out is never resumed.
-      ## `kernel32!Sleep(3000)` is borrowed with a 500 ms hard deadline, so
-      ## the call is still running when the deadline passes. The borrow must
-      ## then terminate the child with `InjectionAbandonedExitCode`, and the
-      ## caller's release and `ResumeThread` (exactly what
-      ## `injectShimIntoChild` does after a failed injection) must neither
-      ## bring it back nor leave it hanging. When this test was written, the
-      ## deadline was a 5 s budget and an expired borrow resumed the child,
-      ## so this case asserted exit 0 instead. On this CET child that case
-      ## also caught a stub that ended the borrow on a self-jump of its own
-      ## and left `gcc.exe` spinning forever; the `hung` check keeps that.
-      require fileExists(curl)
-      let outcome = runBorrowedCalls(curl, "--version", borrows = 1,
-        callee = "Sleep", arg = cast[pointer](3000), timeoutMs = 500'u32)
-      checkpoint("fixture runs with a user shadow stack: " &
-        $outcome.shadowStack)
-      checkpoint("child exit code: 0x" & outcome.exitCode.int64.toHex(8) &
-        " (0xC00000B5 = InjectionAbandonedExitCode)")
-      check outcome.parked
-      check outcome.calls == @[false]
-      check not outcome.hung
-      check outcome.exitCode == InjectionAbandonedExitCode
+      test "a borrowed call that outlives its hard deadline poisons the child":
+        ## The slow path, under R2 of docs/windows-borrowed-call-deadline.md:
+        ## a thread whose context is lent out is never resumed.
+        ## `kernel32!Sleep(3000)` is borrowed with a 500 ms hard deadline, so
+        ## the call is still running when the deadline passes. The borrow must
+        ## then terminate the child with `InjectionAbandonedExitCode`, and the
+        ## caller's release and `ResumeThread` (exactly what
+        ## `injectShimIntoChild` does after a failed injection) must neither
+        ## bring it back nor leave it hanging. When this test was written, the
+        ## deadline was a 5 s budget and an expired borrow resumed the child,
+        ## so this case asserted exit 0 instead. On this CET child that case
+        ## also caught a stub that ended the borrow on a self-jump of its own
+        ## and left `gcc.exe` spinning forever; the `hung` check keeps that.
+        require fileExists(child)
+        let outcome = runBorrowedCalls(child, "", borrows = 1,
+          callee = "Sleep", arg = cast[pointer](3000), timeoutMs = 500'u32)
+        checkpoint("fixture runs with a user shadow stack: " &
+          $outcome.shadowStack)
+        checkpoint("child exit code: 0x" & outcome.exitCode.int64.toHex(8) &
+          " (0xC00000B5 = InjectionAbandonedExitCode)")
+        check outcome.parked
+        check outcome.calls == @[false]
+        check not outcome.hung
+        check outcome.exitCode == InjectionAbandonedExitCode
 
-    test "a borrowed LoadLibraryW maps a real DLL and the child exits 0":
-      ## What injection actually borrows the thread for. Unlike the two
-      ## leaf callees above, the loader runs SSE code on its stack, so this
-      ## is also the case that pins the Win64 call-site alignment the stub
-      ## establishes (RSP 16-byte aligned at the `call`): measured, a stub
-      ## that is 8 bytes off passes both cases above and kills the child
-      ## here. `dbghelp.dll` is a System32 DLL `curl.exe` does not import.
-      require fileExists(curl)
-      let outcome = runBorrowedCalls(curl, "--version", borrows = 1,
-        callee = "LoadLibraryW",
-        childString = getEnv("SystemRoot", r"C:\Windows") / "System32" /
-          "dbghelp.dll")
-      checkpoint("fixture runs with a user shadow stack: " &
-        $outcome.shadowStack)
-      checkpoint("child exit code: 0x" & outcome.exitCode.int64.toHex(8))
-      check outcome.parked
-      check outcome.calls == @[true]
-      # LoadLibraryW's HMODULE came back through RAX: nonzero means mapped.
-      check outcome.answers.len == 1 and outcome.answers[0] != 0
-      check not outcome.hung
-      check outcome.exitCode == 0
+      test "a borrowed LoadLibraryW maps a real DLL and the child exits 0":
+        ## What injection actually borrows the thread for. Unlike the two
+        ## leaf callees above, the loader runs SSE code on its stack, so this
+        ## is also the case that pins the Win64 call-site alignment the stub
+        ## establishes (RSP 16-byte aligned at the `call`): measured, a stub
+        ## that is 8 bytes off passes both cases above and kills the child
+        ## here. `dbghelp.dll` is a System32 DLL the fixture does not import.
+        require fileExists(child)
+        let outcome = runBorrowedCalls(child, "", borrows = 1,
+          callee = "LoadLibraryW",
+          childString = getEnv("SystemRoot", r"C:\Windows") / "System32" /
+            "dbghelp.dll")
+        checkpoint("fixture runs with a user shadow stack: " &
+          $outcome.shadowStack)
+        checkpoint("child exit code: 0x" & outcome.exitCode.int64.toHex(8))
+        check outcome.parked
+        check outcome.calls == @[true]
+        # LoadLibraryW's HMODULE came back through RAX: nonzero means mapped.
+        check outcome.answers.len == 1 and outcome.answers[0] != 0
+        check not outcome.hung
+        check outcome.exitCode == 0
+
+  runCetSuite()

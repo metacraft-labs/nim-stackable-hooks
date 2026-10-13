@@ -94,6 +94,8 @@ package stackable_hooks:
       "clang"
     else:
       "gcc >=12"
+    when defined(windows):
+      "clang" # LLVM linker emits the genuine AMD64 CET child image.
     "just >=1"
     "nimble"
     "sh"
@@ -125,6 +127,7 @@ package stackable_hooks:
     const backendCompiler = (when defined(macosx): "clang" else: "gcc")
 
     proc emitTestPair(source, binary: string;
+                      runtimeInputs, runtimeTools: seq[string];
                       buildActions, executeActions: var seq[BuildActionDef]) =
       var lastSlash = -1
       for i in 0 ..< binary.len:
@@ -149,6 +152,9 @@ package stackable_hooks:
       # The cross-target matrix and process-injection fixtures invoke the
       # compiler at runtime. A BUILD edge's tools are not inherited by RUN.
       appendRegisteredActionToolIdentityRefs(executeEdge.id, ["nim", backendCompiler])
+      appendRegisteredActionToolIdentityRefs(executeEdge.id, runtimeTools)
+      if runtimeInputs.len > 0:
+        setRegisteredActionInputs(executeEdge.id, executeEdge.inputs & runtimeInputs)
       executeActions.add(executeEdge)
 
     # One pair per corpus entry whose ``targets`` cover this host OS. The
@@ -157,6 +163,7 @@ package stackable_hooks:
     # than by two people keeping two lists in step.
     for spec in hostTargets():
       emitTestPair(spec.testSource, spec.testBinary,
+        spec.runtimeInputs, spec.runtimeTools,
         testBuildActions, testExecuteActions)
 
     discard collect("test", testExecuteActions)

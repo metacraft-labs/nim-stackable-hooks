@@ -63,6 +63,8 @@ type
     ## ``.nim`` extension; the source path and the build output path are
     ## derived from it so no lane spells either one.
     stem*: string
+    runtimeInputs*: seq[string] ## Additional source files consumed by this test.
+    runtimeTools*: seq[string] ## Additional declared tools used when the test runs.
     targets*: seq[CheckTarget]
     why*: string
 
@@ -200,6 +202,15 @@ const testCorpus*: seq[TestEntry] = @[
          "borrowed on a real child's main thread, and a fixture DLL whose " &
          "load sleeps -- so the run lane is Windows only while the " &
          "cross-target lane compile-verifies it from Linux and macOS."),
+  TestEntry(stem: "test_windows_entry_park_shadow_stack",
+    runtimeInputs: @["tests/fixtures/cet_child.c"], runtimeTools: @["clang"],
+    targets: @[tLinuxAmd64, tMacosArm64, tWindowsAmd64, tWindowsArm64],
+    why: "Body is gated on `defined(windows) and defined(amd64)`, so it " &
+         "compiles everywhere and is a no-op off Windows/amd64. Its " &
+         "Windows arm borrows the parked main thread of a real " &
+         "`/CETCOMPAT` child (System32 curl.exe) twice, so the run lane is " &
+         "Windows only while the cross-target lane still compile-verifies " &
+         "it from Linux and macOS."),
   TestEntry(stem: "test_windows_wow64_injection",
     targets: @[tLinuxAmd64, tMacosArm64, tWindowsAmd64, tWindowsArm64],
     why: "Body is `when defined(windows)`-wrapped; compiles everywhere, " &

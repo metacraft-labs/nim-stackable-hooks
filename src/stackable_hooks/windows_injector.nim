@@ -359,6 +359,64 @@ proc shim64PathFor*(shimPath32: string): string {.raises: [], gcsafe.} =
   else:
     shimPath32
 
+proc processMachineWitness(hProcess: HANDLE): string {.raises: [], gcsafe.} =
+  # Query the public machine pair separately from the legacy WOW64 boolean.
+  # Diagnostics do not choose an architecture or change injection behavior.
+  type QueryMachine = proc(hProcess: HANDLE; processMachine,
+                           nativeMachine: ptr WORD): BOOL
+    {.stdcall, raises: [], gcsafe.}
+  try:
+    var moduleName = toWideCStringSeq("kernel32.dll")
+    let kernel = GetModuleHandleW(cast[LPCWSTR](addr moduleName[0]))
+    let entry = if kernel == nil: nil
+                else: GetProcAddress(kernel, "IsWow64Process2")
+    var processMachine, nativeMachine: WORD
+    var succeeded = false
+    var apiError: DWORD = 0
+    if entry != nil:
+      let query = cast[QueryMachine](entry)
+      succeeded = query(hProcess, addr processMachine, addr nativeMachine) != 0
+      if not succeeded:
+        apiError = GetLastError()
+        processMachine = 0
+        nativeMachine = 0
+    # Public ABI: learn.microsoft.com/windows/win32/api/processthreadsapi/
+    # ne-processthreadsapi-process_information_class and
+    # ns-processthreadsapi-process_machine_information.
+    # ProcessMachineTypeInfo is the tenth PROCESS_INFORMATION_CLASS member.
+    # Unlike the WOW64 pair, its ProcessMachine describes the actual process.
+    type
+      MachineInformation = object
+        processMachine, reserved: WORD
+        attributes: DWORD
+      QueryInformation = proc(hProcess: HANDLE; informationClass: int32;
+                              information: pointer; size: DWORD): BOOL
+        {.stdcall, raises: [], gcsafe.}
+    static: doAssert sizeof(MachineInformation) == 8
+    let infoEntry = if kernel == nil: nil
+                    else: GetProcAddress(kernel, "GetProcessInformation")
+    var info: MachineInformation
+    var infoSucceeded = false
+    var infoError: DWORD = 0
+    if infoEntry != nil:
+      let query = cast[QueryInformation](infoEntry)
+      infoSucceeded = query(hProcess, 9, addr info, DWORD(sizeof(info))) != 0
+      if not infoSucceeded:
+        infoError = GetLastError()
+        info = default(MachineInformation)
+    result = " machineApiAvailable=" & $(entry != nil) &
+      " machineApiSucceeded=" & $succeeded &
+      " processMachine=" & $processMachine &
+      " nativeMachine=" & $nativeMachine &
+      " machineApiError=" & $apiError &
+      " processInfoApiAvailable=" & $(infoEntry != nil) &
+      " processInfoApiSucceeded=" & $infoSucceeded &
+      " actualProcessMachine=" & $info.processMachine &
+      " machineAttributes=" & $info.attributes &
+      " processInfoApiError=" & $infoError
+  except Exception:
+    result = " machineWitnessUnavailable=true"
+
 proc processIsWow64*(hProcess: HANDLE): bool {.raises: [], gcsafe.} =
   ## True when `hProcess` is a 32-bit process on 64-bit Windows. On a 32-bit
   ## host every process reports false and the ordinary same-bitness path is
@@ -949,7 +1007,10 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
           discard VirtualFreeEx(pi.hProcess, remoteBuf, 0, MEM_RELEASE)
           raise newException(OSError,
             "CreateRemoteThread(LoadLibraryW) failed (err=" &
-            $createThreadError & ")")
+            $createThreadError & ") parkStatus=" & $park.status &
+            " childIsWow64=" & $childIsWow64 &
+            " callerMachine={" & processMachineWitness(GetCurrentProcess()) &
+            "} targetMachine={" & processMachineWitness(pi.hProcess) & "}")
 
         discard WaitForSingleObject(llThread, INFINITE)
         llExit = 0

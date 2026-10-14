@@ -915,8 +915,10 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
     var borrowedLoad = false
     if not skipInjection:
       if park.status == epsParked and not childIsWow64:
-        if not callOnParkedThread(park, pi.hThread, childIsWow64,
-            loadLibraryW, remoteBuf, parkTimeoutMs, llModule):
+        let borrowed = borrowParkedThread(park, pi.hThread, childIsWow64,
+          loadLibraryW, remoteBuf, parkTimeoutMs)
+        llModule = borrowed.ret
+        if borrowed.status != bcsReturned:
           discard VirtualFreeEx(pi.hProcess, remoteBuf, 0, MEM_RELEASE)
           if park.status == epsAbandoned:
             raise newException(OSError,
@@ -929,8 +931,9 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
             "the shim. Falling back to CreateRemoteThread here is NOT an " &
             "option: it would run the shim's module initialisation on a " &
             "thread that then exits, leaving every global it allocated " &
-            "owned by a heap region that dies with it. shim=" &
-            effectiveDllPath)
+            "owned by a heap region that dies with it. borrowedStatus=" &
+            $borrowed.status & " parkStatus=" & $park.status &
+            " shim=" & effectiveDllPath)
         borrowedLoad = true
         # The borrowed call returns LoadLibraryW's HMODULE in RAX. Only
         # "did it load" is wanted below, and a 64-bit base cannot be
@@ -941,9 +944,12 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
         let llThread = CreateRemoteThread(pi.hProcess, nil, 0,
           loadLibraryW, remoteBuf, 0, nil)
         if llThread == nil:
+          # Cleanup may replace the failing API's thread-local error.
+          let createThreadError = GetLastError()
           discard VirtualFreeEx(pi.hProcess, remoteBuf, 0, MEM_RELEASE)
           raise newException(OSError,
-            "CreateRemoteThread(LoadLibraryW) failed (err=" & $GetLastError() & ")")
+            "CreateRemoteThread(LoadLibraryW) failed (err=" &
+            $createThreadError & ")")
 
         discard WaitForSingleObject(llThread, INFINITE)
         llExit = 0

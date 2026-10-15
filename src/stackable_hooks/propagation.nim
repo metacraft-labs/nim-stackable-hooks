@@ -193,12 +193,38 @@ proc isValidSipReplacement*(candidate: string): bool =
   try:
     if not fileExists(candidate):
       return false
+    when defined(posix):
+      # Resolve directory components as well as the leaf. Canonicalizing the
+      # complete path first can hide a protected hop, such as a parent link
+      # to /bin followed by /bin/sh's Nix-managed executable link.
+      var remaining = absolutePath(candidate).split('/')
+      var resolved = "/"
+      var visited: seq[string] = @[]
+      while remaining.len > 0:
+        let component = remaining[0]
+        remaining.delete(0)
+        if component.len == 0 or component == ".":
+          continue
+        if component == "..":
+          if resolved != "/":
+            resolved = resolved.parentDir
+          continue
+        resolved = resolved / component
+        if isSipProtected(resolved & "/"):
+          return false
+        if symlinkExists(resolved):
+          if resolved in visited or visited.len >= 40:
+            return false
+          visited.add(resolved)
+          let link = expandSymlink(resolved)
+          remaining = link.split('/') & remaining
+          resolved = if link.isAbsolute: "/" else: resolved.parentDir
     let target = expandFilename(candidate)
     if isSipProtected(target):
       return false
     let permissions = getFilePermissions(target)
     return (permissions * {fpUserExec, fpGroupExec, fpOthersExec}) != {}
-  except OSError:
+  except OSError, ValueError:
     return false
 
 proc resolveSipReplacement*(binaryPath: string; sandboxDir = ""): string =

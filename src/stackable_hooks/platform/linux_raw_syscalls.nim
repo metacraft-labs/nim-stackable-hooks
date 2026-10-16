@@ -3574,6 +3574,7 @@ proc visitLinuxX8664SyscallBytes*(bytes: openArray[byte];
       inc i
 
 when defined(linux) and defined(amd64):
+  import strict_decoder_binding
   # FUP-H — reuse the (portable, length-only) x86-64 instruction-length
   # decoder from the inline-hook backend to give the LIVE syscall-site
   # scanner true instruction-boundary awareness. A byte-level `0f 05` scan
@@ -3588,46 +3589,59 @@ when defined(linux) and defined(amd64):
   # the mapping start consumes each real instruction whole, so a
   # mid-instruction `0f 05` is never presented as a candidate boundary.
   {.compile: "../inline_hook/windows/length_decoder.c".}
+  {.compile: "../inline_hook/windows/strict_x86_decoder.c".}
   proc ctIldDecode(code: pointer; maxLen: csize_t): cint
-    {.importc: "ct_ild_decode", cdecl.}
+    {.importc: "ct_strict_x8664_decode", cdecl.}
 
-proc visitLinuxX8664SyscallMemory*(start: pointer; length: int;
-                                   visitor: proc(site: LinuxSyscallSite): bool
-                                     {.closure, raises: [].}) {.raises: [].} =
-  ## Scan an already-readable memory range for raw syscall callsites. The
-  ## caller owns mapping selection and exclusion policy.
-  ##
-  ## FUP-H — the scan is instruction-boundary aware: it walks forward one
-  ## decoded instruction at a time and only reports a `0f 05` that begins a
-  ## complete 2-byte instruction. A `0f 05` that falls inside a longer
-  ## instruction is consumed by that instruction's decode and never
-  ## reported, so it is never int3-patched. When a byte cannot be decoded
-  ## (data/padding in the executable mapping, or an opcode outside the
-  ## decoder's subset) the scan resyncs by a single byte and, crucially,
-  ## reports NOTHING for that byte — the safe bias is monitor event-loss
-  ## over corrupting a mid-instruction patch.
-  if start == nil or length < 3 or visitor == nil:
-    return
+type LinuxSyscallScanResult* = object
+  ## A syntactic boundary result, not code/data or process coverage authority.
+  supported*, complete*, visitorStopped*: bool
+  decodedBytes*, rejectedOffset*, candidateCount*: int
+
+proc inspectLinuxX8664SyscallMemory*(start: pointer; length: int;
+    visitor: proc(site: LinuxSyscallSite): bool {.closure, raises: [].}):
+    LinuxSyscallScanResult {.raises: [].} =
+  ## Decode the whole range BEFORE invoking a potentially mutating visitor.
+  ## Unsupported/truncated instructions refuse the range without byte resync
+  ## and without invoking any patch callback. Callers must consume the result;
+  ## a successfully decoded range still needs independent code/data authority.
+  result.rejectedOffset = -1
   when defined(linux) and defined(amd64):
+    result.supported = true
+    if length < 0 or (start == nil and length != 0) or visitor == nil:
+      return
     let p = cast[ptr UncheckedArray[byte]](start)
     let base = cast[uint](start)
+    var sites: seq[LinuxSyscallSite]
     var i = 0
-    while i + 2 < length:
-      let avail = length - i
-      let ilen = int(ctIldDecode(addr p[i], csize_t(min(avail, 15))))
-      if ilen <= 0:
-        inc i
-        continue
-      if ilen == 2 and p[i] == linuxSyscallOpcode0 and
-          p[i + 1] == linuxSyscallOpcode1 and (p[i + 2] != byte 0x00) and
-          not (i >= 1 and precededByRel32Branch(p[i - 1])):
-        let keepGoing = visitor LinuxSyscallSite(
-          address: base + uint(i),
-          offset: i,
-          nextByte: p[i + 2])
-        if not keepGoing:
-          return
-      inc i, ilen
+    while i < length:
+      let available = length - i
+      let instructionLength = int(ctIldDecode(addr p[i], csize_t(min(available, 15))))
+      if instructionLength <= 0 or instructionLength > available:
+        result.rejectedOffset = i
+        return
+      if instructionLength == 2 and p[i] == linuxSyscallOpcode0 and
+          p[i + 1] == linuxSyscallOpcode1:
+        # The decoder established this boundary. A preceding E8/E9 can be a
+        # ModRM/displacement byte of the PREVIOUS instruction (real glibc MOV
+        # cases); neither it nor the next instruction's first byte filters it.
+        sites.add LinuxSyscallSite(address: base + uint(i), offset: i,
+          nextByte: (if available > 2: p[i + 2] else: 0'u8))
+      i += instructionLength
+      result.decodedBytes = i
+    result.candidateCount = sites.len
+    for site in sites:
+      if not visitor(site):
+        result.visitorStopped = true
+        return
+    result.complete = true
+
+proc visitLinuxX8664SyscallMemory*(start: pointer; length: int;
+    visitor: proc(site: LinuxSyscallSite): bool {.closure, raises: [].}) {.raises: [].} =
+  ## Compatibility surface. Never resynchronize and patch an unproven boundary.
+  ## Coverage-sensitive consumers must use inspectLinuxX8664SyscallMemory and
+  ## refuse an incomplete result; this void API cannot confer coverage itself.
+  discard inspectLinuxX8664SyscallMemory(start, length, visitor)
 
 proc visitLinuxExecutableMappingSyscalls*(mapping: LinuxExecutableMapping;
                                           visitor: proc(site: LinuxSyscallSite): bool

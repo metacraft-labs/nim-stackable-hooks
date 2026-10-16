@@ -4710,7 +4710,9 @@
           "nixos-modules",
           "nixpkgs-unstable"
         ],
-        "stackable-hooks-macos-tools": "stackable-hooks-macos-tools"
+        "stackable-hooks-macos-tools": "stackable-hooks-macos-tools",
+        "zycore-src": "zycore-src",
+        "zydis-src": "zydis-src"
       }
     },
     "runquota-src": {
@@ -5454,6 +5456,40 @@
         "owner": "jcollie",
         "ref": "main",
         "repo": "zon2nix",
+        "type": "github"
+      }
+    },
+    "zycore-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1739114385,
+        "narHash": "sha256-/RQl43gx3CO0OxH1syz4l3E4+/m46ql+HKVyuC1x4sA=",
+        "owner": "zyantific",
+        "repo": "zycore-c",
+        "rev": "0b2432ced0884fd152b471d97ecf0258ff4d859f",
+        "type": "github"
+      },
+      "original": {
+        "owner": "zyantific",
+        "repo": "zycore-c",
+        "rev": "0b2432ced0884fd152b471d97ecf0258ff4d859f",
+        "type": "github"
+      }
+    },
+    "zydis-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1739664900,
+        "narHash": "sha256-6J4pTUm3xQXwlQNBldjXVWRcse+auSFJtxGWaPRVzLg=",
+        "owner": "zyantific",
+        "repo": "zydis",
+        "rev": "a2278f1d254e492f6a6b39f6cb5d1f5d515659dc",
+        "type": "github"
+      },
+      "original": {
+        "owner": "zyantific",
+        "repo": "zydis",
+        "rev": "a2278f1d254e492f6a6b39f6cb5d1f5d515659dc",
         "type": "github"
       }
     }

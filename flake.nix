@@ -6,6 +6,14 @@
     stackable-hooks-macos-tools = {
       url = "github:metacraft-labs/stackable-hooks-macos-tools/1ad378d58776ec9b6cc73e1c27b8e53c15676f03";
     };
+    zydis-src = {
+      url = "github:zyantific/zydis/a2278f1d254e492f6a6b39f6cb5d1f5d515659dc";
+      flake = false;
+    };
+    zycore-src = {
+      url = "github:zyantific/zycore-c/0b2432ced0884fd152b471d97ecf0258ff4d859f";
+      flake = false;
+    };
     nixos-modules.url = "github:metacraft-labs/devops-modules";
     nixpkgs.follows = "nixos-modules/nixpkgs-unstable";
     flake-parts.follows = "nixos-modules/flake-parts";
@@ -34,6 +42,32 @@
           ...
         }:
         let
+          strictDecoderEnabled = system == "x86_64-linux";
+          strictDecoder = pkgs.callPackage ./nix/strict-decoder.nix {
+            zydisSrc = inputs.zydis-src;
+            zycoreSrc = inputs.zycore-src;
+            bindingSource = ./nix/strict_decoder_binding.nim;
+          };
+          owningNim =
+            if strictDecoderEnabled then
+              pkgs.symlinkJoin {
+                name = "nim-with-stackable-strict-decoder";
+                paths = [ pkgs.nim2 ];
+                nativeBuildInputs = [ pkgs.makeWrapper ];
+                postBuild = ''
+                  rm "$out/bin/nim"
+                  rm -r "$out/etc/nim"
+                  cp -r "${pkgs.nim2}/etc/nim" "$out/etc/nim"
+                  chmod -R u+w "$out/etc/nim"
+                  printf '\npath = "${strictDecoder}/src"\n' >> "$out/etc/nim/nim.cfg"
+                  substitute "${pkgs.nim2}/bin/nim" "$out/bin/nim" \
+                    --replace-fail "${pkgs.nim2}/bin" "$out/bin" \
+                    --replace-fail "${pkgs.nim2}/etc/nim" "$out/etc/nim"
+                  chmod +x "$out/bin/nim"
+                '';
+              }
+            else
+              pkgs.nim2;
           version = builtins.replaceStrings [ "\n" "\r" ] [ "" "" ] (builtins.readFile ./version.txt);
           # git-hooks.nix installs `.pre-commit-config.yaml` and git hooks into
           # `git rev-parse --show-toplevel` of the directory the shell is entered
@@ -96,17 +130,31 @@
             };
           };
 
-          packages.default = pkgs.stdenv.mkDerivation {
-            pname = "stackable-hooks";
-            inherit version;
-            src = ./.;
+          packages = {
+            default = pkgs.stdenv.mkDerivation {
+              pname = "stackable-hooks";
+              inherit version;
+              src = ./.;
+              dontStrip = true;
+              propagatedBuildInputs = pkgs.lib.optional strictDecoderEnabled strictDecoder;
 
-            installPhase = ''
-              runHook preInstall
-              mkdir -p "$out"
-              cp -r src "$out/src"
-              runHook postInstall
-            '';
+              installPhase = ''
+                runHook preInstall
+                mkdir -p "$out"
+                cp -r src "$out/src"
+                ${pkgs.lib.optionalString strictDecoderEnabled ''
+                  cp "${strictDecoder}/src/strict_decoder_binding.nim" "$out/src/"
+                  cp -r "${strictDecoder}/lib" "$out/lib"
+                  cp -r "${strictDecoder}/include" "$out/include"
+                  mkdir -p "$out/share"
+                  cp -r "${strictDecoder}/share/licenses" "$out/share/licenses"
+                ''}
+                runHook postInstall
+              '';
+            };
+          }
+          // pkgs.lib.optionalAttrs strictDecoderEnabled {
+            strict-decoder = strictDecoder;
           };
 
           devShells.default = pkgs.mkShell (
@@ -122,7 +170,7 @@
               packages = config.pre-commit.settings.enabledPackages ++ [
                 config.pre-commit.settings.package
                 pkgs.just
-                pkgs.nim2
+                owningNim
                 pkgs.nimble
                 pkgs.git
                 pkgs.nixfmt

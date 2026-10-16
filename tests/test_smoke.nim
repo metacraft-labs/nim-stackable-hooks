@@ -58,6 +58,7 @@ suite "smoke":
 
       let dropIn = sandbox / "usr" / "bin" / "iconutil"
       writeFile(dropIn, "#!/bin/sh\nexit 0\n")
+      setFilePermissions(dropIn, {fpUserRead, fpUserWrite, fpUserExec})
       check rewriteExecPathForSip(appleTool) == dropIn
     finally:
       if oldSandbox.len > 0:
@@ -65,3 +66,44 @@ suite "smoke":
       else:
         delEnv("CT_SANDBOX_TOOLS_DIR")
       removeDir(sandbox)
+
+  when defined(posix):
+    test "SIP resolver preserves precedence and rejects protected link targets":
+      # Resolver fixtures point to this real executable: no shim or platform
+      # binary is mocked, and a /bin/sh link is the adversarial SIP escape.
+      let work = getTempDir() / ("hooks-sip-resolver-" & $getCurrentProcessId())
+      removeDir(work)
+      let invocation = work / "invocation"
+      let portable = work / "portable"
+      createDir(invocation / "bin")
+      createDir(portable / "bin")
+      let savedSandbox = getEnv("CT_SANDBOX_TOOLS_DIR")
+      let savedTools = getEnv("STACKABLE_HOOKS_TOOLS_DIR")
+      putEnv("CT_SANDBOX_TOOLS_DIR", invocation)
+      putEnv("STACKABLE_HOOKS_TOOLS_DIR", portable)
+      defer:
+        for entry in [("CT_SANDBOX_TOOLS_DIR", savedSandbox),
+                      ("STACKABLE_HOOKS_TOOLS_DIR", savedTools)]:
+          if entry[1].len > 0: putEnv(entry[0], entry[1])
+          else: delEnv(entry[0])
+        removeDir(work)
+      let invocationSh = invocation / "bin" / "sh"
+      let portableSh = portable / "bin" / "sh"
+      createSymlink(getAppFilename(), portableSh)
+      check rewriteExecPathForSip("/bin/sh") == portableSh
+      createSymlink(getAppFilename(), invocationSh)
+      check rewriteExecPathForSip("/bin/sh") == invocationSh
+      removeFile(invocationSh)
+      createSymlink("/bin/sh", invocationSh)
+      check rewriteExecPathForSip("/bin/sh") == portableSh
+      removeFile(invocationSh)
+      createSymlink(work / "missing", invocationSh)
+      check rewriteExecPathForSip("/bin/sh") == portableSh
+      check rewriteExecPathForSip("/bin/no-such-stackable-tool") ==
+        "/bin/no-such-stackable-tool"
+      check rewriteExecPathForSip(getAppFilename()) == getAppFilename()
+      let nonExecutable = invocation / "bin" / "no-such-stackable-tool"
+      writeFile(nonExecutable, "unusable")
+      setFilePermissions(nonExecutable, {fpUserRead, fpUserWrite})
+      check rewriteExecPathForSip("/bin/no-such-stackable-tool") ==
+        "/bin/no-such-stackable-tool"

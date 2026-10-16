@@ -97,3 +97,14 @@ addPackagePath("STACKABLE_HOOKS_SRC", [
   "libs" / "vendor" / "nim-stackable-hooks" / "src",
 ], "stackable_hooks.nim")
 ```
+
+macOS spawn propagation resolves each SIP replacement through
+`resolveSipReplacement`: the invocation's `CT_SANDBOX_TOOLS_DIR`, then
+`STACKABLE_HOOKS_TOOLS_DIR`, then the build-embedded shipped tools directory.
+Set `STACKABLE_HOOKS_BUILT_TOOLS_DIR` while compiling (or the Nim strdefine
+`StackableHooksBuiltToolsDir`) to retain that bundle independently of runtime
+`PATH`. Candidates must be executable and their canonical targets must be
+outside SIP prefixes. Missing or invalid candidates fall through; an unavailable
+tool keeps its original path so the consumer can report incomplete capture.
+Tests of the unavailable-tools case explicitly compile an empty strdefine or
+build environment value, preserving their negative controls in packaged shells.

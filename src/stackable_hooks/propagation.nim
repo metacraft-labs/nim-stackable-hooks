@@ -182,37 +182,71 @@ proc prepareSandboxCopy*(binaryPath: string,
 
   return destPath
 
-proc rewriteExecPathForSip*(binaryPath: string): string =
-  ## Called by exec/posix_spawn hooks at runtime to rewrite a SIP-protected
-  ## binary path to use the sandbox-tools copy. Reads CT_SANDBOX_TOOLS_DIR
-  ## from the environment.
-  ##
-  ## Unlike `prepareSandboxCopy`, this does NOT copy the binary — it only
-  ## rewrites the path if the sandbox copy already exists. The `ct-mcr record`
-  ## command is responsible for pre-populating the sandbox-tools directory
-  ## for the initial target; child process binaries must also be pre-populated
-  ## (e.g. by a setup step or by the recorder preparing common tools ahead
-  ## of time).
-  ##
-  ## Returns the rewritten path if a sandbox copy exists, or the original
-  ## path otherwise.
+const StackableHooksBuiltToolsDir* {.strdefine.} =
+  static(getEnv("STACKABLE_HOOKS_BUILT_TOOLS_DIR"))
+  ## Distribution-provided non-SIP tools retained in the binary's closure.
+  ## An explicit empty strdefine disables this fallback for negative controls.
+
+proc isValidSipReplacement*(candidate: string): bool =
+  ## Checking the lexical path alone would accept a symlink back to /bin/sh,
+  ## which still strips injection. Check its canonical executable identity.
+  try:
+    if not fileExists(candidate):
+      return false
+    when defined(posix):
+      # Resolve directory components as well as the leaf. Canonicalizing the
+      # complete path first can hide a protected hop, such as a parent link
+      # to /bin followed by /bin/sh's Nix-managed executable link.
+      var remaining = absolutePath(candidate).split('/')
+      var resolved = "/"
+      var visited: seq[string] = @[]
+      while remaining.len > 0:
+        let component = remaining[0]
+        remaining.delete(0)
+        if component.len == 0 or component == ".":
+          continue
+        if component == "..":
+          if resolved != "/":
+            resolved = resolved.parentDir
+          continue
+        resolved = resolved / component
+        if isSipProtected(resolved & "/"):
+          return false
+        if symlinkExists(resolved):
+          if resolved in visited or visited.len >= 40:
+            return false
+          visited.add(resolved)
+          let link = expandSymlink(resolved)
+          remaining = link.split('/') & remaining
+          resolved = if link.isAbsolute: "/" else: resolved.parentDir
+    let target = expandFilename(candidate)
+    if isSipProtected(target):
+      return false
+    let permissions = getFilePermissions(target)
+    return (permissions * {fpUserExec, fpGroupExec, fpOthersExec}) != {}
+  except OSError, ValueError:
+    return false
+
+proc resolveSipReplacement*(binaryPath: string; sandboxDir = ""): string =
+  ## Return an available non-SIP replacement, or the unchanged original path.
+  ## Invocation-local tools win; the shipped bundle supplies tools absent from
+  ## that tree independently of PATH, including Nim's absolute /bin/sh spawn.
   if not isSipProtected(binaryPath):
     return binaryPath
+  let invocationDir = if sandboxDir.len > 0: sandboxDir else: sandboxToolsDir()
+  for root in [invocationDir, getEnv("STACKABLE_HOOKS_TOOLS_DIR"),
+               StackableHooksBuiltToolsDir]:
+    if root.len == 0:
+      continue
+    let candidate = rewriteSipPath(binaryPath, root)
+    if isValidSipReplacement(candidate):
+      return candidate
+  binaryPath
 
-  let sandboxDir = sandboxToolsDir()
-  if sandboxDir.len == 0:
-    return binaryPath
-
-  let rewritten = rewriteSipPath(binaryPath, sandboxDir)
-  try:
-    if fileExists(rewritten):
-      return rewritten
-  except OSError:
-    discard
-
-  # No sandbox copy available — return original path.
-  # DYLD_INSERT_LIBRARIES will be stripped by SIP for this child.
-  return binaryPath
+proc rewriteExecPathForSip*(binaryPath: string): string =
+  ## Shared spawn-boundary resolver. The built fallback is used even when the
+  ## monitor's invocation sandbox could not populate a shell from PATH.
+  resolveSipReplacement(binaryPath)
 
 # ---------------------------------------------------------------------------
 # Per-library propagation registry

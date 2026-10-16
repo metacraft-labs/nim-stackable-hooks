@@ -2,6 +2,10 @@
   description = "Cross-platform stackable hooks framework for Nim";
 
   inputs = {
+    # Keep the shipped SIP replacements available when a child has an empty PATH.
+    stackable-hooks-macos-tools = {
+      url = "github:metacraft-labs/stackable-hooks-macos-tools/1ad378d58776ec9b6cc73e1c27b8e53c15676f03";
+    };
     nixos-modules.url = "github:metacraft-labs/devops-modules";
     nixpkgs.follows = "nixos-modules/nixpkgs-unstable";
     flake-parts.follows = "nixos-modules/flake-parts";
@@ -23,7 +27,12 @@
       ];
 
       perSystem =
-        { pkgs, config, ... }:
+        {
+          pkgs,
+          config,
+          system,
+          ...
+        }:
         let
           version = builtins.replaceStrings [ "\n" "\r" ] [ "" "" ] (builtins.readFile ./version.txt);
           # git-hooks.nix installs `.pre-commit-config.yaml` and git hooks into
@@ -104,6 +113,11 @@
             {
               # Not `inputsFrom = [ config.pre-commit.devShell ]`: that shell's
               # hook installs the git hooks without `ownRepoOnly`.
+              STACKABLE_HOOKS_BUILT_TOOLS_DIR =
+                if pkgs.stdenv.isDarwin then
+                  "${inputs.stackable-hooks-macos-tools.packages.${system}.default}"
+                else
+                  "";
               shellHook = ownRepoOnly config.pre-commit.installationScript;
               packages = config.pre-commit.settings.enabledPackages ++ [
                 config.pre-commit.settings.package

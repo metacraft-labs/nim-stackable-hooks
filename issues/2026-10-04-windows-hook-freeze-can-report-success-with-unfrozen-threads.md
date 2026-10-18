@@ -2,7 +2,7 @@
 
 |             |                                                                  |
 | ----------- | ---------------------------------------------------------------- |
-| Status      | open                                                             |
+| Status | in-progress (eli-pc:fix-windows-hook-freeze-can-report-success-wit) |
 | Recorded    | 2026-10-04                                                       |
 | Observed in | nim-stackable-hooks `fcac217396872eede718a57f49f91fecab41c4ac`   |
 | Area        | `inline_hook/windows/install_windows.c`, `suspend_other_threads` |

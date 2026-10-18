@@ -2,7 +2,7 @@
 
 |             |                                                  |
 | ----------- | ------------------------------------------------ |
-| Status | in-progress (eli-pc:fix-monitored-windows-injection-stress-exits) |
+| Status | open |
 | Recorded    | 2026-10-01                                       |
 | Observed in | nim-stackable-hooks `9fcaf89`                    |
 | Area        | Windows propagation stress under the io-mon shim |

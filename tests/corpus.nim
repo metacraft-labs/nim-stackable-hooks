@@ -169,6 +169,12 @@ const testCorpus*: seq[TestEntry] = @[
     why: "stackable_hooks/windows_env_block is deliberately NOT " &
          "`when defined(windows)`-gated -- the lpEnvironment encoding is " &
          "pure string/UTF-16 work -- so this runs for real on every host."),
+  TestEntry(stem: "test_windows_hook_freeze", targets: AllHostTargets,
+    why: "Real peer threads and executable pages on Windows x86: every " &
+         "default patching entry point refuses, unpatched and with peers " &
+         "resumed and handles closed, when a live thread cannot be frozen. " &
+         "Other hosts compile the platform guard; native Windows ARM64 " &
+         "inline hooks remain deferred."),
   TestEntry(stem: "test_windows_hook_page_preparation", targets: AllHostTargets,
     why: "Real executable pages, trampolines and peer threads on Windows x86. " &
          "Other hosts compile the platform guard; native Windows ARM64 " &

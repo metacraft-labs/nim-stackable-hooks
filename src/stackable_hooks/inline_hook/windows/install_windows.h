@@ -60,7 +60,13 @@ extern "C" {
  *   -2  length decoder rejected the target prologue (caller must fall
  *       back to int3 patching or a different mechanism)
  *   -3  rel32 fixup failed (out-of-range disp32 with no thunk room)
- *   -4  VirtualAlloc / VirtualProtect / thread suspend failed
+ *   -4  VirtualAlloc / VirtualProtect / thread suspend failed.  The
+ *       thread-suspend case covers every way of not stopping all other
+ *       threads of the process: the thread snapshot or its walk failed, a
+ *       live thread could not be opened or suspended, or there were more
+ *       live threads than the freeze can hold.  Threads confirmed to have
+ *       exited do not count.  In that case no patch byte is written, every
+ *       thread already suspended is resumed and every handle is closed.
  *   -5  target already hooked (use uninstall first, or layer manually
  *       through trampolines)
  */
@@ -170,7 +176,8 @@ int ct_inline_hook_install_noreturn_no_suspend(void *target,
 /* Uninstall the hook at `target`, restoring the original prologue
  * bytes.  Returns 0 on success, <0 on failure:
  *   -1  no hook registered at this target
- *   -4  VirtualProtect / thread suspend failed
+ *   -4  VirtualProtect / thread suspend failed (see ct_inline_hook_install
+ *       for what a failed suspend covers; the hook stays installed)
  */
 int ct_inline_hook_uninstall(void *target);
 
@@ -198,6 +205,8 @@ int ct_inline_hook_begin_transaction(void);
  * a single thread-suspend window. Before suspending peers, prepares each
  * distinct install page's protection transition once, without writing patch bytes;
  * returns -7 if that preparation fails, with no installs applied.
+ * Returns -4, with no queued operation applied, if the other threads
+ * cannot all be suspended (see ct_inline_hook_install).
  * Returns 0 on success, <0 if a queued
  * operation failed (the same error code that install/uninstall would
  * have returned outside a transaction).  On failure, the queue is

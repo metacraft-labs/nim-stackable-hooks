@@ -36,6 +36,19 @@ Consumers still own the exported wrapper symbols, target symbol set, hook-body d
 
 The default `inlineHookInstall`, `inlineHookInstallNoReturn`, and `inlineHookUninstall` entry points suspend other threads around patch writes.
 
+The freeze succeeds only when every other thread of the process in the thread
+snapshot is suspended or has confirmably exited: `OpenThread` reports that the
+TID no longer names a thread, or the opened thread has an exit code or belongs
+to another process. A thread that refuses suspension is re-checked for exit a
+bounded number of times. Every other outcome fails the freeze: the snapshot or
+its walk fails, a live thread cannot be opened or suspended, or there are more
+live threads than the freeze holds (4096). The entry point, or
+`inlineHookCommitTransaction`, then returns -4 before any patch byte changes,
+with the threads it had suspended resumed and every handle it acquired closed.
+`tests/test_windows_hook_freeze.nim` checks each case against real threads
+through `inlineHookInstall`, `inlineHookUninstall` and
+`inlineHookCommitTransaction`.
+
 Transactions prepare each distinct install page's writable-and-back transition
 once before suspending peers. Windows protection changes apply to whole pages,
 so hooks sharing a page reuse that preparation within the same transaction.

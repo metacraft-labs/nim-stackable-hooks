@@ -244,6 +244,10 @@ const testCorpus*: seq[TestEntry] = @[
     targets: WindowsOnlyTargets,
     why: "Exercises real Windows process/pipe inheritance through the " &
          "Windows-only injector, including a surviving descendant writer."),
+  TestEntry(stem: "test_windows_injector_job",
+    targets: WindowsOnlyTargets,
+    why: "Assigns real roots to real Job Objects through the Windows-only " &
+         "injector, and provokes a real nesting refusal."),
   TestEntry(stem: "test_windows_injector_fork_runtime",
     targets: WindowsOnlyTargets,
     why: "Unconditionally imports stackable_hooks/windows_injector, whose " &

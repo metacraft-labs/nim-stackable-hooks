@@ -200,6 +200,15 @@ proc GetExitCodeProcess(hProcess: HANDLE, lpExitCode: ptr DWORD): BOOL
   {.importc, stdcall, dynlib: "kernel32".}
 proc TerminateProcess(hProcess: HANDLE, uExitCode: DWORD): BOOL
   {.importc, stdcall, dynlib: "kernel32".}
+# Job Objects. Only the assignment and the membership probe live here: the
+# job itself belongs to the caller, who created it and owns its lifetime.
+# https://learn.microsoft.com/en-us/windows/win32/api/jobapi2/nf-jobapi2-assignprocesstojobobject
+# https://learn.microsoft.com/en-us/windows/win32/api/jobapi/nf-jobapi-isprocessinjob
+proc AssignProcessToJobObject(hJob: HANDLE, hProcess: HANDLE): BOOL
+  {.importc, stdcall, dynlib: "kernel32".}
+proc IsProcessInJob(ProcessHandle: HANDLE, JobHandle: HANDLE,
+                    Result: ptr BOOL): BOOL
+  {.importc, stdcall, dynlib: "kernel32".}
 
 proc GetStdHandle(nStdHandle: DWORD): HANDLE
   {.importc, stdcall, dynlib: "kernel32".}
@@ -238,6 +247,16 @@ const
   PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002'u32
 
 type
+  RootJobMembership* = enum
+    ## Whether the root already belonged to a job when it could not be
+    ## assigned to the caller's. Only consulted when the assignment FAILED:
+    ## it is what tells "the inherited job hierarchy refused nesting" apart
+    ## from every other refusal.
+    rjmNotChecked  ## no job was requested, or the assignment succeeded
+    rjmUnknown     ## `IsProcessInJob` itself failed
+    rjmNotInJob    ## the root was in no job
+    rjmInJob       ## the root had inherited a job from this process
+
   WindowsInjectionResult* = object
     exitCode*: int
     monitoringSkipped*: bool
@@ -248,6 +267,17 @@ type
       ## that emits nothing is indistinguishable from one that was never
       ## hooked, and the only party who knows which pid SHOULD have
       ## appeared is the launcher. 0 when no process was started.
+    jobAssigned*: bool
+      ## The caller passed a `job` and the root was assigned to it while it
+      ## was still suspended, before it had executed a single instruction.
+      ## `false` when no job was passed, and when the assignment failed.
+    jobAssignError*: uint32
+      ## `GetLastError()` of a FAILED `AssignProcessToJobObject`; 0 when the
+      ## assignment succeeded or was not requested. The spawn is NOT failed
+      ## over it: the root still runs, and the caller decides what an
+      ## unguarded tree means for its own guarantees.
+    jobAssignRootMembership*: RootJobMembership
+      ## For a failed assignment, whether the root was already in a job.
 
 # ---------------------------------------------------------------------------
 # WOW64 (32-bit child) support
@@ -588,7 +618,8 @@ proc wow64ExportRva*(probeExe, dllPath32, procName: string): uint32
 proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
     cwd = ""; captureStdio = false;
     captureStdioPath = ""; env: StringTableRef = nil;
-    parkTimeoutMs: DWORD = DefaultInjectDeadlineMs): WindowsInjectionResult =
+    parkTimeoutMs: DWORD = DefaultInjectDeadlineMs;
+    job: pointer = nil): WindowsInjectionResult =
   ## Windows: Spawn `argv` in a CREATE_SUSPENDED state, inject the monitor
   ## shim DLL via CreateRemoteThread+LoadLibraryW, optionally invoke the
   ## shim's `repro_runtime_init` entry point, then resume the main thread.
@@ -645,6 +676,24 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
   ## arm and observe the refusal -- the passing arm cannot then pass
   ## vacuously -- and is the same "0 means no park" encoding
   ## ``propagation_windows.injectShimIntoChild`` already uses.
+  ##
+  ## ``job``, when non-nil, is a Job Object handle (with
+  ## ``JOB_OBJECT_ASSIGN_PROCESS``) that the root is assigned to IMMEDIATELY
+  ## after ``CreateProcessW`` returns: before the entry-point park (which
+  ## resumes the main thread to run the loader), before any remote thread, and
+  ## before the final ``ResumeThread``. A process that has executed nothing has
+  ## created nothing, so every process the tree ever creates is created by a
+  ## member, and joins the job unless the job permits breakaway. That is what
+  ## lets a caller prove, by the job's active-process count, that the whole
+  ## tree has exited (io-mon's Windows tree-lifetime guard). The job stays the
+  ## caller's: this proc neither creates, configures nor closes it.
+  ##
+  ## A failed assignment does NOT fail the spawn. It is reported through
+  ## ``jobAssigned`` / ``jobAssignError`` / ``jobAssignRootMembership`` and the
+  ## root runs exactly as it would have with ``job = nil``; whether an
+  ## unguarded tree is acceptable is the caller's decision, not this proc's.
+  ## ``job = nil`` (the default) leaves this proc's behaviour byte-identical to
+  ## what it was before the parameter existed.
   ##
   ## WHAT IS **NOT** SILENTLY COMPLETE. ``monitoringSkipped`` is set only
   ## when the park did not happen AND the target carries a fork runtime; when
@@ -826,6 +875,32 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
     raise newException(OSError,
       "CreateProcessW failed (err=" & $GetLastError() & "): " & commandLine)
   result.rootPid = uint64(pi.dwProcessId)
+
+  # ASSIGN THE ROOT TO THE CALLER'S JOB WHILE IT HAS EXECUTED NOTHING.
+  #
+  # This has to come before EVERYTHING below that can run code in the child:
+  # the entry-point park resumes the main thread so the loader runs (and a
+  # loader-run TLS callback or DllMain may already create a process), and the
+  # remote-thread and borrowed-thread loads run the shim's initialisation. A
+  # child created by the root before it is a member is created OUTSIDE the
+  # job, and a job that misses one descendant proves nothing about the tree.
+  #
+  # Failure is reported, never raised: the spawn itself is sound, and turning
+  # "the tree cannot be guarded" into "the command cannot run" would make a
+  # host inside a job that refuses nesting unable to build at all. Nested
+  # jobs exist since Windows 8; see
+  # https://learn.microsoft.com/en-us/windows/win32/procthread/nested-jobs
+  if job != nil:
+    if AssignProcessToJobObject(cast[HANDLE](job), pi.hProcess) != 0:
+      result.jobAssigned = true
+    else:
+      # Read the error before any other call can replace it.
+      result.jobAssignError = GetLastError()
+      var inJob: BOOL = 0
+      result.jobAssignRootMembership =
+        if IsProcessInJob(pi.hProcess, nil, addr inJob) == 0: rjmUnknown
+        elif inJob != 0: rjmInJob
+        else: rjmNotInJob
 
   template safeClose(h: HANDLE) =
     if h != nil:

@@ -676,10 +676,12 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
   ## 2026-10-13 "building blocks; tool decides"). ``btpTerminate`` (the
   ## API-compatibility default, which every io-mon call site names explicitly)
   ## terminates the child and this proc RAISES, exactly as before.
-  ## ``btpDetach`` lets the borrowed call finish on its own so the child runs
-  ## its real entry point UNINSTRUMENTED, and the loss is reported through
+  ## ``btpDetach`` lets the borrowed call finish on its own and the child run
+  ## its real entry point with its monitoring UNKNOWN (a detached load leaves
+  ## the shim mapped but never initialised; a detached init may install all,
+  ## some or none of its hooks). That is reported through
   ## ``monitoringSkipped`` / ``skipReason`` (never swallowed) rather than
-  ## raising.
+  ## raised. A detach that cannot be carried out terminates and raises.
   ##
   ## ``parkTimeoutMs = 0`` DISABLES the park and restores the pre-park
   ## behaviour verbatim: a child carrying an MSYS2/Cygwin fork runtime is then
@@ -1069,23 +1071,24 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
           # the CALLER's policy. Either way `remoteBuf` is NOT freed here: a
           # mid-flight LoadLibraryW (detached) or a still-exiting child
           # (terminated) may read it, and it is reclaimed when the child exits.
-          case onBorrowTimeout
-          of btpTerminate:
-            terminateBorrowedChild(borrowed.timedOut)
+          case applyBorrowTimeoutPolicy(borrowed.timedOut, onBorrowTimeout)
+          of atpTerminated:
             raise newException(OSError,
               "the child's main thread did not return from loading the " &
               "shim within " & $parkTimeoutMs & " ms; it was mid-call, so " &
-              "it was terminated per onBorrowTimeout=btpTerminate. shim=" &
+              "it was terminated (onBorrowTimeout=" & $onBorrowTimeout &
+              "; a detach that cannot be carried out terminates). shim=" &
               effectiveDllPath)
-          of btpDetach:
-            # The child runs its real entry point with no injector and the
-            # shim never mapped. Report the loss; skip init; resume+wait below.
-            discard detachBorrowedChild(borrowed.timedOut)
+          of atpDetached, atpChildExited:
+            # The child runs its real entry point with no injector. The load
+            # finishes on its own, so the shim ends up mapped but never
+            # initialised. Report the loss; skip init; resume+wait below.
             result.monitoringSkipped = true
             result.skipReason =
-              "shim load abandoned after " & $parkTimeoutMs &
-              " ms; child detached and runs UNMONITORED " &
-              "(onBorrowTimeout=btpDetach). shim=" & effectiveDllPath
+              "shim load did not return within " & $parkTimeoutMs &
+              " ms; child detached (onBorrowTimeout=btpDetach) and runs " &
+              "UNMONITORED: the shim may finish loading but is never " &
+              "initialised. shim=" & effectiveDllPath
             rootDetached = true
         elif borrowed.status != bcsReturned:
           discard VirtualFreeEx(pi.hProcess, remoteBuf, 0, MEM_RELEASE)
@@ -1221,23 +1224,27 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
           of bcsReturned:
             discard
           of bcsTimedOut:
-            case onBorrowTimeout
-            of btpTerminate:
-              terminateBorrowedChild(init.timedOut)
+            case applyBorrowTimeoutPolicy(init.timedOut, onBorrowTimeout)
+            of atpTerminated:
               raise newException(OSError,
                 "repro_runtime_init did not return on the child's main " &
                 "thread within " & $parkTimeoutMs & " ms; it was mid-call, " &
-                "so the child was terminated per onBorrowTimeout=btpTerminate " &
-                "rather than resumed with its hooks half-installed")
-            of btpDetach:
-              # The child reaches its real entry point with the shim mapped but
-              # hooks NOT installed: it runs uninstrumented. Report the loss.
-              discard detachBorrowedChild(init.timedOut)
+                "so the child was terminated (onBorrowTimeout=" &
+                $onBorrowTimeout & "; a detach that cannot be carried out " &
+                "terminates) rather than resumed with its hooks " &
+                "half-installed")
+            of atpDetached, atpChildExited:
+              # The child reaches its real entry point with no injector, and
+              # init runs on to completion by itself: it may install all,
+              # some or none of its hooks. The monitoring is UNKNOWN, which
+              # for the consumer is the same as lost. Report it.
               result.monitoringSkipped = true
               result.skipReason =
-                "repro_runtime_init abandoned after " & $parkTimeoutMs &
-                " ms; child detached and runs UNMONITORED with hooks not " &
-                "installed (onBorrowTimeout=btpDetach)"
+                "repro_runtime_init did not return within " &
+                $parkTimeoutMs & " ms; child detached " &
+                "(onBorrowTimeout=btpDetach) and runs with its monitoring " &
+                "UNKNOWN: init continues without the injector and may " &
+                "install all, some or none of its hooks"
           of bcsNotRun, bcsNoResult, bcsChildExited:
             raise newException(OSError,
               "the shim loaded into the child but repro_runtime_init could " &

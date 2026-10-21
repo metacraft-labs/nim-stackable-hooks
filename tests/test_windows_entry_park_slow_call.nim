@@ -38,7 +38,12 @@
 ## * THE HARD RULE. With no building block applied, the reflexive
 ##   ``releaseEntryPark`` + ``ResumeThread`` leaves the lent-out child FROZEN
 ##   (never its own exit code), because of the extra suspend and the neutered
-##   release.
+##   release -- observed with a borrowed call short enough that a released
+##   thread would have finished it.
+## * DETACH. A detach that cannot be carried out leaves the borrow
+##   terminable; a detached call is not cancelled but runs to completion
+##   with no injector watching, which is why a detached child's monitoring
+##   is reported as unknown.
 ## * THE INJECT LAYER. ``injectShimIntoChild`` waits for a slow shim load
 ##   (``ioInjected``) and, with the default terminate policy, kills a wedged
 ##   one (``ioChildTerminated``). ``autoPropagateCreateProcessW`` turns that
@@ -114,6 +119,16 @@ when defined(windows) and defined(amd64):
     # way out of the borrowed call is the deadline.
     WedgedMs = 120_000'u32
     ShortHardDeadlineMs = 1_500'u32
+    # A borrowed call that outlives `ShortDeadlineMs` but would finish soon
+    # after, so a thread wrongly released finishes it inside the window a
+    # case observes.
+    ShortSleepMs = 1_500'u32
+    ShortDeadlineMs = 400'u32
+    SlowInitEnvVar = "STACKABLE_HOOKS_SLOW_INIT_MS"
+    InitMarkerEnvVar = "STACKABLE_HOOKS_INIT_MARKER"
+    MEM_COMMIT = 0x1000'u32
+    MEM_RESERVE = 0x2000'u32
+    PAGE_READWRITE = 0x04'u32
     ChildRunBudgetMs = 60_000'u32
 
   if paramCount() == 1 and paramStr(1) == "--slow-call-child":
@@ -134,6 +149,19 @@ when defined(windows) and defined(amd64):
   proc GetProcAddress(m: HANDLE, name: cstring): pointer
     {.importc, stdcall, dynlib: "kernel32".}
   proc ResumeThread(hThread: HANDLE): DWORD
+    {.importc, stdcall, dynlib: "kernel32".}
+  proc SuspendThread(hThread: HANDLE): DWORD
+    {.importc, stdcall, dynlib: "kernel32".}
+  proc ReadProcessMemory(hProcess: HANDLE; base: pointer; buf: pointer;
+                         size: uint; got: ptr uint): BOOL
+    {.importc, stdcall, dynlib: "kernel32".}
+  proc WriteProcessMemory(hProcess: HANDLE; base: pointer; buf: pointer;
+                          size: uint; written: ptr uint): BOOL
+    {.importc, stdcall, dynlib: "kernel32".}
+  proc VirtualAllocEx(hProcess: HANDLE; address: pointer; size: uint;
+                      allocType, protect: DWORD): pointer
+    {.importc, stdcall, dynlib: "kernel32".}
+  proc LoadLibraryW(name: LPCWSTR): HANDLE
     {.importc, stdcall, dynlib: "kernel32".}
   proc WaitForSingleObject(hHandle: HANDLE, ms: DWORD): DWORD
     {.importc, stdcall, dynlib: "kernel32".}
@@ -164,6 +192,19 @@ when defined(windows) and defined(amd64):
         addr result) == 0:
       raise newException(OSError,
         "CreateProcessW failed (err=" & $GetLastError() & ")")
+
+  proc GetThreadContext(hThread: HANDLE; ctx: pointer): BOOL
+    {.importc, stdcall, dynlib: "kernel32".}
+
+  proc integerRegisters(hThread: HANDLE): array[17, uint64] =
+    ## `RAX` .. `R15` and `RIP` of a SUSPENDED thread, from an x64 `CONTEXT`
+    ## (`CONTEXT_CONTROL | CONTEXT_INTEGER`; `Rax` at 0x78, `Rip` at 0xF8).
+    var raw: array[1232 + 16, byte]
+    let ctx = cast[pointer]((cast[uint](addr raw[0]) + 15) and not 15'u)
+    cast[ptr uint32](cast[uint](ctx) + 0x30)[] = 0x0010_0003'u32
+    doAssert GetThreadContext(hThread, ctx) != 0
+    for i in 0 ..< 17:
+      result[i] = cast[ptr uint64](cast[uint](ctx) + 0x78 + uint(i) * 8)[]
 
   proc kernel32Proc(name: cstring): pointer =
     var k32 = toWide("kernel32.dll")
@@ -311,22 +352,26 @@ when defined(windows) and defined(amd64):
     test "keep waiting: a slow call given more time completes and runs main":
       ## Obligation 3. A `Sleep` that outlives a short deadline but is given
       ## more time via `keepWaitingForBorrow` returns, and the child then runs
-      ## its own `main` to 42 on the loader's stack. FALSIFYING MUTATION: make
-      ## `keepWaitingForBorrow` skip `resumeFully` -- the call never progresses
-      ## and it times out again, so `bcsReturned` never arrives; or make it
-      ## skip the `SetThreadContext(saved)` restore -- the child returns on a
-      ## clobbered context and does not reach exit 42.
+      ## its own `main` to 42 on the loader's stack, with every integer register,
+      ## `RSP` and `RIP` exactly as the park left them. FALSIFYING MUTATIONS:
+      ## make `keepWaitingForBorrow` skip `resumeFully` -- the call never
+      ## progresses and it times out again, so `bcsReturned` never arrives; or
+      ## make it skip the `SetThreadContext(saved)` restore -- the stub's tail
+      ## puts `RSP`/`RCX` back by itself, so the child would still reach 42,
+      ## but `RAX`, `R11` and the other volatiles differ from the parked ones.
       putEnv(SlowLoadEnvVar, "0")
       var pi = spawnSuspended()
       defer: reap(pi)
       var park = parkChildAtEntryPoint(pi.hProcess, pi.hThread, false,
         DefaultInjectDeadlineMs)
       require park.status == epsParked
+      let parked = integerRegisters(pi.hThread)
       var call = borrowParkedThread(park, pi.hThread, false, sleepFn,
         cast[pointer](uint(SlowButAliveMs)), ShortHardDeadlineMs)
       require call.status == bcsTimedOut
       check park.status == epsLentOut
       let resumed = keepWaitingForBorrow(call.timedOut, ChildRunBudgetMs)
+      check integerRegisters(pi.hThread) == parked
       checkpoint("resumed status=" & $resumed.status &
         " elapsedMs=" & $resumed.elapsedMs)
       check resumed.status == bcsReturned
@@ -341,9 +386,16 @@ when defined(windows) and defined(amd64):
       ## reflexive caller sequence -- `releaseEntryPark` then `ResumeThread` --
       ## must leave the lent-out child FROZEN, never running its own code. The
       ## extra suspend and the neutered release are what make this structural.
-      ## FALSIFYING MUTATION: drop the extra `SuspendThread` in
-      ## `windows_entry_park.lendOut`, or let `releaseEntryPark` strip the
-      ## bytes on `epsLentOut` -- the child then resumes and runs to 42.
+      ##
+      ## The borrowed `Sleep` is SHORT (1.5 s against a 0.4 s deadline), so a
+      ## thread that the reflexive sequence did release would finish it well
+      ## inside the observation window; with a long sleep this case could not
+      ## tell a frozen thread from a sleeping one. Each mechanism is also
+      ## checked directly. FALSIFYING MUTATIONS: drop the extra `SuspendThread`
+      ## in `windows_entry_park.lendOut` -- the suspend-count probe sees 0; let
+      ## `releaseEntryPark` strip the bytes on `epsLentOut` -- the park is no
+      ## longer `epsLentOut` and the entry no longer holds `EB FE`; both
+      ## together -- the child also runs to 42.
       putEnv(SlowLoadEnvVar, "0")
       var pi = spawnSuspended()
       defer: reap(pi)
@@ -351,18 +403,129 @@ when defined(windows) and defined(amd64):
         DefaultInjectDeadlineMs)
       require park.status == epsParked
       var call = borrowParkedThread(park, pi.hThread, false, sleepFn,
-        cast[pointer](uint(WedgedMs)), ShortHardDeadlineMs)
+        cast[pointer](uint(ShortSleepMs)), ShortDeadlineMs)
       require call.status == bcsTimedOut
       # The reflexive sequence, applied with no policy chosen.
       releaseEntryPark(park)
       discard ResumeThread(pi.hThread)
-      # Still frozen: its own exit code is never observed within a budget far
-      # longer than a healthy child needs to reach `main`.
-      check waitExitCode(pi.hProcess, 3_000'u32) == StillActive
+      # The release did nothing: the park is still lent out and the entry
+      # still holds the self-jump.
+      check park.status == epsLentOut
+      var entryBytes: array[2, byte]
+      var got: uint = 0
+      check ReadProcessMemory(pi.hProcess, park.entry, addr entryBytes[0], 2,
+        addr got) != 0
+      check entryBytes == [0xEB'u8, 0xFE'u8]
+      # The resume did not run it: it is still suspended.
+      let before = SuspendThread(pi.hThread)
+      discard ResumeThread(pi.hThread)
+      checkpoint("suspend count after the reflexive resume: " & $before)
+      check before != high(uint32) and before >= 1'u32
+      # And it never reaches its own exit code, although the borrowed call
+      # would have finished long before this wait ends.
+      check waitExitCode(pi.hProcess, 5_000'u32) == StillActive
       # Only a building block can end it.
       terminateBorrowedChild(call.timedOut)
       check waitExitCode(pi.hProcess, ChildRunBudgetMs) ==
         InjectionAbandonedExitCode
+
+    test "a detach that cannot be carried out leaves the borrow terminable":
+      ## Obligation 9. White-box: `fieldPairs` swaps the park's process handle
+      ## for one that may terminate, wait and query but not write memory, so
+      ## `detachBorrowedChild` cannot write the entry bytes back. It must answer `doFailed`, leave the child frozen and the
+      ## park lent out, and leave the handle LIVE, so that
+      ## `terminateBorrowedChild` still ends the child -- the only other safe
+      ## exit -- and `applyBorrowTimeoutPolicy(btpDetach)` reports a
+      ## termination. FALSIFYING MUTATION: mark the handle consumed before the
+      ## entry-byte restore in `detachBorrowedChild` (as it once was) -- the
+      ## terminate is then a no-op and the child stays alive, frozen forever.
+      putEnv(SlowLoadEnvVar, "0")
+      var pi = spawnSuspended()
+      defer: reap(pi)
+      var park = parkChildAtEntryPoint(pi.hProcess, pi.hThread, false,
+        DefaultInjectDeadlineMs)
+      require park.status == epsParked
+      var call = borrowParkedThread(park, pi.hThread, false, sleepFn,
+        cast[pointer](uint(ShortSleepMs)), ShortDeadlineMs)
+      require call.status == bcsTimedOut
+      const PROCESS_TERMINATE = 0x0001'u32
+      const SYNCHRONIZE = 0x00100000'u32
+      const PROCESS_QUERY_LIMITED_INFORMATION = 0x1000'u32
+      let noWrite = OpenProcess(PROCESS_TERMINATE or SYNCHRONIZE or
+        PROCESS_QUERY_LIMITED_INFORMATION, BOOL(0), pi.dwProcessId)
+      require noWrite != nil
+      defer: discard CloseHandle(noWrite)
+      var fullAccess: pointer = nil
+      for name, field in fieldPairs(park):
+        when name == "hProcess":
+          fullAccess = field
+          field = noWrite
+      require fullAccess == pi.hProcess
+      check detachBorrowedChild(call.timedOut) == doFailed
+      check park.status == epsLentOut
+      check waitExitCode(pi.hProcess, 3_000'u32) == StillActive
+      # The policy dispatcher meets the same impossible detach, and falls
+      # back to the only other safe exit.
+      check applyBorrowTimeoutPolicy(call.timedOut, btpDetach) ==
+        atpTerminated
+      for name, field in fieldPairs(park):
+        when name == "hProcess":
+          field = fullAccess
+      check park.status == epsAbandoned
+      check waitExitCode(pi.hProcess, ChildRunBudgetMs) ==
+        InjectionAbandonedExitCode
+
+    test "detach does not cancel the call: a detached init still completes":
+      ## Why a detached child's monitoring is UNKNOWN rather than absent. The
+      ## fixture's `slow_load_lib_init` sleeps past the deadline and then
+      ## writes a marker file, standing in for a shim init that goes on to
+      ## install its hooks. After the caller detaches, the init runs to
+      ## completion with no injector watching -- the marker appears -- and the
+      ## child still runs its own `main` to 42. FALSIFYING MUTATION: make
+      ## `detachBorrowedChild` terminate instead of resume -- no marker, no 42.
+      putEnv(SlowLoadEnvVar, "0")
+      let marker = workDir / "detached-init.marker"
+      removeFile(marker)
+      putEnv(SlowInitEnvVar, $ShortSleepMs)
+      putEnv(InitMarkerEnvVar, marker)
+      defer:
+        putEnv(SlowInitEnvVar, "0")
+        putEnv(InitMarkerEnvVar, "")
+      var pi = spawnSuspended()
+      defer: reap(pi)
+      var park = parkChildAtEntryPoint(pi.hProcess, pi.hThread, false,
+        DefaultInjectDeadlineMs)
+      require park.status == epsParked
+      # Map the fixture on the child's own thread, as injection does.
+      var pathW = toWide(slowDll)
+      let pathBytes = uint(pathW.len * sizeof(uint16))
+      let remote = VirtualAllocEx(pi.hProcess, nil, pathBytes,
+        MEM_COMMIT or MEM_RESERVE, PAGE_READWRITE)
+      require remote != nil
+      var written: uint = 0
+      require WriteProcessMemory(pi.hProcess, remote, addr pathW[0],
+        pathBytes, addr written) != 0
+      let load = borrowParkedThread(park, pi.hThread, false,
+        kernel32Proc("LoadLibraryW"), remote, DefaultInjectDeadlineMs)
+      require load.status == bcsReturned and load.ret != 0
+      # The init export's RVA, from this process's own mapping of the image.
+      let local = LoadLibraryW(cast[LPCWSTR](addr pathW[0]))
+      require local != nil
+      let rva = cast[uint](GetProcAddress(local, "slow_load_lib_init")) -
+        cast[uint](local)
+      require rva != 0
+      let childInit = cast[pointer](uint(load.ret) + rva)
+      var init = borrowParkedThread(park, pi.hThread, false, childInit, nil,
+        ShortDeadlineMs)
+      require init.status == bcsTimedOut
+      check not fileExists(marker)
+      check detachBorrowedChild(init.timedOut) == doDetached
+      check park.status == epsDetached
+      # The caller's reflexive sequence is now a no-op.
+      releaseEntryPark(park)
+      discard ResumeThread(pi.hThread)
+      check waitExitCode(pi.hProcess, ChildRunBudgetMs) == ChildExitCode
+      check fileExists(marker)
 
     test "injectShimIntoChild: a slow shim load is waited for":
       putEnv(SlowLoadEnvVar, $SlowButAliveMs)
@@ -519,6 +682,9 @@ when defined(windows) and defined(amd64):
       ctx.args[9] = cast[uint64](addr pi)
       gLastChildPid = 0
       reg.dispatch("CreateProcessW", ctx)
+      # Never leave the child behind: a regression here can leave it spinning
+      # on the self-jump, holding this test binary open.
+      defer: reap(pi)
       checkpoint("result=" & $ctx.result & " childPid=" & $gLastChildPid)
       require gLastChildPid != 0
       # The spawn SUCCEEDED and the caller's handles are intact.

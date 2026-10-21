@@ -431,14 +431,16 @@ when defined(windows) and defined(amd64):
         ## A caller cannot forge one (its fields are private) and there is no
         ## `resume`-style proc that acts on a lent-out park. A default
         ## (stub-less) handle reports `usesStub == false`, and detaching it is
-        ## refused rather than resumed. FALSIFYING MUTATION: add a public
+        ## refused rather than resumed. FALSIFYING MUTATIONS: add a public
         ## `resumeLentOut(park)` proc, or make `TimedOutBorrow`'s fields
-        ## public -- the `not compiles` assertions below then fail.
+        ## public -- the `not compiles` assertions below then fail; drop the
+        ## stub check from `detachBorrowedChild` -- it answers `doFailed`.
         var zero: TimedOutBorrow
         check zero.usesStub == false
         # Detach refuses a handle with no stub rather than resuming it.
-        check detachBorrowedChild(zero) == doFailed or
-              detachBorrowedChild(zero) == doRefusedNoStub
+        check detachBorrowedChild(zero) == doRefusedNoStub
+        # `usesStub` is a getter, so a caller cannot flip it.
+        check not compiles(zero.usesStub = true)
         # There is no public field to read the thread handle out of the handle,
         # and no resume entry point on a lent-out park.
         check not compiles(zero.hThread)

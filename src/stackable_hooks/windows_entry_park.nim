@@ -167,10 +167,12 @@ type
     ## frame, the stub executing ``fn``), plus one extra suspend so a reflexive
     ## ``ResumeThread`` from the caller leaves it frozen. The ONLY operations
     ## are ``keepWaitingForBorrow``, ``terminateBorrowedChild`` and
-    ## ``detachBorrowedChild``; the fields are private so a caller can neither
-    ## forge one nor read the thread handle out of it, and there is no resume
-    ## entry point. This is how "never resume a lent-out context without the
-    ## stub" is made structural, not merely documented.
+    ## ``detachBorrowedChild``; the fields are not exported, so ordinary code
+    ## cannot build or edit one, and there is no resume entry point. (Like any
+    ## Nim object, ``fieldPairs`` or a ``cast`` can still reach the fields;
+    ## that is deliberate abuse, not an API path.) This is how "never resume
+    ## a lent-out context without the stub" is made structural, not merely
+    ## documented. Copies of a handle are not tracked: act on ONE copy.
     hThread: pointer
     childIsWow64: bool
     park: ptr EntryPark
@@ -193,11 +195,14 @@ type
       ## ``true`` until a building block consumes the handle, so a second
       ## building block on the same handle is a no-op rather than a
       ## double-free or double-terminate.
-    usesStub*: bool
-      ## Public, read-only: whether this handle is backed by the CET stub.
-      ## Always ``true`` for a handle a real borrow produced.
-    elapsedMs*: uint64
-      ## How long the call had run when the deadline passed.
+    entryRestored: bool
+      ## A ``detachBorrowedChild`` restored the entry bytes but could not
+      ## release the thread. ``keepWaitingForBorrow`` then refuses: with the
+      ## self-jump gone the call would run on into the child's program.
+    stubBacked: bool
+      ## Read through ``usesStub``.
+    lentMs: uint64
+      ## Read through ``elapsedMs``.
 
   DetachOutcome* = enum
     ## Result of ``detachBorrowedChild``.
@@ -229,9 +234,37 @@ type
       ## (fail the spawn, raise, or record it).
     btpDetach
       ## Apply ``detachBorrowedChild``: the child reaches its real entry point
-      ## with no injector present and runs UNINSTRUMENTED. The loss MUST be
-      ## reported through the entry point's own channel (an outcome, a
-      ## ``skipReason``), never swallowed.
+      ## with no injector present. Its monitoring is then UNKNOWN, not merely
+      ## absent: the borrowed call runs to completion on its own, so a
+      ## detached shim load leaves the shim mapped but never initialised,
+      ## while a detached init goes on to install all, some or none of its
+      ## hooks. The loss MUST be reported through the entry point's own
+      ## channel (an outcome, a ``skipReason``), never swallowed.
+      ##
+      ## If detach cannot be carried out (``doFailed``, ``doRefusedNoStub``)
+      ## the thread is still frozen and lent out, and its only other safe exit
+      ## is termination; ``applyBorrowTimeoutPolicy`` then terminates and says
+      ## so (``atpTerminated``) rather than leave a child frozen forever.
+
+  AppliedTimeoutPolicy* = enum
+    ## What ``applyBorrowTimeoutPolicy`` actually did to the child.
+    atpTerminated
+      ## Terminated with ``InjectionAbandonedExitCode``: the policy was
+      ## ``btpTerminate``, or it was ``btpDetach`` and detach was impossible.
+    atpDetached
+      ## Released into its own program (``doDetached``).
+    atpChildExited
+      ## The child had already died; nothing was done to it.
+
+func usesStub*(b: TimedOutBorrow): bool {.inline.} =
+  ## Whether this handle is backed by the CET call stub. Always ``true`` for
+  ## a handle a real borrow produced. A getter, not a field, so a caller
+  ## cannot flip it.
+  b.stubBacked
+
+func elapsedMs*(b: TimedOutBorrow): uint64 {.inline.} =
+  ## How long the call had run when the deadline passed.
+  b.lentMs
 
 const
   InfiniteDeadline* = 0xFFFF_FFFF'u32
@@ -625,18 +658,24 @@ when defined(i386) or defined(amd64):
     park.status = epsLentOut
     result = TimedOutBorrow(hThread: hThread, childIsWow64: childIsWow64,
       park: addr park, stub: stub, stubLen: stubLen, live: true,
-      usesStub: stub != nil, elapsedMs: elapsedMs)
+      stubBacked: stub != nil, lentMs: elapsedMs)
     copyMem(savedCtxPtr(result), saved, ContextAmd64Size)
 
-  proc resumeFully(hThread: pointer) =
+  proc resumeFully(hThread: pointer): bool {.discardable.} =
     ## Drive the suspend count to zero so the thread actually runs. A lent-out
     ## thread carries the deadline suspend plus the extra ``lendOut`` suspend;
     ## ``ResumeThread`` returns the PREVIOUS count, and zero/``high`` means it
     ## is already running or the call failed, so the loop is bounded and safe.
+    ## ``true`` only when the count was seen to reach zero: a failed
+    ## ``ResumeThread`` leaves the thread frozen, and ``detachBorrowedChild``
+    ## must not report a frozen thread as released.
     for _ in 0 ..< 8:
       let prev = ResumeThread(hThread)
-      if prev == 0'u32 or prev == high(uint32):
-        break
+      if prev == high(uint32):
+        return false
+      if prev <= 1'u32:
+        return true
+    false
 
   proc keepWaitingForBorrow*(b: var TimedOutBorrow;
                              additionalMs: uint32): BorrowedCall =
@@ -651,13 +690,13 @@ when defined(i386) or defined(amd64):
     ## A fresh ``bcsTimedOut`` carries a new handle; ``bcsChildExited`` means
     ## the child died while waiting.
     result = BorrowedCall(status: bcsNotRun)
-    if not b.live or b.park == nil:
+    if not b.live or b.park == nil or b.entryRestored:
       return
     let started = GetTickCount64()
     resumeFully(b.hThread)
     let waited = waitForParkedIp(b.park[], b.hThread, b.childIsWow64,
       additionalMs)
-    result.elapsedMs = b.elapsedMs + (GetTickCount64() - started)
+    result.elapsedMs = b.lentMs + (GetTickCount64() - started)
     case waited
     of pwExited:
       b.live = false
@@ -690,6 +729,9 @@ when defined(i386) or defined(amd64):
         savedCtxPtr(b), b.stub, b.stubLen, result.elapsedMs)
       return
     b.park[].status = epsParked
+    # Back on the self-jump: nothing executes the stub any more, so its page
+    # is freed exactly as a prompt return frees it.
+    discard VirtualFreeEx(b.park[].hProcess, b.stub, 0'u, MemRelease)
     if haveResult:
       result.ret = cast[ptr uint64](cast[uint](done) + ContextAmd64RaxOffset)[]
       result.status = bcsReturned
@@ -725,26 +767,64 @@ when defined(i386) or defined(amd64):
     ##  3. leak the stub page (a live thread may still be in it) and discard
     ##     the saved parked context (there is no parked thread to hand back).
     ##
+    ## ``fn`` is NOT abandoned: it runs to completion in the child, with no
+    ## injector watching. A detached shim LOAD therefore leaves the shim
+    ## mapped but never initialised; a detached INIT goes on to install
+    ## whatever hooks it installs. What the child is monitored by afterwards
+    ## is the callee's business, and a caller must report it as unknown.
+    ##
+    ## ``doFailed`` and ``doRefusedNoStub`` leave the handle LIVE and the
+    ## thread frozen, so the caller can still ``terminateBorrowedChild`` --
+    ## the only other safe exit for a lent-out thread.
+    ##
     ## See ``docs/windows-borrowed-call-deadline.md`` for why this is the one
     ## recovery that cannot strand the child on the self-jump.
+    if not b.stubBacked or b.stub == nil:
+      return doRefusedNoStub
     if not b.live or b.park == nil:
       return doFailed
-    if not b.usesStub or b.stub == nil:
-      return doRefusedNoStub
     if not childAlive(b.park[].hProcess):
       b.live = false
       b.park[].status = epsAbandoned
       return doChildExited
-    b.live = false
     if not restoreEntryBytes(b.park[]):
-      # The self-jump is still in place; resuming now would spin the child on
-      # it forever. Refuse to resume; leave the thread frozen for the caller
-      # to terminate.
+      # The self-jump may still be in place; resuming now could spin the
+      # child on it forever. Do not resume; the handle stays live and the
+      # thread frozen for the caller to terminate.
       b.park[].status = epsLentOut
       return doFailed
-    resumeFully(b.hThread)
+    if not resumeFully(b.hThread):
+      # Still suspended. The entry bytes are already the real ones, so the
+      # handle stays live for the caller to terminate.
+      b.entryRestored = true
+      b.park[].status = epsLentOut
+      return doFailed
+    b.live = false
     b.park[].status = epsDetached
     doDetached
+
+  proc applyBorrowTimeoutPolicy*(b: var TimedOutBorrow;
+                                 policy: BorrowTimeoutPolicy):
+      AppliedTimeoutPolicy =
+    ## Apply the CALLER's ``policy`` to a timed-out borrow and say what
+    ## happened. This is the one dispatcher the borrowing entry points use, so
+    ## ``btpDetach`` means the same thing everywhere: detach, and if detach
+    ## cannot be carried out (the thread is still frozen and lent out),
+    ## terminate -- the only other safe exit -- rather than leave a child that
+    ## never runs again and never dies.
+    case policy
+    of btpTerminate:
+      terminateBorrowedChild(b)
+      atpTerminated
+    of btpDetach:
+      case detachBorrowedChild(b)
+      of doDetached:
+        atpDetached
+      of doChildExited:
+        atpChildExited
+      of doRefusedNoStub, doFailed:
+        terminateBorrowedChild(b)
+        atpTerminated
 
   proc borrowParkedThread*(park: var EntryPark; hThread: pointer;
                            childIsWow64: bool; fn: pointer; arg: pointer;
@@ -893,12 +973,12 @@ when defined(i386) or defined(amd64):
       # `RAX` -- the callee's result -- is left alone for the caller to read.
       # `RCX` is put back because it is the entry point's one argument (the
       # PEB, from `BaseThreadInitThunk`) and the callee is free to clobber
-      # it. On every path that reaches the wait the saved context restores
-      # it anyway, and a call that outlives the hard deadline poisons the
-      # child rather than resuming it (R2 in
-      # docs/windows-borrowed-call-deadline.md), so the thread never
-      # enters the program from here. The restore is kept so the tail
-      # hands back exactly the parked state.
+      # it. When the call comes back to the self-jump the saved context
+      # restores it anyway. When the caller DETACHES a timed-out borrow
+      # (``detachBorrowedChild``), the entry bytes are restored first and
+      # this tail is what carries the thread into the program: on the
+      # parked RSP, with the entry point's RCX, by a `jmp` that leaves the
+      # CET shadow stack exactly as the park found it.
       var stubCode: array[49, byte] = [
         0x48'u8, 0x83, 0xEC, 0x20,
         0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -1028,15 +1108,15 @@ when defined(i386) or defined(amd64):
     ## is the point -- this convenience never decides for the caller. On
     ## ``bcsTimedOut`` it applies that building block (``btpTerminate`` leaves
     ## the park ``epsAbandoned`` and the child dead; ``btpDetach`` leaves it
-    ## ``epsDetached`` and the child running UNINSTRUMENTED) and returns
+    ## ``epsDetached`` and the child running with its monitoring unknown, or
+    ## terminated if detach was impossible -- see ``applyBorrowTimeoutPolicy``)
+    ## and returns
     ## ``false``. A caller that wants to keep waiting, or to inspect the
     ## ``TimedOutBorrow`` itself, must use ``borrowParkedThread``.
     var r = borrowParkedThread(park, hThread, childIsWow64, fn, arg,
       timeoutMs)
     if r.status == bcsTimedOut:
-      case onTimeout
-      of btpTerminate: terminateBorrowedChild(r.timedOut)
-      of btpDetach: discard detachBorrowedChild(r.timedOut)
+      discard applyBorrowTimeoutPolicy(r.timedOut, onTimeout)
     ret = r.ret
     r.status == bcsReturned
 
@@ -1078,5 +1158,24 @@ else:
                            ret: var uint64): bool =
     ret = 0
     false
+
+  # The building blocks exist on every architecture so callers compile
+  # unchanged, but no ``TimedOutBorrow`` can be live here: nothing is ever
+  # lent out.
+  proc keepWaitingForBorrow*(b: var TimedOutBorrow;
+                             additionalMs: uint32): BorrowedCall =
+    BorrowedCall(status: bcsNotRun)
+
+  proc terminateBorrowedChild*(b: var TimedOutBorrow;
+      exitCode: uint32 = InjectionAbandonedExitCode) =
+    discard
+
+  proc detachBorrowedChild*(b: var TimedOutBorrow): DetachOutcome =
+    doRefusedNoStub
+
+  proc applyBorrowTimeoutPolicy*(b: var TimedOutBorrow;
+                                 policy: BorrowTimeoutPolicy):
+      AppliedTimeoutPolicy =
+    atpTerminated
 
 {.pop.}

@@ -130,10 +130,17 @@ lent-out context **without the stub**. This is structural, not documentary:
   restores `RSP`/`RCX` by itself. `keepWaitingForBorrow` resumes the thread
   only to run the rest of the borrowed call back to the controlled self-jump,
   never into the child's program.
-- `TimedOutBorrow`'s fields are module-private, so a caller can neither forge
-  one nor read the thread handle out of it; there is no `resume` entry point.
+- `TimedOutBorrow`'s fields are not exported, so ordinary code can neither
+  build nor edit one (`usesStub` and `elapsedMs` are getters); there is no
+  `resume` entry point. Nim's `fieldPairs` or a `cast` can still reach the
+  fields, as for any object; that is deliberate abuse, not an API path.
   `detachBorrowedChild` additionally refuses (returns `doRefusedNoStub`) if its
   handle carries no stub pointer.
+- Even so, the rule does not rest on secrecy alone. While a borrow is lent
+  out the thread is executing the stub or `fn`, and every way it can leave
+  `fn` runs the stub's tail, which puts `RSP`/`RCX` back before it jumps to
+  the entry point. With the self-jump still in place that lands on `EB FE`;
+  only a restored entry point (detach) carries it into the program.
 
 ### Is there a borrow without the stub? (`usesStub`)
 
@@ -186,12 +193,39 @@ ever changes.
    parked context is discarded on purpose: there is no parked thread to hand
    back any more — the child is running its own program.
 
+**`fn` is not abandoned; it finishes without a witness.** Detach does not
+cancel the borrowed call, it stops waiting for it. So what the child is
+monitored by afterwards depends on which call was detached:
+
+- a detached **`LoadLibraryW`** of the shim finishes on its own. The shim ends
+  up mapped and its `DllMain` runs, but its init export is never called, so the
+  child is unmonitored (for a shim, like io-mon's, whose hooks are installed by
+  the init export rather than by `DllMain`);
+- a detached **init** (`repro_runtime_init`) runs to completion on its own and
+  installs all, some or none of its hooks, with nothing left to check which.
+
+Either way the caller cannot know the result, and must report the child's
+monitoring as **unknown**, which for evidence grading is the same as lost.
+Measured: a detached init that sleeps past the deadline and then writes a
+marker does write it, and the child still runs its own `main` to its own exit
+code.
+
+**When detach cannot be carried out.** If the entry bytes cannot be restored,
+or the thread cannot be released, `detachBorrowedChild` returns `doFailed`
+and leaves the handle **live** and the thread frozen, so the caller can still
+`terminateBorrowedChild` — the only other safe exit. (A handle that carries no
+stub is refused the same way, with `doRefusedNoStub`.) The entry points do
+exactly that through `applyBorrowTimeoutPolicy`: under `btpDetach`, a detach
+that cannot be carried out terminates the child and is reported as terminated
+(`ioChildTerminated`, or `runWithMonitorShim` raising), never as a child frozen
+forever with nobody left to end it.
+
 The park is left `epsDetached`: `releaseEntryPark` is a no-op on it (the bytes
 are already restored) and the caller owes no resume (the thread is already
-running). Detach's whole point is that the child reaches its real entry point
-**whether or not the injector is still alive** — nothing the injector does
-afterwards is required, so a dead or absent injector cannot strand the child on
-the self-jump. See the stranding note under "Relation to the stranding record".
+running). Once detach has returned `doDetached`, the child reaches its real
+entry point **whether or not the injector is still alive** — nothing the
+injector does afterwards is required, so a dead or absent injector cannot
+strand it on the self-jump. See the stranding note under "Relation to the stranding record".
 
 ## Rules (unchanged where not noted)
 
@@ -239,10 +273,10 @@ stdio.
   bcsChildExited, bcsTimedOut`
 - `type BorrowedCall = object` — `status`, `ret`, `elapsedMs`, and `timedOut`
   (a `TimedOutBorrow`, meaningful only on `bcsTimedOut`).
-- `type TimedOutBorrow = object` — opaque; public read-only `elapsedMs` and
+- `type TimedOutBorrow = object` — opaque; getters `elapsedMs` and
   `usesStub`. Its only operations are the three building blocks.
 - `type DetachOutcome = enum doDetached, doChildExited, doRefusedNoStub,
-  doFailed`
+  doFailed` — on `doRefusedNoStub` and `doFailed` the handle stays live.
 - `proc borrowParkedThread(park, hThread, childIsWow64, fn, arg, deadlineMs):
   BorrowedCall`
 - `proc keepWaitingForBorrow(b: var TimedOutBorrow; additionalMs): BorrowedCall`
@@ -252,11 +286,17 @@ stdio.
 - `type BorrowTimeoutPolicy = enum btpTerminate, btpDetach` (lives here, in the
   building-block layer, and is re-exported by `windows_injector` and
   `propagation_windows`).
+- `proc applyBorrowTimeoutPolicy(b: var TimedOutBorrow; policy):
+  AppliedTimeoutPolicy` (`atpTerminated`, `atpDetached`, `atpChildExited`) —
+  the one dispatcher every borrowing entry point uses, so `btpDetach` means the
+  same thing everywhere: detach, and terminate if detach cannot be carried
+  out.
 - `proc callOnParkedThread(park, hThread, childIsWow64, fn, arg, timeoutMs,
   onTimeout: BorrowTimeoutPolicy; ret): bool` — the boolean convenience. `true`
   only on `bcsReturned`. `onTimeout` has **no default**: on `bcsTimedOut` it
-  applies that building block (`btpTerminate` → `epsAbandoned`, child dead;
-  `btpDetach` → `epsDetached`, child running uninstrumented) and returns
+  applies that policy through `applyBorrowTimeoutPolicy` (`btpTerminate` →
+  `epsAbandoned`, child dead; `btpDetach` → `epsDetached`, child running with
+  its monitoring unknown, or terminated if detach was impossible) and returns
   `false`. A caller that wants to keep waiting, or to inspect the handle, uses
   `borrowParkedThread`.
 - `EntryParkStatus` gains `epsLentOut` (a borrow timed out; awaiting a policy)
@@ -269,15 +309,16 @@ stdio.
   — default for source compatibility only; io-mon names it at every call site.
   `btpTerminate` terminates and raises (unchanged contract); `btpDetach` detaches
   and reports the loss through `WindowsInjectionResult.monitoringSkipped` /
-  `skipReason` instead of raising.
+  `skipReason` instead of raising (and terminates and raises when detach cannot
+  be carried out).
 
 `propagation_windows` (applies a policy while the park is alive, because a
 lent-out handle cannot outlive the frame that owns the park):
 
 - `InjectionConfig.onBorrowTimeout: BorrowTimeoutPolicy` (default `btpTerminate`)
 - `InjectionOutcome` keeps `ioChildTerminated` (policy terminate) and gains
-  `ioChildDetached` (policy detach: the child runs on, uninstrumented, with the
-  shim load or init abandoned and no injector present).
+  `ioChildDetached` (policy detach: the child runs on with no injector present
+  and its monitoring unknown — see "Detach, precisely").
 
 ### `btpDetach` under `autoPropagateCreateProcessW`
 
@@ -290,16 +331,17 @@ out:
   would be a lie and would orphan a live process, so `ctx.result` stays
   non-zero and `PROCESS_INFORMATION` is left intact (it is **not** zeroed, the
   way a terminated child's is).
-- **The child runs UNINSTRUMENTED, and the loss is not silent.** The hook
-  stops propagating at the first detached node (the park is spent and the child
-  is running; injecting a further node would race a live thread down the legacy
-  remote-thread path — the wedge the park exists to avoid). The child carries no
-  hooks and emits no monitoring records, exactly as any uninjected child does.
-  The signal a consumer reads is `injectShimIntoChild`'s `ioChildDetached`
-  outcome; io-mon's own spawn path annotates its record `inject=ioChildDetached`
-  (R6), so the incomplete subtree is visible in the merged evidence rather than
-  mistaken for a complete one. **A silent monitoring loss never happens:** a
-  child is either injected, reported terminated, or reported detached.
+- **The child's monitoring is unknown, and this hook does not record it.**
+  The hook stops propagating at the first detached node (the park is spent and
+  the child is running; injecting a further node would race a live thread down
+  the legacy remote-thread path — the wedge the park exists to avoid).
+  `autoPropagateCreateProcessW` has no reporting channel of its own: it drops
+  `ioChildDetached` exactly as it has always dropped `ioInjectFailed` and
+  `ioInitFailed`. A consumer that must record the loss drives
+  `injectShimIntoChildReport` from its own spawn hook and reads the outcome, as
+  io-mon does (`inject=<outcome>` on the spawn record), so the incomplete
+  subtree is visible in its merged evidence rather than mistaken for a
+  complete one.
 - **Exactly one wakeup.** Detach already resumed the child, so the hook does
   NOT resume again (that would be a redundant no-op); the "resume iff we forced
   the suspension" contract holds.
@@ -317,12 +359,13 @@ this path does not arise; it is defined and tested for consumers that choose it.
 3. Keep waiting: a call that outlives the first deadline but is given more time
    completes, and the child runs its own `main` to its own exit code.
 4. Detach with the stub, on a genuine CETCOMPAT AMD64 child: the injector
-   abandons the borrow (or exits) and the child still finishes the call and runs
-   its own `main` to its own exit code.
-5. Detach is refused when the stub is not in use, and no API path resumes a
-   lent-out context without the stub (the reflexive `releaseEntryPark` +
-   `ResumeThread` leaves the child frozen, not running; only detach continues
-   it).
+   abandons the borrow and the child still finishes the call and runs its own
+   `main` to its own exit code.
+5. Detach is refused for a handle without a stub, and no API path resumes a
+   lent-out context without the stub: the reflexive `releaseEntryPark` +
+   `ResumeThread` leaves the child frozen (the park stays `epsLentOut`) even
+   when the borrowed call itself would have finished long before the check;
+   only a building block ends it.
 6. io-mon's default policy gives the old end-to-end behaviour: `ioChildTerminated`
    and `CreateProcessW` failing with `ERROR_TIMEOUT`.
 7. `injectShimIntoChild` with `btpDetach`: a timed-out shim load is detached,
@@ -330,17 +373,36 @@ this path does not arise; it is defined and tested for consumers that choose it.
    own exit code uninstrumented.
 8. `autoPropagateCreateProcessW` with `btpDetach`: `CreateProcess` SUCCEEDS,
    `PROCESS_INFORMATION` is intact, and the detached child runs its own `main`
-   to its own exit code (the loss being observable as `ioChildDetached`).
+   to its own exit code.
+9. A detach that cannot be carried out returns `doFailed`, leaves the child
+   frozen, and leaves the handle live: `terminateBorrowedChild` still ends the
+   child with `InjectionAbandonedExitCode`.
 
 ## Relation to the stranding record
 
 `issues/.../windows-entry-park-strands-a-spinning-child-when-the-injector-dies`
-(moved to reprobuild-pm) records a child left spinning on the `EB FE` for an
-hour after the injector died mid-**park** — before any borrow. That case is not
-a borrowed-call timeout, so this redesign neither fixes nor worsens it; its
-owner is the job-object assignment in `runWithMonitorShim` (`job`), which kills
-the tree when the injector's handle closes. What this redesign does add is that
-**detach** never leaves a child on the self-jump: it restores the entry bytes
-before releasing the thread, so a tool that chooses detach as its timeout policy
-gets a child that runs its own code rather than one that spins. Terminate,
-likewise, never resumes a half-injected thread.
+(moved to reprobuild-pm, still open) records a child left spinning on the
+`EB FE` for an hour after its injector (a monitored `gcc.exe`) died. The child
+was running, not suspended, so the injector died while the thread was free to
+reach the self-jump: during the park or during a borrow, both of which end on
+`EB FE` and both of which need a live injector to restore the bytes. That is
+not a borrowed-call timeout, and this redesign neither fixes it nor makes it
+worse:
+
+- The new lent-out state holds the thread **suspended**, not spinning. The
+  entry points apply their policy in the same call that saw the timeout, so the
+  window in which an injector's death leaves a lent-out child behind is as
+  short as the old terminate's was. A caller that holds a `TimedOutBorrow` for
+  longer (to decide, or to `keepWaitingForBorrow`) widens it, and a dying
+  injector then leaves a frozen child rather than a spinning one; either still
+  holds its inherited handles.
+- `keepWaitingForBorrow` runs the call back to the self-jump, exactly as a
+  borrow does, so an injector that dies during it strands the child exactly as
+  the record describes, no more.
+- `detachBorrowedChild` is the one path that leaves no self-jump behind: it
+  restores the entry bytes before it releases the thread, so once it has
+  returned `doDetached` the child runs its own code with or without its
+  injector.
+- `runWithMonitorShim`'s `job` does not own the stranded child: a job counts
+  the tree's members and outlives the intermediate injector (`gcc.exe` here),
+  it does not kill a child when that injector dies. The record stays open.

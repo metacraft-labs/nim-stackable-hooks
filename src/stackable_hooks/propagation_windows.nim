@@ -330,9 +330,13 @@ type
       ## A borrowed call outlived the deadline AND the consumer's policy was
       ## ``btpDetach``. The entry bytes were restored and the lent-out thread
       ## released, so the child reaches its real entry point with no injector
-      ## present and runs on, UNINSTRUMENTED (the shim load or init was
-      ## abandoned mid-flight). The child is alive and resumable by the
-      ## consumer's own ``ResumeThread``; the spawn succeeds.
+      ## present. Its monitoring is UNKNOWN: the borrowed call runs to
+      ## completion on its own, so a detached load leaves the shim mapped but
+      ## never initialised, and a detached init may install all, some or none
+      ## of its hooks. Treat the subtree as incompletely observed. The child
+      ## is already running (a further ``ResumeThread`` is a no-op); the spawn
+      ## succeeds. A ``btpDetach`` that could not detach terminates instead
+      ## and is reported as ``ioChildTerminated``.
 
   InjectionReport* = object
     ## ``injectShimIntoChildReport``'s answer: the outcome, plus how long the
@@ -359,13 +363,13 @@ proc defaultInjectionConfig*(): InjectionConfig =
   ##   park completes in 1-2 ms on a healthy image, but a healthy child on
   ##   an I/O-starved host has been measured far past the 5 s this used to
   ##   be, and a borrowed call that misses the deadline costs the child its
-  ##   life (``ioChildTerminated``). So this is a safety net for a WEDGED
+  ##   life (``ioChildTerminated``) under the default ``onBorrowTimeout``. So this is a safety net for a WEDGED
   ##   child, not a tuning parameter; ``InfiniteDeadline`` waits as long as
   ##   the child lives. See ``docs/windows-borrowed-call-deadline.md``.
   ## - onBorrowTimeout = btpTerminate: the old behaviour, now an explicit
   ##   default policy rather than a rigid library act. A wedged child is
   ##   terminated and the spawn fails; a consumer that prefers to let such a
-  ##   child run uninstrumented sets ``btpDetach``.
+  ##   child run on, with its monitoring unknown, sets ``btpDetach``.
   InjectionConfig(maxInFlight: 16,
                   waitDeadlineMs: 5000,
                   skipIfImageHasShim: true,
@@ -517,14 +521,14 @@ proc applyBorrowTimeout(call: var BorrowedCall;
   ## A borrowed call missed ``parkTimeoutMs``; the thread is lent out. Apply
   ## the consumer's policy through the ``TimedOutBorrow`` building blocks and
   ## report it. The library itself has done nothing but suspend and report.
-  case cfg.onBorrowTimeout
-  of btpTerminate:
-    terminateBorrowedChild(call.timedOut)
+  case applyBorrowTimeoutPolicy(call.timedOut, cfg.onBorrowTimeout)
+  of atpTerminated:
+    # ``btpTerminate``, or ``btpDetach`` whose detach was impossible: either
+    # way the child is dead and the spawn must fail.
     ioChildTerminated
-  of btpDetach:
-    # Whether the child was still alive (``doDetached``) or had already gone
-    # (``doChildExited``), it runs no injected code and the spawn succeeds.
-    discard detachBorrowedChild(call.timedOut)
+  of atpDetached, atpChildExited:
+    # Released into its own program (or already gone on its own): the spawn
+    # succeeds and the consumer reports the monitoring as lost.
     ioChildDetached
 
 proc injectShimIntoChildImpl(hProcess: HANDLE; libraryPath: string;
@@ -1091,15 +1095,16 @@ proc autoPropagateCreateProcessW*(ctx: var HookContext) {.raises: [].} =
     of ioChildDetached:
       # Policy was btpDetach and a borrow timed out: detach already restored
       # the entry bytes and RESUMED the child, which now runs its real entry
-      # point UNINSTRUMENTED. Three observable facts, per
+      # point with its monitoring UNKNOWN (see `ioChildDetached`). Per
       # docs/windows-borrowed-call-deadline.md:
       #  * CreateProcess SUCCEEDS -- the child exists and runs, so failing it
       #    would be a lie and would orphan a live process.
-      #  * The loss is NOT silent: the child carries this library's module but
-      #    no hooks (or not even the module), so it emits no monitoring
-      #    records, exactly as any uninjected child does; a consumer that
-      #    drives injection itself sees the `ioChildDetached` outcome, and
-      #    io-mon's spawn record annotates `inject=ioChildDetached`.
+      #  * This hook has no reporting channel of its own: like every other
+      #    non-terminating outcome here (`ioInjectFailed`, `ioInitFailed`,
+      #    ...), the loss is not recorded by THIS hook. A consumer that must
+      #    record it drives `injectShimIntoChildReport` itself and reads
+      #    `ioChildDetached`, as io-mon's spawn hook does
+      #    (`inject=<outcome>`).
       #  * We STOP here: the park is spent (epsDetached) and the child is
       #    already running, so injecting a further node would race a live
       #    thread down the legacy remote-thread path -- precisely the wedge

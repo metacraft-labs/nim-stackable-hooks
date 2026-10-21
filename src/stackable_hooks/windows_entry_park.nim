@@ -94,13 +94,27 @@ type
       ## The child is suspended at its patched entry point, fully
       ## initialised, loader lock free. The caller owns the park and must
       ## call ``releaseEntryPark``.
-    epsAbandoned
-      ## A borrowed call (``borrowParkedThread``) could not hand the thread
-      ## back: its context was lent out and could not be restored. The child
-      ## HAS BEEN TERMINATED and its main thread carries one EXTRA suspend
-      ## count, so a caller's ``ResumeThread`` cannot run it. Nothing about
-      ## this child may be used again. See
+    epsLentOut
+      ## A borrowed call (``borrowParkedThread``) missed its deadline. The
+      ## thread is SUSPENDED with its context STILL LENT OUT, plus one EXTRA
+      ## suspend so a caller's reflexive ``ResumeThread`` cannot run it, and
+      ## the entry bytes are left in place (``releaseEntryPark`` is a no-op in
+      ## this state). The child's fate is the caller's to decide, through the
+      ## ``TimedOutBorrow`` building blocks -- keep waiting, terminate or
+      ## detach. The library itself does NOTHING further. See
       ## ``docs/windows-borrowed-call-deadline.md``.
+    epsDetached
+      ## ``detachBorrowedChild`` ran on a lent-out park: the entry bytes were
+      ## restored and the thread released, so the child is now running its
+      ## OWN code with no injector present. ``releaseEntryPark`` is a no-op
+      ## and the caller owes no resume.
+    epsAbandoned
+      ## ``terminateBorrowedChild`` ran on a lent-out park (directly, or
+      ## because a caller passed ``btpTerminate`` to the boolean
+      ## ``callOnParkedThread``). The child HAS BEEN
+      ## TERMINATED and its main thread carries an extra suspend count, so a
+      ## caller's ``ResumeThread`` cannot run it. Nothing about this child may
+      ## be used again. See ``docs/windows-borrowed-call-deadline.md``.
 
   EntryPark* = object
     ## Handle on a parked child. Zero-initialises to ``epsUnsupported``,
@@ -128,14 +142,13 @@ type
       ## effect is unknown.
     bcsChildExited
       ## The child died while ``fn`` ran. Nothing to restore.
-    bcsPoisoned
-      ## The thread's context was lent out and could NOT be handed back --
-      ## the hard deadline passed mid-call, or the saved context could not
-      ## be restored. Resuming it would run the rest of ``fn`` and then
-      ## return into the real entry point on a borrowed stack. So this proc
-      ## has already suspended it a second time and TERMINATED the child
-      ## with ``InjectionAbandonedExitCode``; the park is ``epsAbandoned``.
-      ## A caller must report the spawn as failed.
+    bcsTimedOut
+      ## The call did not come back within the deadline (or the saved context
+      ## could not be restored after it did). The thread is SUSPENDED with its
+      ## context STILL LENT OUT; the library has TERMINATED NOTHING. The
+      ## ``timedOut`` field carries a ``TimedOutBorrow`` whose building blocks
+      ## -- keep waiting, terminate, detach -- are the only ways to act on the
+      ## lent-out thread. See ``docs/windows-borrowed-call-deadline.md``.
 
   BorrowedCall* = object
     status*: BorrowedCallStatus
@@ -143,6 +156,82 @@ type
       ## ``RAX`` on ``bcsReturned``; zero otherwise.
     elapsedMs*: uint64
       ## How long the call ran in the child, measured from the resume.
+    timedOut*: TimedOutBorrow
+      ## Meaningful only on ``bcsTimedOut``: the handle onto the lent-out
+      ## thread. Pass it to exactly one building block. On every other status
+      ## it is a zero value whose ``usesStub`` is ``false``.
+
+  TimedOutBorrow* = object
+    ## A borrowed call that missed its deadline, caught mid-flight. The
+    ## thread is suspended with its context lent out (``RSP`` below the parked
+    ## frame, the stub executing ``fn``), plus one extra suspend so a reflexive
+    ## ``ResumeThread`` from the caller leaves it frozen. The ONLY operations
+    ## are ``keepWaitingForBorrow``, ``terminateBorrowedChild`` and
+    ## ``detachBorrowedChild``; the fields are private so a caller can neither
+    ## forge one nor read the thread handle out of it, and there is no resume
+    ## entry point. This is how "never resume a lent-out context without the
+    ## stub" is made structural, not merely documented.
+    hThread: pointer
+    childIsWow64: bool
+    park: ptr EntryPark
+      ## Borrow of the caller's park. A building block writes the park's final
+      ## status back through it (``epsParked`` on a late return, ``epsAbandoned``
+      ## on terminate, ``epsDetached`` on detach), so the caller's own
+      ## ``releaseEntryPark`` and branching see the right state.
+    stub: pointer
+      ## The CET call stub in the child. ``detachBorrowedChild`` refuses when
+      ## this is ``nil``; it is the stub's tail that restores ``RSP``/``RCX``,
+      ## so detach is unsound without it.
+    stubLen: uint
+    savedCtx: array[1248, byte]
+      ## The parked context (``ContextAmd64Size`` = 1232, plus 16 for 16-byte
+      ## alignment), saved before the borrow, handed back verbatim if the call
+      ## later returns under ``keepWaitingForBorrow``. Sized by literal because
+      ## this type is compiled on every architecture, while ``ContextAmd64Size``
+      ## lives in the amd64/i386 branch below.
+    live: bool
+      ## ``true`` until a building block consumes the handle, so a second
+      ## building block on the same handle is a no-op rather than a
+      ## double-free or double-terminate.
+    usesStub*: bool
+      ## Public, read-only: whether this handle is backed by the CET stub.
+      ## Always ``true`` for a handle a real borrow produced.
+    elapsedMs*: uint64
+      ## How long the call had run when the deadline passed.
+
+  DetachOutcome* = enum
+    ## Result of ``detachBorrowedChild``.
+    doDetached
+      ## The entry bytes were restored and the thread released; the child is
+      ## running its own code with no injector present.
+    doChildExited
+      ## The child had already died by the time detach ran.
+    doRefusedNoStub
+      ## The handle carries no stub (``usesStub == false``), so restoring
+      ## ``RSP``/``RCX`` by the stub's tail is not possible. Nothing was done;
+      ## the thread is left frozen.
+    doFailed
+      ## Restoring the entry bytes or resuming the thread failed. The thread
+      ## is left frozen; the caller should terminate instead.
+
+  BorrowTimeoutPolicy* = enum
+    ## What a borrowing ENTRY POINT does with a timed-out borrow, chosen by the
+    ## caller -- never a silent library default. These are the two TERMINAL
+    ## choices (what to do once you have decided to stop waiting); "keep
+    ## waiting" is not here because at the entry-point level it is the deadline
+    ## itself (a larger ``deadlineMs``/``parkTimeoutMs``, up to
+    ## ``InfiniteDeadline``), and for a caller that borrows directly it is the
+    ## ``keepWaitingForBorrow`` building block. See
+    ## ``docs/windows-borrowed-call-deadline.md``.
+    btpTerminate
+      ## Apply ``terminateBorrowedChild``: the child dies with
+      ## ``InjectionAbandonedExitCode``. The tool must then report the loss
+      ## (fail the spawn, raise, or record it).
+    btpDetach
+      ## Apply ``detachBorrowedChild``: the child reaches its real entry point
+      ## with no injector present and runs UNINSTRUMENTED. The loss MUST be
+      ## reported through the entry point's own channel (an outcome, a
+      ## ``skipReason``), never swallowed.
 
 const
   InfiniteDeadline* = 0xFFFF_FFFF'u32
@@ -490,8 +579,9 @@ when defined(i386) or defined(amd64):
     ## live across the call.
     ##
     ## On ``pwDeadline`` the thread is left SUSPENDED where it is. It is
-    ## mid-call, and resuming it is exactly the corruption this module must
-    ## never cause; the caller poisons the child instead.
+    ## mid-call, and resuming it into the child's own code is exactly the
+    ## corruption this module must never cause; ``borrowParkedThread`` wraps
+    ## it in a ``TimedOutBorrow`` and hands policy to the caller.
     let start = GetTickCount64()
     let wantIp = uint64(cast[uint](park.entry))
     while true:
@@ -518,19 +608,143 @@ when defined(i386) or defined(amd64):
         return pwDeadline
       pollPause(start)
 
-  proc poisonChild(park: var EntryPark; hThread: pointer) =
-    ## The thread's context is lent out and cannot be handed back. Make sure
-    ## it never runs another instruction, whatever the caller does next:
-    ##
-    ## * one EXTRA suspend, so the caller's unconditional ``ResumeThread``
-    ##   (every caller has one, in a ``finally``) still leaves it frozen,
-    ##   even if the termination below were to fail;
-    ## * terminate the child, and wait for it, so a caller that reports the
-    ##   spawn as failed is not racing a process that is still exiting.
+  proc savedCtxPtr(b: var TimedOutBorrow): pointer {.inline.} =
+    ## The 16-byte-aligned CONTEXT inside the handle's in-object buffer.
+    alignUp16(addr b.savedCtx[0])
+
+  proc lendOut(park: var EntryPark; hThread: pointer; childIsWow64: bool;
+               saved: pointer; stub: pointer; stubLen: uint;
+               elapsedMs: uint64): TimedOutBorrow =
+    ## Build the handle for a borrow that missed its deadline. The thread is
+    ## already suspended once by ``waitForParkedIp``; add ONE MORE suspend so a
+    ## caller's reflexive ``ResumeThread`` leaves it frozen, and mark the park
+    ## ``epsLentOut`` so ``releaseEntryPark`` will not strip the ``EB FE`` out
+    ## from under the lent-out thread. The library does nothing else: the
+    ## caller's chosen building block decides the child's fate.
     discard SuspendThread(hThread)
-    discard TerminateProcess(park.hProcess, InjectionAbandonedExitCode)
-    discard WaitForSingleObject(park.hProcess, 30_000'u32)
-    park.status = epsAbandoned
+    park.status = epsLentOut
+    result = TimedOutBorrow(hThread: hThread, childIsWow64: childIsWow64,
+      park: addr park, stub: stub, stubLen: stubLen, live: true,
+      usesStub: stub != nil, elapsedMs: elapsedMs)
+    copyMem(savedCtxPtr(result), saved, ContextAmd64Size)
+
+  proc resumeFully(hThread: pointer) =
+    ## Drive the suspend count to zero so the thread actually runs. A lent-out
+    ## thread carries the deadline suspend plus the extra ``lendOut`` suspend;
+    ## ``ResumeThread`` returns the PREVIOUS count, and zero/``high`` means it
+    ## is already running or the call failed, so the loop is bounded and safe.
+    for _ in 0 ..< 8:
+      let prev = ResumeThread(hThread)
+      if prev == 0'u32 or prev == high(uint32):
+        break
+
+  proc keepWaitingForBorrow*(b: var TimedOutBorrow;
+                             additionalMs: uint32): BorrowedCall =
+    ## BUILDING BLOCK: give a timed-out borrow more time. Resume the lent-out
+    ## thread and wait up to ``additionalMs`` more for the borrowed call to
+    ## return to the parked entry point. The thread is only ever run back to
+    ## the controlled self-jump, never into the child's own program.
+    ##
+    ## On ``bcsReturned`` the saved context is handed back and the park is
+    ## ``epsParked`` again -- identical to a prompt return, so the caller's
+    ## usual ``releaseEntryPark`` + ``ResumeThread`` runs the child normally.
+    ## A fresh ``bcsTimedOut`` carries a new handle; ``bcsChildExited`` means
+    ## the child died while waiting.
+    result = BorrowedCall(status: bcsNotRun)
+    if not b.live or b.park == nil:
+      return
+    let started = GetTickCount64()
+    resumeFully(b.hThread)
+    let waited = waitForParkedIp(b.park[], b.hThread, b.childIsWow64,
+      additionalMs)
+    result.elapsedMs = b.elapsedMs + (GetTickCount64() - started)
+    case waited
+    of pwExited:
+      b.live = false
+      result.status = bcsChildExited
+      return
+    of pwDeadline:
+      # Still lent out. Re-wrap: ``lendOut`` adds the extra suspend again and
+      # keeps the park ``epsLentOut``.
+      result.status = bcsTimedOut
+      result.timedOut = lendOut(b.park[], b.hThread, b.childIsWow64,
+        savedCtxPtr(b), b.stub, b.stubLen, result.elapsedMs)
+      b.live = false
+      return
+    of pwParked:
+      discard
+    # Back on the parked entry point and suspended: hand the thread back.
+    b.live = false
+    var doneRaw: array[ContextAmd64Size + 16, byte]
+    let done = alignUp16(addr doneRaw[0])
+    cast[ptr uint32](cast[uint](done) + ContextAmd64FlagsOffset)[] =
+      ContextAmd64Full
+    let haveResult = GetThreadContext(b.hThread, done) != 0
+    if SetThreadContext(b.hThread, savedCtxPtr(b)) == 0:
+      # Cannot restore the parked context: the thread is parked on the
+      # self-jump with a stack pointer that is not the loader's. Re-lend it so
+      # the caller can still terminate or detach rather than resume a bad
+      # context.
+      result.status = bcsTimedOut
+      result.timedOut = lendOut(b.park[], b.hThread, b.childIsWow64,
+        savedCtxPtr(b), b.stub, b.stubLen, result.elapsedMs)
+      return
+    b.park[].status = epsParked
+    if haveResult:
+      result.ret = cast[ptr uint64](cast[uint](done) + ContextAmd64RaxOffset)[]
+      result.status = bcsReturned
+    else:
+      result.status = bcsNoResult
+
+  proc terminateBorrowedChild*(b: var TimedOutBorrow;
+      exitCode: uint32 = InjectionAbandonedExitCode) =
+    ## BUILDING BLOCK: today's default. The thread is already carrying the
+    ## extra ``lendOut`` suspend, so even if the termination below failed the
+    ## caller's ``ResumeThread`` would still leave it frozen. Terminate the
+    ## child and wait, so a caller that reports the spawn as failed is not
+    ## racing a process that is still exiting. Marks the park ``epsAbandoned``.
+    if not b.live or b.park == nil:
+      return
+    b.live = false
+    discard SuspendThread(b.hThread)
+    discard TerminateProcess(b.park[].hProcess, exitCode)
+    discard WaitForSingleObject(b.park[].hProcess, 30_000'u32)
+    b.park[].status = epsAbandoned
+
+  proc detachBorrowedChild*(b: var TimedOutBorrow): DetachOutcome =
+    ## BUILDING BLOCK: let the borrowed call finish on its own and get the
+    ## child back to its REAL entry point with no injector present. Allowed
+    ## only with the stub, whose tail restores ``RSP``/``RCX`` by itself.
+    ##
+    ## In order, under the suspension:
+    ##  1. restore the two original entry bytes over the ``EB FE`` self-jump,
+    ##     so the stub's final ``jmp <entry>`` lands on the child's real first
+    ##     instruction rather than the self-jump;
+    ##  2. resume the thread fully, so it finishes ``fn`` and the stub's tail
+    ##     carries it into the entry point on the parked ``RSP``/``RCX``;
+    ##  3. leak the stub page (a live thread may still be in it) and discard
+    ##     the saved parked context (there is no parked thread to hand back).
+    ##
+    ## See ``docs/windows-borrowed-call-deadline.md`` for why this is the one
+    ## recovery that cannot strand the child on the self-jump.
+    if not b.live or b.park == nil:
+      return doFailed
+    if not b.usesStub or b.stub == nil:
+      return doRefusedNoStub
+    if not childAlive(b.park[].hProcess):
+      b.live = false
+      b.park[].status = epsAbandoned
+      return doChildExited
+    b.live = false
+    if not restoreEntryBytes(b.park[]):
+      # The self-jump is still in place; resuming now would spin the child on
+      # it forever. Refuse to resume; leave the thread frozen for the caller
+      # to terminate.
+      b.park[].status = epsLentOut
+      return doFailed
+    resumeFully(b.hThread)
+    b.park[].status = epsDetached
+    doDetached
 
   proc borrowParkedThread*(park: var EntryPark; hThread: pointer;
                            childIsWow64: bool; fn: pointer; arg: pointer;
@@ -607,20 +821,20 @@ when defined(i386) or defined(amd64):
     ## proc waits for, so the stub ends there, on the parked stack pointer
     ## and with the entry point's argument (``RCX``) as the loader passed
     ## it: exactly the state a completed borrow hands back. The saved
-    ## context is then restored on top of it. An earlier version of this
-    ## stub also relied on that tail to let a borrow that outlived a 5 s
-    ## timeout run the program on, uninjected, after the caller resumed the
-    ## child. That path does not exist here: a call that outlives the hard
-    ## deadline poisons the child instead (see below), so a lent-out thread
-    ## is never resumed.
+    ## context is then restored on top of it. That same tail is what makes
+    ## ``detachBorrowedChild`` possible: restore the entry bytes and let the
+    ## thread run, and the tail carries it into the child's real entry point
+    ## on the parked ``RSP``/``RCX`` with no injector present.
     ##
-    ## FAILURE IS NEVER SILENT, AND NEVER RESUMES A LENT-OUT THREAD. Every
-    ## status but ``bcsReturned`` means "the child was not injected"; a
-    ## caller must not retry with a remote thread, which is the broken
-    ## combination this proc exists to replace. ``bcsPoisoned`` means more:
-    ## the thread's context was lent out and could not be handed back, so
-    ## the child has been TERMINATED here, before any caller gets the
-    ## chance to resume it. See ``docs/windows-borrowed-call-deadline.md``.
+    ## FAILURE IS NEVER SILENT, AND THE LIBRARY NEVER RESUMES A LENT-OUT
+    ## THREAD. Every status but ``bcsReturned`` means "the child was not
+    ## injected"; a caller must not retry with a remote thread, which is the
+    ## broken combination this proc exists to replace. ``bcsTimedOut`` means
+    ## more: the thread's context is lent out and was NOT handed back, so the
+    ## borrow returns a ``TimedOutBorrow`` and leaves the thread suspended
+    ## (plus one extra suspend). The library terminates nothing and resumes
+    ## nothing; the caller picks a building block -- keep waiting, terminate
+    ## or detach. See ``docs/windows-borrowed-call-deadline.md``.
     ##
     ## THE DEADLINE IS A LAST RESORT. ``deadlineMs`` bounds a WEDGED call;
     ## while the child is alive and the call has not come back, this keeps
@@ -630,7 +844,8 @@ when defined(i386) or defined(amd64):
     ## the entry bytes and resumed it, and the child finished the borrowed
     ## call and returned into its real entry point on the borrowed stack.
     ## That is a corrupted child manufactured out of a slow one, and it was
-    ## observed exactly so on an I/O-starved build host.
+    ## observed exactly so on an I/O-starved build host. The deadline now
+    ## ends the wait with a ``TimedOutBorrow`` and never resumes the thread.
     ##
     ## WOW64 is refused (``false``) rather than approximated: a 32-bit
     ## child needs ``Wow64SetThreadContext`` and a 32-bit frame, and
@@ -741,14 +956,18 @@ when defined(i386) or defined(amd64):
         return
 
       # FROM HERE THE CONTEXT IS LENT OUT. Every exit below either hands it
-      # back byte for byte or poisons the child; none leaves a resumable
-      # thread that is not the one the park produced.
+      # back byte for byte or hands the caller a ``TimedOutBorrow``; the
+      # library never resumes a lent-out thread itself and never terminates.
       if ResumeThread(hThread) == high(uint32):
         # Never ran, so restoring is enough -- if restoring works.
         if SetThreadContext(hThread, saved) != 0:
           return
-        poisonChild(park, hThread)
-        result.status = bcsPoisoned
+        # The lent-out context is set and cannot be restored; resuming would
+        # run the stub. Hand it back lent out, with the stub still mapped.
+        stubOwned = false
+        result.status = bcsTimedOut
+        result.timedOut = lendOut(park, hThread, childIsWow64, saved, stub,
+          uint(stubCode.len), 0)
         return
       # The thread may now be executing the stub.
       stubOwned = false
@@ -761,8 +980,11 @@ when defined(i386) or defined(amd64):
         result.status = bcsChildExited
         return
       of pwDeadline:
-        poisonChild(park, hThread)
-        result.status = bcsPoisoned
+        # The call did not come back in time. The thread is suspended mid-stub,
+        # context lent out, stub still mapped. Hand policy to the caller.
+        result.status = bcsTimedOut
+        result.timedOut = lendOut(park, hThread, childIsWow64, saved, stub,
+          uint(stubCode.len), result.elapsedMs)
         return
       of pwParked:
         discard
@@ -777,12 +999,15 @@ when defined(i386) or defined(amd64):
         ContextAmd64Full
       let haveResult = GetThreadContext(hThread, done) != 0
 
-      # Hand the thread back byte-for-byte. Parked on the self-jump with a
-      # stack pointer that is not the one the loader left is NOT a state to
-      # resume from, so a failed restore poisons the child too.
+      # Hand the thread back byte-for-byte. The stub's tail already put the
+      # parked RSP/RCX back and the thread is on the self-jump, but the full
+      # register file is only byte-identical once the saved context is
+      # restored. If that restore fails, hand the caller a lent-out borrow
+      # rather than resume a thread the library could not fully hand back.
       if SetThreadContext(hThread, saved) == 0:
-        poisonChild(park, hThread)
-        result.status = bcsPoisoned
+        result.status = bcsTimedOut
+        result.timedOut = lendOut(park, hThread, childIsWow64, saved, stub,
+          uint(stubCode.len), result.elapsedMs)
         return
       if haveResult:
         result.ret = cast[ptr uint64](cast[uint](done) +
@@ -793,14 +1018,25 @@ when defined(i386) or defined(amd64):
 
   proc callOnParkedThread*(park: var EntryPark; hThread: pointer;
                            childIsWow64: bool; fn: pointer; arg: pointer;
-                           timeoutMs: uint32; ret: var uint64): bool =
+                           timeoutMs: uint32; onTimeout: BorrowTimeoutPolicy;
+                           ret: var uint64): bool =
     ## Boolean form of ``borrowParkedThread``: ``true`` only on
-    ## ``bcsReturned``. ``timeoutMs`` is the HARD deadline. A caller that
-    ## has to tell a poisoned (terminated) child apart from an intact,
-    ## uninjected one -- every spawn hook does -- must use
-    ## ``borrowParkedThread`` or check ``park.status == epsAbandoned``.
-    let r = borrowParkedThread(park, hThread, childIsWow64, fn, arg,
+    ## ``bcsReturned``. ``timeoutMs`` is the HARD deadline.
+    ##
+    ## A timed-out borrow leaves a lent-out thread that a bool cannot describe,
+    ## so the caller MUST state its policy: ``onTimeout`` has NO default, which
+    ## is the point -- this convenience never decides for the caller. On
+    ## ``bcsTimedOut`` it applies that building block (``btpTerminate`` leaves
+    ## the park ``epsAbandoned`` and the child dead; ``btpDetach`` leaves it
+    ## ``epsDetached`` and the child running UNINSTRUMENTED) and returns
+    ## ``false``. A caller that wants to keep waiting, or to inspect the
+    ## ``TimedOutBorrow`` itself, must use ``borrowParkedThread``.
+    var r = borrowParkedThread(park, hThread, childIsWow64, fn, arg,
       timeoutMs)
+    if r.status == bcsTimedOut:
+      case onTimeout
+      of btpTerminate: terminateBorrowedChild(r.timedOut)
+      of btpDetach: discard detachBorrowedChild(r.timedOut)
     ret = r.ret
     r.status == bcsReturned
 
@@ -838,7 +1074,8 @@ else:
 
   proc callOnParkedThread*(park: var EntryPark; hThread: pointer;
                            childIsWow64: bool; fn: pointer; arg: pointer;
-                           timeoutMs: uint32; ret: var uint64): bool =
+                           timeoutMs: uint32; onTimeout: BorrowTimeoutPolicy;
+                           ret: var uint64): bool =
     ret = 0
     false
 

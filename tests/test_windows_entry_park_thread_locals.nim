@@ -180,8 +180,11 @@ when defined(windows) and (defined(i386) or defined(amd64)):
       case technique
       of ltBorrowedThread:
         var module: uint64 = 0
+        # A 10 s deadline on a healthy local load never fires; btpTerminate is
+        # named because callOnParkedThread now requires an explicit policy.
         result.loaded = callOnParkedThread(park, pi.hThread, wow64 != 0,
-          loadLibraryW, remoteBuf, 10_000'u32, module) and module != 0
+          loadLibraryW, remoteBuf, 10_000'u32, btpTerminate, module) and
+          module != 0
       of ltRemoteThread:
         let t = CreateRemoteThread(pi.hProcess, nil, 0, loadLibraryW,
           remoteBuf, 0, nil)

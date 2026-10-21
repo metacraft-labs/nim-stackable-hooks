@@ -619,7 +619,9 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
     cwd = ""; captureStdio = false;
     captureStdioPath = ""; env: StringTableRef = nil;
     parkTimeoutMs: DWORD = DefaultInjectDeadlineMs;
-    job: pointer = nil): WindowsInjectionResult =
+    job: pointer = nil;
+    onBorrowTimeout: BorrowTimeoutPolicy = btpTerminate):
+    WindowsInjectionResult =
   ## Windows: Spawn `argv` in a CREATE_SUSPENDED state, inject the monitor
   ## shim DLL via CreateRemoteThread+LoadLibraryW, optionally invoke the
   ## shim's `repro_runtime_init` entry point, then resume the main thread.
@@ -665,9 +667,19 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
   ##
   ## ``parkTimeoutMs`` is a HARD deadline for a wedged child, applied to the
   ## park and to each call borrowed on the parked thread; it is not a
-  ## performance budget (see ``docs/windows-borrowed-call-deadline.md``). A
-  ## borrowed call that outlives it leaves the child TERMINATED rather than
-  ## resumed mid-call, and this proc raises.
+  ## performance budget (see ``docs/windows-borrowed-call-deadline.md``). To
+  ## wait for as long as the child lives, pass ``InfiniteDeadline`` -- that,
+  ## not a policy value, is "keep waiting" at this entry point.
+  ##
+  ## ``onBorrowTimeout`` is the CALLER's policy for a borrowed call that
+  ## outlives ``parkTimeoutMs``; the library no longer decides it (the owner's
+  ## 2026-10-13 "building blocks; tool decides"). ``btpTerminate`` (the
+  ## API-compatibility default, which every io-mon call site names explicitly)
+  ## terminates the child and this proc RAISES, exactly as before.
+  ## ``btpDetach`` lets the borrowed call finish on its own so the child runs
+  ## its real entry point UNINSTRUMENTED, and the loss is reported through
+  ## ``monitoringSkipped`` / ``skipReason`` (never swallowed) rather than
+  ## raising.
   ##
   ## ``parkTimeoutMs = 0`` DISABLES the park and restores the pre-park
   ## behaviour verbatim: a child carrying an MSYS2/Cygwin fork runtime is then
@@ -1046,19 +1058,37 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
     var llExit: DWORD = 1
     var llModule: uint64 = 0
     var borrowedLoad = false
+    var rootDetached = false
     if not skipInjection:
       if park.status == epsParked and not childIsWow64:
-        let borrowed = borrowParkedThread(park, pi.hThread, childIsWow64,
+        var borrowed = borrowParkedThread(park, pi.hThread, childIsWow64,
           loadLibraryW, remoteBuf, parkTimeoutMs)
         llModule = borrowed.ret
-        if borrowed.status != bcsReturned:
-          discard VirtualFreeEx(pi.hProcess, remoteBuf, 0, MEM_RELEASE)
-          if park.status == epsAbandoned:
+        if borrowed.status == bcsTimedOut:
+          # The library left the thread lent out and terminated nothing. Apply
+          # the CALLER's policy. Either way `remoteBuf` is NOT freed here: a
+          # mid-flight LoadLibraryW (detached) or a still-exiting child
+          # (terminated) may read it, and it is reclaimed when the child exits.
+          case onBorrowTimeout
+          of btpTerminate:
+            terminateBorrowedChild(borrowed.timedOut)
             raise newException(OSError,
               "the child's main thread did not return from loading the " &
               "shim within " & $parkTimeoutMs & " ms; it was mid-call, so " &
-              "it was terminated rather than resumed. shim=" &
+              "it was terminated per onBorrowTimeout=btpTerminate. shim=" &
               effectiveDllPath)
+          of btpDetach:
+            # The child runs its real entry point with no injector and the
+            # shim never mapped. Report the loss; skip init; resume+wait below.
+            discard detachBorrowedChild(borrowed.timedOut)
+            result.monitoringSkipped = true
+            result.skipReason =
+              "shim load abandoned after " & $parkTimeoutMs &
+              " ms; child detached and runs UNMONITORED " &
+              "(onBorrowTimeout=btpDetach). shim=" & effectiveDllPath
+            rootDetached = true
+        elif borrowed.status != bcsReturned:
+          discard VirtualFreeEx(pi.hProcess, remoteBuf, 0, MEM_RELEASE)
           raise newException(OSError,
             "the parked child's main thread could not be borrowed to load " &
             "the shim. Falling back to CreateRemoteThread here is NOT an " &
@@ -1067,12 +1097,13 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
             "owned by a heap region that dies with it. borrowedStatus=" &
             $borrowed.status & " parkStatus=" & $park.status &
             " shim=" & effectiveDllPath)
-        borrowedLoad = true
-        # The borrowed call returns LoadLibraryW's HMODULE in RAX. Only
-        # "did it load" is wanted below, and a 64-bit base cannot be
-        # narrowed to a DWORD without risking a 4 GiB-aligned base
-        # reporting as a failure.
-        llExit = (if llModule != 0: 1'u32 else: 0'u32)
+        if not rootDetached:
+          borrowedLoad = true
+          # The borrowed call returns LoadLibraryW's HMODULE in RAX. Only
+          # "did it load" is wanted below, and a 64-bit base cannot be
+          # narrowed to a DWORD without risking a 4 GiB-aligned base
+          # reporting as a failure.
+          llExit = (if llModule != 0: 1'u32 else: 0'u32)
       else:
         let llThread = CreateRemoteThread(pi.hProcess, nil, 0,
           loadLibraryW, remoteBuf, 0, nil)
@@ -1091,7 +1122,10 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
         llExit = 0
         discard GetExitCodeThread(llThread, addr llExit)
         discard CloseHandle(llThread)
-    discard VirtualFreeEx(pi.hProcess, remoteBuf, 0, MEM_RELEASE)
+    if not rootDetached:
+      # A detached child may still be reading the path string from a borrowed
+      # LoadLibraryW; the reservation is leaked and reclaimed when it exits.
+      discard VirtualFreeEx(pi.hProcess, remoteBuf, 0, MEM_RELEASE)
 
     if llExit == 0:
       # Report enough to tell the three causes apart without a rebuild: a
@@ -1124,7 +1158,7 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
       tail
     var childMods: array[1024, HANDLE]
     var modCb: DWORD = 0
-    if not skipInjection and
+    if not skipInjection and not rootDetached and
         EnumProcessModulesEx(pi.hProcess, cast[ptr pointer](addr childMods[0]),
         DWORD(sizeof(childMods)), addr modCb, 0x3'u32) != 0:
       let modCount = int(modCb) div sizeof(HANDLE)
@@ -1178,16 +1212,33 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
         if borrowedLoad:
           # Same thread that mapped the shim, for the same reason: the init
           # entry point installs hooks and touches the shim's thread-locals,
-          # and the thread whose locals must be sound is the child's own.
-          var initRet: uint64 = 0
-          if not callOnParkedThread(park, pi.hThread, childIsWow64,
-              childInit, nil, parkTimeoutMs, initRet):
-            if park.status == epsAbandoned:
+          # and the thread whose locals must be sound is the child's own. The
+          # library reports a timeout and terminates nothing; this entry point
+          # applies the CALLER's `onBorrowTimeout`.
+          var init = borrowParkedThread(park, pi.hThread, childIsWow64,
+            childInit, nil, parkTimeoutMs)
+          case init.status
+          of bcsReturned:
+            discard
+          of bcsTimedOut:
+            case onBorrowTimeout
+            of btpTerminate:
+              terminateBorrowedChild(init.timedOut)
               raise newException(OSError,
                 "repro_runtime_init did not return on the child's main " &
                 "thread within " & $parkTimeoutMs & " ms; it was mid-call, " &
-                "so the child was terminated rather than resumed with its " &
-                "hooks half-installed")
+                "so the child was terminated per onBorrowTimeout=btpTerminate " &
+                "rather than resumed with its hooks half-installed")
+            of btpDetach:
+              # The child reaches its real entry point with the shim mapped but
+              # hooks NOT installed: it runs uninstrumented. Report the loss.
+              discard detachBorrowedChild(init.timedOut)
+              result.monitoringSkipped = true
+              result.skipReason =
+                "repro_runtime_init abandoned after " & $parkTimeoutMs &
+                " ms; child detached and runs UNMONITORED with hooks not " &
+                "installed (onBorrowTimeout=btpDetach)"
+          of bcsNotRun, bcsNoResult, bcsChildExited:
             raise newException(OSError,
               "the shim loaded into the child but repro_runtime_init could " &
               "not be called on its parked main thread; the child would run " &

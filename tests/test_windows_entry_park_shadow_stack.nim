@@ -157,6 +157,7 @@ when defined(windows) and defined(amd64):
     doAssert result != nil, "kernel32!" & name & " not found"
 
   type
+    TimeoutPolicy = enum tpTerminate, tpDetach
     Outcome = object
       shadowStack: bool       ## the child runs with a user shadow stack
       parked: bool
@@ -165,6 +166,9 @@ when defined(windows) and defined(amd64):
       pid: DWORD
       hung: bool
       exitCode: DWORD
+      timedOut: bool          ## a borrowed call hit its deadline
+      usesStub: bool          ## the timed-out borrow was stub-backed
+      detach: DetachOutcome   ## result of detach, when tpDetach was chosen
 
   proc peWord(data: string; offset: int): uint16 =
     doAssert offset >= 0 and offset + 2 <= data.len
@@ -238,7 +242,8 @@ when defined(windows) and defined(amd64):
   proc runBorrowedCalls(exe, args: string; borrows: int;
                         callee = "GetCurrentProcessId"; arg: pointer = nil;
                         timeoutMs = 10_000'u32;
-                        childString = ""): Outcome =
+                        childString = "";
+                        onTimeout = tpTerminate): Outcome =
     requireAmd64CetImage(exe)
     var cmdW = toWide("\"" & exe & "\" " & args)
     var si: STARTUPINFOW
@@ -305,12 +310,24 @@ when defined(windows) and defined(amd64):
     if result.parked:
       let fn = kernel32Export(callee)
       for _ in 0 ..< borrows:
-        var answer: uint64 = 0
-        let ok = callOnParkedThread(park, pi.hThread, false, fn, callArg,
-          timeoutMs, answer)
-        result.calls.add ok
-        result.answers.add answer
-        if not ok:
+        var call = borrowParkedThread(park, pi.hThread, false, fn, callArg,
+          timeoutMs)
+        if call.status == bcsTimedOut:
+          # The library reported the timeout and terminated nothing; the test
+          # applies its chosen building block, exactly as a tool would.
+          result.timedOut = true
+          result.usesStub = call.timedOut.usesStub
+          case onTimeout
+          of tpTerminate:
+            terminateBorrowedChild(call.timedOut)
+          of tpDetach:
+            result.detach = detachBorrowedChild(call.timedOut)
+          result.calls.add false
+          result.answers.add call.ret
+          break
+        result.calls.add (call.status == bcsReturned)
+        result.answers.add call.ret
+        if call.status != bcsReturned:
           break
     releaseEntryPark(park)
     discard ResumeThread(pi.hThread)
@@ -348,19 +365,20 @@ when defined(windows) and defined(amd64):
         check not outcome.hung
         check outcome.exitCode == 0
 
-      test "a borrowed call that outlives its hard deadline poisons the child":
-        ## The slow path, under R2 of docs/windows-borrowed-call-deadline.md:
-        ## a thread whose context is lent out is never resumed.
+      test "a timed-out borrow, terminated by the caller, kills the CET child":
+        ## The slow path under the redesign: the library reports `bcsTimedOut`
+        ## and terminates NOTHING; the test applies the TERMINATE building
+        ## block, exactly as io-mon's default policy does.
         ## `kernel32!Sleep(3000)` is borrowed with a 500 ms hard deadline, so
-        ## the call is still running when the deadline passes. The borrow must
-        ## then terminate the child with `InjectionAbandonedExitCode`, and the
-        ## caller's release and `ResumeThread` (exactly what
-        ## `injectShimIntoChild` does after a failed injection) must neither
-        ## bring it back nor leave it hanging. When this test was written, the
-        ## deadline was a 5 s budget and an expired borrow resumed the child,
-        ## so this case asserted exit 0 instead. On this CET child that case
-        ## also caught a stub that ended the borrow on a self-jump of its own
-        ## and left `gcc.exe` spinning forever; the `hung` check keeps that.
+        ## the call is still running when the deadline passes. The timed-out
+        ## borrow must be stub-backed; `terminateBorrowedChild` must leave the
+        ## child dead with `InjectionAbandonedExitCode`, and the caller's
+        ## release and `ResumeThread` must neither bring it back nor leave it
+        ## hanging. On this CET child this case also catches a stub that ended
+        ## the borrow on a self-jump of its own and left `gcc.exe` spinning
+        ## forever; the `hung` check keeps that. FALSIFYING MUTATION: make
+        ## `terminateBorrowedChild` a no-op -- the child is then frozen (hung)
+        ## or revived, not dead with the sentinel.
         require fileExists(child)
         let outcome = runBorrowedCalls(child, "", borrows = 1,
           callee = "Sleep", arg = cast[pointer](3000), timeoutMs = 500'u32)
@@ -369,9 +387,66 @@ when defined(windows) and defined(amd64):
         checkpoint("child exit code: 0x" & outcome.exitCode.int64.toHex(8) &
           " (0xC00000B5 = InjectionAbandonedExitCode)")
         check outcome.parked
+        check outcome.timedOut
+        check outcome.usesStub
         check outcome.calls == @[false]
         check not outcome.hung
         check outcome.exitCode == InjectionAbandonedExitCode
+
+      test "detach: an abandoned borrow lets the CET child reach its own exit":
+        ## Obligation 4. `kernel32!Sleep(2000)` is borrowed with a 400 ms hard
+        ## deadline on a genuine CETCOMPAT AMD64 child. The injector then
+        ## DETACHES -- `detachBorrowedChild` restores the entry bytes and lets
+        ## the call finish on its own -- and does nothing else. The stub's tail
+        ## restores RSP/RCX and jumps to the real entry point, so the child
+        ## runs `cetChildEntry` and exits 0 with NO injector present. The
+        ## shadow stack stays sound (the `call`/`ret` inside the borrow already
+        ## balanced it), so a detached CET child cannot fault with 0xC0000409.
+        ## FALSIFYING MUTATION: make `detachBorrowedChild` skip
+        ## `restoreEntryBytes` -- the child then spins on the `EB FE` forever
+        ## and the `hung` check fires; or make it return `doRefusedNoStub`
+        ## without resuming -- the child stays frozen and never exits 0.
+        require fileExists(child)
+        let outcome = runBorrowedCalls(child, "", borrows = 1,
+          callee = "Sleep", arg = cast[pointer](2000), timeoutMs = 400'u32,
+          onTimeout = tpDetach)
+        checkpoint("fixture runs with a user shadow stack: " &
+          $outcome.shadowStack)
+        checkpoint("detach outcome: " & $outcome.detach &
+          " child exit code: 0x" & outcome.exitCode.int64.toHex(8))
+        check outcome.parked
+        check outcome.timedOut
+        check outcome.usesStub
+        check outcome.detach == doDetached
+        check outcome.calls == @[false]
+        # The child continued its own program to its own exit code, with the
+        # injector gone, and did NOT spin on the self-jump or fault on CET.
+        check not outcome.hung
+        check outcome.exitCode == 0
+
+      test "detach is refused without a stub, and no API resumes a lent-out ctx":
+        ## Obligation 5 (compile-time). `detachBorrowedChild` is defined ONLY
+        ## on a `TimedOutBorrow`, and a `TimedOutBorrow` is produced ONLY by
+        ## the stub borrow, so "detach without the stub" is unrepresentable.
+        ## A caller cannot forge one (its fields are private) and there is no
+        ## `resume`-style proc that acts on a lent-out park. A default
+        ## (stub-less) handle reports `usesStub == false`, and detaching it is
+        ## refused rather than resumed. FALSIFYING MUTATION: add a public
+        ## `resumeLentOut(park)` proc, or make `TimedOutBorrow`'s fields
+        ## public -- the `not compiles` assertions below then fail.
+        var zero: TimedOutBorrow
+        check zero.usesStub == false
+        # Detach refuses a handle with no stub rather than resuming it.
+        check detachBorrowedChild(zero) == doFailed or
+              detachBorrowedChild(zero) == doRefusedNoStub
+        # There is no public field to read the thread handle out of the handle,
+        # and no resume entry point on a lent-out park.
+        check not compiles(zero.hThread)
+        check not compiles(zero.park)
+        check not compiles(zero.stub)
+        var p: EntryPark
+        check not compiles(resumeLentOut(p))
+        check not compiles(p.resume())
 
       test "a borrowed LoadLibraryW maps a real DLL and the child exits 0":
         ## What injection actually borrows the thread for. Unlike the two

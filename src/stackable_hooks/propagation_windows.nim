@@ -295,6 +295,7 @@ type
     skipIfImageHasShim*: bool
     attachStrategy*: AttachStrategy
     parkTimeoutMs*: DWORD
+    onBorrowTimeout*: BorrowTimeoutPolicy
 
   InjectionOutcome* = enum
     ioInjected, ioAlreadyPresent, ioSkippedCap,
@@ -316,14 +317,22 @@ type
     ioChildTerminated
       ## A borrowed call on the child's parked main thread outlived the hard
       ## deadline (``parkTimeoutMs``), or its context could not be handed
-      ## back. The thread was mid-call, so resuming it would have run the
-      ## child into its entry point on a borrowed stack. The child HAS BEEN
-      ## TERMINATED (exit code ``InjectionAbandonedExitCode``) and carries an
-      ## extra suspend count. The consumer must report the SPAWN as failed
-      ## -- see ``failSpawnForTerminatedChild`` and
+      ## back, AND the consumer's policy was ``btpTerminate`` (the default).
+      ## The thread was mid-call, so resuming it would have run the child into
+      ## its entry point on a borrowed stack. The child HAS BEEN TERMINATED
+      ## (exit code ``InjectionAbandonedExitCode``) and carries an extra
+      ## suspend count. The consumer must report the SPAWN as failed -- see
+      ## ``failSpawnForTerminatedChild`` and
       ## ``docs/windows-borrowed-call-deadline.md``. Unlike every other
       ## non-success value, this one is not "the child runs unmonitored":
       ## there is no child.
+    ioChildDetached
+      ## A borrowed call outlived the deadline AND the consumer's policy was
+      ## ``btpDetach``. The entry bytes were restored and the lent-out thread
+      ## released, so the child reaches its real entry point with no injector
+      ## present and runs on, UNINSTRUMENTED (the shim load or init was
+      ## abandoned mid-flight). The child is alive and resumable by the
+      ## consumer's own ``ResumeThread``; the spawn succeeds.
 
   InjectionReport* = object
     ## ``injectShimIntoChildReport``'s answer: the outcome, plus how long the
@@ -353,11 +362,16 @@ proc defaultInjectionConfig*(): InjectionConfig =
   ##   life (``ioChildTerminated``). So this is a safety net for a WEDGED
   ##   child, not a tuning parameter; ``InfiniteDeadline`` waits as long as
   ##   the child lives. See ``docs/windows-borrowed-call-deadline.md``.
+  ## - onBorrowTimeout = btpTerminate: the old behaviour, now an explicit
+  ##   default policy rather than a rigid library act. A wedged child is
+  ##   terminated and the spawn fails; a consumer that prefers to let such a
+  ##   child run uninstrumented sets ``btpDetach``.
   InjectionConfig(maxInFlight: 16,
                   waitDeadlineMs: 5000,
                   skipIfImageHasShim: true,
                   attachStrategy: asEntryPark,
-                  parkTimeoutMs: DefaultInjectDeadlineMs)
+                  parkTimeoutMs: DefaultInjectDeadlineMs,
+                  onBorrowTimeout: btpTerminate)
 
 # ---------------------------------------------------------------------------
 # Concurrency cap (maxInFlight)
@@ -497,6 +511,21 @@ proc isCygwinForkChild*(hProcess: pointer): bool =
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+proc applyBorrowTimeout(call: var BorrowedCall;
+                        cfg: InjectionConfig): InjectionOutcome =
+  ## A borrowed call missed ``parkTimeoutMs``; the thread is lent out. Apply
+  ## the consumer's policy through the ``TimedOutBorrow`` building blocks and
+  ## report it. The library itself has done nothing but suspend and report.
+  case cfg.onBorrowTimeout
+  of btpTerminate:
+    terminateBorrowedChild(call.timedOut)
+    ioChildTerminated
+  of btpDetach:
+    # Whether the child was still alive (``doDetached``) or had already gone
+    # (``doChildExited``), it runs no injected code and the spawn succeeds.
+    discard detachBorrowedChild(call.timedOut)
+    ioChildDetached
 
 proc injectShimIntoChildImpl(hProcess: HANDLE; libraryPath: string;
                              initSymbol: string; cfg: InjectionConfig;
@@ -651,12 +680,13 @@ proc injectShimIntoChildImpl(hProcess: HANDLE; libraryPath: string;
     case park.status
     of epsParked:
       discard
-    of epsTimedOut, epsAbandoned:
-      # (`epsAbandoned` only follows a borrowed call, never a fresh park.)
-      # The child HAS RUN. Injecting now is the fixed-`Sleep` technique
-      # that was measured to be a race (0 ms hangs, >=1 ms passes) rather
-      # than a fix. Refuse, and let the consumer grade the subtree
-      # incomplete.
+    of epsTimedOut, epsAbandoned, epsLentOut, epsDetached:
+      # (`epsAbandoned`/`epsLentOut`/`epsDetached` only follow a borrowed
+      # call, never a fresh park, so this arm is reached only for
+      # `epsTimedOut` here.) The child HAS RUN. Injecting now is the
+      # fixed-`Sleep` technique that was measured to be a race (0 ms hangs,
+      # >=1 ms passes) rather than a fix. Refuse, and let the consumer grade
+      # the subtree incomplete.
       return ioParkFailed
     of epsUnsupported, epsSetupFailed:
       # The child has executed NOTHING and is exactly as CreateProcessW
@@ -783,7 +813,7 @@ proc injectShimIntoChildImpl(hProcess: HANDLE; libraryPath: string;
     # The buffer belongs to the child for the duration of the borrowed
     # call, exactly as it belongs to a remote thread on the legacy arm.
     remoteBufOwned = false
-    let load = borrowParkedThread(park, hThread, false, loadLibraryW,
+    var load = borrowParkedThread(park, hThread, false, loadLibraryW,
       remoteBuf, cfg.parkTimeoutMs)
     waitedMs += load.elapsedMs
     case load.status
@@ -795,11 +825,12 @@ proc injectShimIntoChildImpl(hProcess: HANDLE; libraryPath: string;
       # Falling back to a remote thread here is NOT available: it is the
       # combination this branch exists to avoid.
       return ioInjectFailed
-    of bcsPoisoned:
-      # Terminated, not resumed mid-call. The whole reason this outcome is
-      # distinct: the caller must fail the spawn, not run an uninjected
-      # child that does not exist.
-      return ioChildTerminated
+    of bcsTimedOut:
+      # Lent out: the library resumed and terminated nothing. Apply the
+      # consumer's policy. ``remoteBuf`` stays leaked (a detached child's
+      # LoadLibraryW may still be reading the path string); it is reclaimed
+      # when the child exits.
+      return applyBorrowTimeout(load, cfg)
     if load.status != bcsReturned or load.ret == 0:
       return ioInjectFailed
     borrowedLoad = true
@@ -895,17 +926,18 @@ proc injectShimIntoChildImpl(hProcess: HANDLE; libraryPath: string;
     # Same thread that mapped the shim, for the same reason: init installs
     # the hooks and touches the shim's thread-locals, and the thread whose
     # locals have to be sound is the child's own.
-    let init = borrowParkedThread(park, hThread, false, childInit, nil,
+    var init = borrowParkedThread(park, hThread, false, childInit, nil,
       cfg.parkTimeoutMs)
     waitedMs += init.elapsedMs
     case init.status
     of bcsReturned:
       return ioInjected
-    of bcsPoisoned:
+    of bcsTimedOut:
       # Init was mid-flight: hooks possibly half-armed, the thread on a
-      # borrowed stack. Resuming that is the corruption this whole path
-      # exists to rule out, so the child was terminated instead.
-      return ioChildTerminated
+      # borrowed stack. The library left it lent out; apply the consumer's
+      # policy (terminate by default -- resuming a half-installed hook set is
+      # the corruption this whole path exists to rule out).
+      return applyBorrowTimeout(init, cfg)
     of bcsNotRun, bcsNoResult, bcsChildExited:
       return ioInitFailed
   let initThread = CreateRemoteThread(hProcess, nil, 0, childInit,
@@ -1039,25 +1071,50 @@ proc autoPropagateCreateProcessW*(ctx: var HookContext) {.raises: [].} =
   # the behaviour this hook had before the park existed.
   let cfg = propagationCfg
   let injectThread = if callerAskedSuspended: nil else: pi[].hThread
+  var detached = false
   for node in propagationNodes():
     if not node.enabled.load():
       continue
     if node.libraryPath.len == 0:
       continue
-    if injectShimIntoChild(pi[].hProcess, node.libraryPath,
-        node.initSymbol, cfg, injectThread) == ioChildTerminated:
-      # The child was terminated rather than resumed mid-call; there is
-      # nothing left to inject into or to resume. Fail the spawn -- see
+    case injectShimIntoChild(pi[].hProcess, node.libraryPath,
+        node.initSymbol, cfg, injectThread)
+    of ioChildTerminated:
+      # Policy was btpTerminate and a borrow timed out: the child was
+      # terminated rather than resumed mid-call; there is nothing left to
+      # inject into or to resume. Fail the spawn -- see
       # docs/windows-borrowed-call-deadline.md.
       let err = failSpawnForTerminatedChild(pi)
       ctx.result = 0
       SetLastError(err)
       return
+    of ioChildDetached:
+      # Policy was btpDetach and a borrow timed out: detach already restored
+      # the entry bytes and RESUMED the child, which now runs its real entry
+      # point UNINSTRUMENTED. Three observable facts, per
+      # docs/windows-borrowed-call-deadline.md:
+      #  * CreateProcess SUCCEEDS -- the child exists and runs, so failing it
+      #    would be a lie and would orphan a live process.
+      #  * The loss is NOT silent: the child carries this library's module but
+      #    no hooks (or not even the module), so it emits no monitoring
+      #    records, exactly as any uninjected child does; a consumer that
+      #    drives injection itself sees the `ioChildDetached` outcome, and
+      #    io-mon's spawn record annotates `inject=ioChildDetached`.
+      #  * We STOP here: the park is spent (epsDetached) and the child is
+      #    already running, so injecting a further node would race a live
+      #    thread down the legacy remote-thread path -- precisely the wedge
+      #    the park exists to avoid. The remaining nodes are not attempted.
+      detached = true
+      break
+    else:
+      discard
 
-  # Still the single wakeup. injectShimIntoChild leaves the suspend count
-  # exactly as it found it, park or no park, so this stays correct whether
-  # zero, one or several nodes were injected.
-  if not callerAskedSuspended:
+  # Still the single wakeup -- UNLESS detach already resumed the child, in
+  # which case the thread is running (suspend count 0) and another resume is a
+  # harmless no-op; we skip it to keep the "exactly one wakeup" contract
+  # honest. injectShimIntoChild otherwise leaves the suspend count exactly as
+  # it found it, park or no park.
+  if not callerAskedSuspended and not detached:
     discard ResumeThread(pi[].hThread)
   SetLastError(savedLastError)
 

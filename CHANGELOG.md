@@ -2,8 +2,44 @@
 
 ## Unreleased
 
+### Changed
+
+- **A borrowed call that misses its deadline is reported; the caller picks
+  what happens next** (owner decision, 2026-10-13: "building blocks; tool
+  decides"). `windows_entry_park` no longer terminates anything on its own.
+  `borrowParkedThread` returns `bcsTimedOut` (replacing `bcsPoisoned`) with
+  the thread still suspended, its context still lent out and one extra
+  suspend held, so a caller's reflexive `releaseEntryPark` + `ResumeThread`
+  cannot run it (the park is `epsLentOut`). The `TimedOutBorrow` it carries
+  has three building blocks: `keepWaitingForBorrow`, `terminateBorrowedChild`
+  and `detachBorrowedChild`. Detach restores the entry bytes and releases the
+  thread, and the call stub's tail carries it into the real entry point; the
+  borrowed call is not cancelled, so a detached child's monitoring is
+  unknown. A detach that cannot be carried out (`doFailed`) leaves the
+  handle live so the child can still be terminated.
+  `applyBorrowTimeoutPolicy` applies a `BorrowTimeoutPolicy`
+  (`btpTerminate`, `btpDetach`; under `btpDetach` an impossible detach
+  terminates). The entry points take the policy from their caller:
+  `InjectionConfig.onBorrowTimeout` and `runWithMonitorShim(onBorrowTimeout)`
+  default to `btpTerminate` for source compatibility, and
+  `callOnParkedThread` now requires an `onTimeout` argument (**breaking**).
+  `btpDetach` is reported as `ioChildDetached`, or through
+  `monitoringSkipped` / `skipReason`. See
+  `docs/windows-borrowed-call-deadline.md`.
+
 ### Fixed
 
+- **A borrowed call no longer kills a /CETCOMPAT child.** The parked thread
+  was borrowed by writing the entry point onto its stack as a return address
+  and pointing `RIP` at the callee, so no `call` ever executed and the
+  callee's `ret` had no matching shadow-stack entry. On a host that enforces
+  user shadow stacks (CET), every /CETCOMPAT child (`pwsh.exe`, System32
+  `curl.exe`, `conhost.exe`) died with `0xC0000409` before running any code
+  of its own, which broke Windows `repro build .#apps` from 2026-09-18. The
+  borrow now goes through a small stub written into the child that makes a
+  real `call`, then restores the parked `RSP` and `RCX` and `jmp`s to the
+  entry point. `tests/test_windows_entry_park_shadow_stack.nim` builds a
+  genuine AMD64 CETCOMPAT child for it.
 - **A slow Windows child is no longer turned into a corrupted one.** A call
   borrowed on a parked child's main thread (`LoadLibraryW`, then the shim's
   init) had a 5 s deadline. When a call missed it, the thread was suspended
@@ -13,8 +49,9 @@
   The park and every borrowed call now keep waiting while the child is
   alive, up to a hard deadline of `DefaultInjectDeadlineMs` (10 min;
   `InfiniteDeadline` waits for as long as the child lives). A call that
-  outlives the hard deadline no longer resumes the thread: the child is
-  terminated (`InjectionAbandonedExitCode`) and reported as its own outcome,
+  outlives the hard deadline no longer resumes the thread. Under the
+  default `btpTerminate` policy (see Changed) the child is terminated
+  (`InjectionAbandonedExitCode`) and reported as its own outcome,
   `ioChildTerminated`. `autoPropagateCreateProcessW` then fails the spawn
   with `ERROR_TIMEOUT`, and `runWithMonitorShim` raises. See
   `docs/windows-borrowed-call-deadline.md`.

@@ -2729,10 +2729,15 @@ void *stackable_linux_resolve_symbol_in_handle(void *handle, char *name) {
 }
 
 static void stackable_linux_arm_write_abs_jump(unsigned char *p, void *target) {
+  /* Target word FIRST, branch word second: a thread already past the first
+   * word sees the original second instruction until the branch is written,
+   * and a thread that then fetches the branch finds its target in place.
+   * The other order has a window in which `ldr pc` reads a stale word. */
   uint32_t ldr_pc = 0xe51ff004u;            /* ldr pc, [pc, #-4] */
   uint32_t addr = (uint32_t)(uintptr_t)target;
-  memcpy(p + 0, &ldr_pc, 4);
   memcpy(p + 4, &addr, 4);
+  __builtin___clear_cache((char *)p + 4, (char *)p + 8);
+  memcpy(p + 0, &ldr_pc, 4);
 }
 static int stackable_linux_arm_is_abs_jump(const unsigned char *p) {
   uint32_t w; memcpy(&w, p, 4);
@@ -2953,9 +2958,14 @@ int stackable_linux_restore_int3_syscall(
   unsigned char *p = (unsigned char *)target;
   int w = stackable_linux_arm_udf_width(p);
   if (w == 0) {
+    /* Idempotent: a site that already holds its `svc #0` again (restored by
+     * an earlier call, or never patched) is a success, as on x86-64 where a
+     * second restore finds `0f 05` and reports OK. Anything else is not a
+     * site this substrate patched. */
+    int already = stackable_linux_arm_svc_width(p) != 0;
     long mpr = stackable_linux_raw_mprotect(start, span, PROT_READ | PROT_EXEC);
     if (out_errno && mpr < 0) *out_errno = (int)(-mpr);
-    return STACKABLE_LINUX_PATCH_NOT_SYSCALL_SITE;
+    return already ? STACKABLE_LINUX_PATCH_OK : STACKABLE_LINUX_PATCH_NOT_SYSCALL_SITE;
   }
   if (w == 2) { uint16_t s = STACKABLE_THUMB_SVC_HALF; memcpy(p, &s, 2); }
   else { uint32_t s = STACKABLE_ARM_SVC_WORD; memcpy(p, &s, 4); }
@@ -4095,7 +4105,7 @@ proc restoreAbsoluteJumpPatch*(handle: var LinuxPatchHandle): LinuxRawSyscallDia
     return handle.diagnostic
   if not handle.active:
     return lrsInvalidArgument
-  when defined(linux) and defined(amd64):
+  when defined(linux) and (defined(amd64) or defined(arm)):
     var osErr: cint
     let rc = cRestoreAbsoluteJump(handle.target, unsafeAddr handle.originalBytes[0],
                                   addr osErr)

@@ -135,19 +135,29 @@ when defined(linux) and defined(arm):
       # svc to UDF, install the real inline handler, record the site, call it,
       # and confirm the handler replayed the syscall (r0 = our pid) and resumed
       # at `bx lr`. This is the mechanism io-mon's inline trap relies on.
+      # r7 is callee-saved under AAPCS (and the frame pointer in Thumb code),
+      # so the stub preserves it: a stub that clobbered it crashed the
+      # optimised (gcc -O3) test driver on rpi2 with SIGSEGV after the call.
       let code = rwxPage()
-      wi(code, 0, 0xe3a07014'u32)   # mov r7, #20   (SYS_getpid on arm)
-      wi(code, 4, 0xef000000'u32)   # svc #0
-      wi(code, 8, 0xe12fff1e'u32)   # bx lr
-      clearCache(code, 12)
+      wi(code, 0, 0xe52d7004'u32)   # push {r7}
+      wi(code, 4, 0xe3a07014'u32)   # mov r7, #20   (SYS_getpid on arm)
+      wi(code, 8, 0xef000000'u32)   # svc #0
+      wi(code, 12, 0xe49d7004'u32)  # pop {r7}
+      wi(code, 16, 0xe12fff1e'u32)  # bx lr
+      clearCache(code, 20)
       type Fn = proc (): cint {.cdecl.}
       let fn = cast[Fn](addr code[0])
       check fn() == cint(getpid())            # baseline, before patching
-      armTrapSite = cast[uint](addr code[4])
+      armTrapSite = cast[uint](addr code[8])
       let tx = installInt3SyscallPatchTransaction(cast[pointer](armTrapSite))
       check tx.diagnostic == lrsOk
       check installLinuxSigtrapHandler(cast[pointer](armTrapHandler)) == lrsOk
+      # A wrong resume width would re-execute the trap forever (or run off into
+      # the next word); the alarm turns that into a prompt SIGALRM failure
+      # instead of a hang the runner can only report as a timeout.
+      discard alarm(5)
       check fn() == cint(getpid())            # trapped, replayed, resumed
+      discard alarm(0)
       check uninstallLinuxSigtrapHandler() == lrsOk
 else:
   static:

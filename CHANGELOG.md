@@ -26,6 +26,14 @@
 
 ### Changed
 
+- **ARM substrate review fixes.** The body patch writes the target word
+  before the `ldr pc` word; `restoreInt3SyscallPatch` is idempotent on ARM
+  (a site already holding `svc #0` is a success, as on x86-64);
+  `restoreAbsoluteJumpPatch` is available on ARM. The armhf test's live-trap
+  stub preserves r7 (callee-saved under AAPCS; the clobber crashed the
+  `-d:release` driver on rpi2) and is guarded by an alarm so a wrong resume
+  width fails in seconds instead of hanging.
+
 - **A borrowed call that misses its deadline is reported; the caller picks
   what happens next** (owner decision, 2026-10-13: "building blocks; tool
   decides"). `windows_entry_park` no longer terminates anything on its own.

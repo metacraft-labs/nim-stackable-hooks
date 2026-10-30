@@ -13,7 +13,15 @@ Consumers still own the exported wrapper symbols, target symbol set, hook-body d
 
 ## Linux Raw-Syscall Primitives
 
-`stackable_hooks/platform/linux_raw_syscalls` exposes low-level Linux x86_64 helpers for consumers that need to close direct syscall bypasses:
+`stackable_hooks/platform/linux_raw_syscalls` exposes low-level Linux helpers for consumers that need to close direct syscall bypasses. The substrate is implemented for **x86-64** and **32-bit ARM EABI (armhf / `armv7l`)**; `linuxRawSyscallSupported()` reports `lrsOk` on both and `lrsUnsupportedArchitecture` elsewhere. The two share one C ABI and struct contract, so consumers (io-mon) bind the same `stackable_linux_*` symbols unchanged. The architecture differences are internal to the module:
+
+- **Syscall-site trap.** x86-64 overwrites `0f 05` byte 0 with `INT3` and handles **SIGTRAP**. ARM has no one-byte software breakpoint, and `bkpt` does not deliver a catchable signal without a ptracer, so ARM overwrites the whole `svc #0` with an **undefined instruction** (`udf`, equal width — 4 bytes in ARM state, 2 in Thumb) and handles **SIGILL**. `installLinuxSigtrapHandler` installs the architecture's trap signal.
+- **Body patch.** x86-64 writes a 14-byte `ff 25` absolute jump; ARM writes an 8-byte `ldr pc,[pc,#-4]` + target word (A32, interworking).
+- **Site scanner.** x86-64 is instruction-boundary aware via a length decoder; ARM scans word-aligned for `svc #0` (`0xef000000`). Automatic discovery of inline *Thumb*-state syscalls is out of scope (not boundary-sound without a decoder), though the `svc`->UDF patch itself supports an explicit Thumb site.
+
+The x86_64-specific helpers below (atomic-window classification, the INT3 clone-continuation trampoline, the original-call trampoline builder) are x86-64 only; io-mon does not use them on ARM.
+
+The low-level Linux x86_64 helpers:
 
 - `rawSyscall6` for internal forwarding without calling libc wrappers. It returns the kernel result directly (failed syscalls are negative errno values).
 - `resolveDefaultSymbol`, `openLibraryNoLoad`, `resolveSymbolInHandle`, and `resolveSymbolChain` for consumer-controlled symbol resolver chains.

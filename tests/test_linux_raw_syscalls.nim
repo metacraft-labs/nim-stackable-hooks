@@ -8,8 +8,14 @@ import stackable_hooks/platform/linux_raw_syscalls
 
 suite "linux raw syscall primitives":
   test "platform support is explicit":
-    when defined(linux) and defined(amd64):
+    when defined(linux) and (defined(amd64) or defined(arm)):
+      # x86-64 and 32-bit ARM implement the shared raw-syscall subset; the
+      # x86-only helpers keep their own predicate.
       check linuxRawSyscallSupported() == lrsOk
+      when defined(amd64):
+        check linuxX8664RawSyscallSupported() == lrsOk
+      else:
+        check linuxX8664RawSyscallSupported() == lrsUnsupportedArchitecture
     elif defined(linux):
       check linuxRawSyscallSupported() == lrsUnsupportedArchitecture
       check rawSyscall6(0, 0, 0, 0, 0, 0, 0) == -38
@@ -73,7 +79,7 @@ suite "linux raw syscall primitives":
 
   test "enumerating executable mappings reports support diagnostics":
     let enumerated = enumerateLinuxExecutableMappings()
-    when defined(linux) and defined(amd64):
+    when defined(linux) and (defined(amd64) or defined(arm)):
       check enumerated.diagnostic == lrsOk
       check enumerated.mappings.len > 0
       var foundExecutable = false
@@ -89,7 +95,7 @@ suite "linux raw syscall primitives":
       check enumerated.mappings.len == 0
 
   test "default symbol resolution is explicit":
-    when defined(linux) and defined(amd64):
+    when defined(linux) and (defined(amd64) or defined(arm)):
       check resolveDefaultSymbol(cstring("syscall")) != nil
       check resolveDefaultSymbol(cstring("__stackable_missing_symbol")) == nil
     else:

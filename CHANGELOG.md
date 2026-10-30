@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Added
+
+- **32-bit ARM (armhf) raw-syscall substrate.** `platform/linux_raw_syscalls`
+  now implements the subset io-mon's Linux shim consumes on ARM EABI as well
+  as x86-64, behind the same `stackable_linux_*` C ABI and struct contract:
+  `rawSyscall6`, the glibc `syscall` body patch (8-byte `ldr pc,[pc,#-4]` +
+  target word), the inline syscall-site trap (an equal-width `udf` over
+  `svc #0`, 4 bytes ARM / 2 bytes Thumb, handled on **SIGILL** since ARM has
+  no one-byte breakpoint and `bkpt` is not catchable without a ptracer), the
+  `ucontext` register capture/write/replay, and the Elf32 vDSO image
+  discovery/patch. `linuxRawSyscallSupported()` is `lrsOk` on `linux/arm`;
+  the x86-only helpers (atomic-window classifier, near trampolines, INT3
+  clone-continuation) report through the new `linuxX8664RawSyscallSupported()`
+  so they never return a default-initialised (falsely OK) result elsewhere.
+  The live ARM scanner reports word-aligned ARM-state `svc #0` only; automatic
+  discovery of inline Thumb-state syscalls is out of scope (not boundary-sound
+  without a decoder), though the patch itself supports an explicit Thumb site.
+  Verified on a Raspberry Pi 2 (Raspberry Pi OS 13 armhf): `tests/
+  test_linux_raw_syscalls_armhf.nim`, and a monitored `sh -c "gcc … && ./a"`
+  through io-mon grading `mcComplete` with zero event loss where it was
+  `mcIncomplete` on the two `unsupported-architecture` losses before.
+
 ### Changed
 
 - **A borrowed call that misses its deadline is reported; the caller picks

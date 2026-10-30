@@ -89,6 +89,7 @@ type
 const
   tLinuxAmd64* = CheckTarget(os: "linux", cpu: "amd64")
   tLinuxArm64* = CheckTarget(os: "linux", cpu: "arm64")
+  tLinuxArm* = CheckTarget(os: "linux", cpu: "arm")
   tMacosArm64* = CheckTarget(os: "macosx", cpu: "arm64")
   tWindowsAmd64* = CheckTarget(os: "windows", cpu: "amd64")
   tWindowsArm64* = CheckTarget(os: "windows", cpu: "arm64")
@@ -133,6 +134,13 @@ const testCorpus*: seq[TestEntry] = @[
          "everywhere. linux/arm64 is listed explicitly because that is " &
          "the ONLY target on which its body is live; before this corpus " &
          "the file was in no lane at all and ran on no host."),
+  TestEntry(stem: "test_linux_raw_syscalls_armhf",
+    targets: @[tLinuxAmd64, tLinuxArm, tLinuxArm64, tMacosArm64, tWindowsAmd64],
+    why: "Self-gating `when defined(linux) and defined(arm)` with an " &
+         "`else: static: doAssert` arm. The portable `svc`-site byte-scanner " &
+         "checks run on every host; the body-patch / svc->UDF trap primitives " &
+         "run live only on linux/arm (armhf), which is listed explicitly as " &
+         "the ONLY target on which that body is live."),
   TestEntry(stem: "test_macos_bodypatch_minimal_consumer",
     targets: AllHostTargets,
     why: "Self-gating `when defined(macosx)` with an " &

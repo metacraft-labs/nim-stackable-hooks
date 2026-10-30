@@ -36,7 +36,7 @@ src/
     │       └── *.h
     └── platform/
         ├── linux_preload.nim            # LD_PRELOAD + dlsym(RTLD_NEXT)
-        ├── linux_raw_syscalls.nim       # x86-64 raw-syscall body patching
+        ├── linux_raw_syscalls.nim       # x86-64 + 32-bit ARM (armhf) raw-syscall substrate
         ├── linux_raw_syscalls_aarch64.nim  # AArch64 body patch + trampolines
         ├── macos_bodypatch.nim          # DYLD_INSERT_LIBRARIES + body patch
         └── windows_iat_patcher.nim      # PE Import Address Table patcher

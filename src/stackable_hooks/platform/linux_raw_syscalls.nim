@@ -419,7 +419,29 @@ const
   linuxX8664SysClone3* = 435
   linuxX8664SysRtSigreturn* = 15
 
+  # 32-bit ARM EABI raw `svc #0` instruction encodings, used by the ARM
+  # inline syscall-site scanner. The syscall number travels in r7 on EABI, so
+  # the svc immediate is always 0; the whole instruction is therefore a fixed
+  # word (ARM) or halfword (Thumb). See the ARM `{.emit.}` block above.
+  linuxArmSvcWord* = 0xef000000'u32   ## ARM (A32) `svc #0`
+  linuxThumbSvcHalf* = 0xdf00'u16     ## Thumb (T16/T32) `svc #0`
+
 proc linuxRawSyscallSupported*(): LinuxRawSyscallDiagnostic =
+  when defined(linux):
+    when defined(amd64) or defined(arm):
+      lrsOk
+    else:
+      lrsUnsupportedArchitecture
+  else:
+    lrsUnsupportedPlatform
+
+proc linuxX8664RawSyscallSupported*(): LinuxRawSyscallDiagnostic =
+  ## Support predicate for the helpers that exist on x86-64 ONLY (the atomic
+  ## instruction classifier, the near-trampoline allocator, the original-call
+  ## trampoline builder, the INT3 clone-continuation helpers). On 32-bit ARM
+  ## `linuxRawSyscallSupported()` is `lrsOk` because the shared subset is
+  ## implemented there, but these must still report `lrsUnsupportedArchitecture`
+  ## instead of a default-initialised (and therefore falsely OK) result.
   when defined(linux):
     when defined(amd64):
       lrsOk
@@ -2501,11 +2523,829 @@ unsigned int stackable_linux_jit_range_untracked(
                           outCap: cuint): cuint
     {.importc: "stackable_linux_jit_range_untracked", cdecl.}
 
+elif defined(linux) and defined(arm):
+  # 32-bit ARM EABI (armhf / armel) raw-syscall substrate.
+  # ======================================================
+  #
+  # The ARM sibling of the x86-64 `{.emit.}` body above. It provides the SAME
+  # `stackable_linux_*` C symbols and struct contract the x86-64 block does, so
+  # the Nim wrappers below bind to them unchanged, for exactly the subset io-mon
+  # consumes on Linux: the glibc `syscall` wrapper body patch, the inline
+  # syscall-site trap (scan + patch + signal handler + replay), the vDSO image
+  # discovery/patch, and symbol resolution.
+  #
+  # Substitutions vs the x86-64 primitives, each verified on a Raspberry Pi 2
+  # (Raspberry Pi OS 13 armhf, kernel 6.18 armv7l) on 2026-10-30:
+  #
+  #   * Syscall ABI: number in r7, args r0-r5, `svc #0`, kernel `-errno` in r0.
+  #     glibc's `syscall(2)` wrapper shuffles r0->r7, r1->r0, ... (measured:
+  #     `mov r12,sp; push {r4-r7}; mov r7,r0; mov r0,r1; ...`), and it is ARM
+  #     (A32) state on this userland, so the body patch is an A32 jump.
+  #   * Absolute jump (x86 `ff 25 <abs64>`, 14 B) -> `ldr pc, [pc, #-4]`
+  #     (`0xe51ff004`) followed by the 4-byte target word = 8 bytes, 4-aligned.
+  #     `ldr pc` on ARMv7 interworks, so a Thumb replacement (its address' bit0
+  #     set, as dlsym returns it) is entered correctly. No original-call
+  #     trampoline is built: io-mon's wrapper replacement re-issues `svc`
+  #     itself and never calls the original, so destroying the prologue is fine
+  #     (it always patches with captureRestore = false).
+  #   * Inline trap: x86 overwrites `0f 05` byte 0 with `INT3` (SIGTRAP). ARM
+  #     has no 1-byte software breakpoint, and `bkpt` does NOT deliver a
+  #     catchable SIGTRAP without a ptracer (measured: it loops forever). An
+  #     UNDEFINED instruction delivers SIGILL (ILL_ILLOPC) with the saved PC AT
+  #     the instruction, which advancing past escapes cleanly (measured, both
+  #     states). So the trap replaces the whole `svc` with an equal-width UDF:
+  #       ARM   `svc #0` = 0xef000000 (4 B) -> `udf #0` = 0xe7f000f0 (4 B)
+  #       Thumb `svc #0` = 0xdf00     (2 B) -> `udf #0` = 0xde00     (2 B)
+  #     Equal width means no prologue relocation and no trampoline: simpler and
+  #     safer than the x86 int3-in-a-2-byte-insn case. The handler installs on
+  #     SIGILL, reads the ARM register file from `ucontext_t`, replays, writes
+  #     r0, and advances arm_pc by the instruction width (2 in Thumb state, 4
+  #     in ARM state, from the CPSR T bit, bit 5).
+  #   * ELF/vDSO parsing is `Elf32_*` / `EM_ARM` / `ELFCLASS32`; otherwise the
+  #     same discovery (`getauxval(AT_SYSINFO_EHDR)`) and bounds checks.
+  #   * I-cache: ARM is not coherent I/D, so every code write is followed by
+  #     `__builtin___clear_cache`.
+  #
+  # The scanner only recognizes ARM-state `svc #0` (word-aligned 0xef000000) in
+  # the live-memory path. A halfword scan for Thumb `svc #0` (0xdf00) over
+  # Thumb-2 code is not instruction-boundary sound without a linear-sweep
+  # decoder (0xdf00 is a common Thumb-2 instruction half), and ARM has no cheap
+  # length decoder like x86's ILD, so scanning for it would risk corrupting a
+  # monitored program (the exact failure class the x86 `visitLinux...Memory`
+  # FUP-H note guards against). The Thumb `svc` -> UDF PATCH and the SIGILL
+  # handler fully support Thumb sites when one is supplied explicitly (the unit
+  # tests exercise this); only the automatic discovery of inline Thumb-state
+  # syscalls is out of scope, and recorded as a narrowed residual.
+  {.emit: """
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <unistd.h>
+#include <signal.h>
+#include <ucontext.h>
+#include <dlfcn.h>
+#include <link.h>
+#include <elf.h>
+#include <sys/auxv.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+
+#ifndef STACKABLE_LINUX_RTLD_NOLOAD
+#define STACKABLE_LINUX_RTLD_NOLOAD RTLD_NOLOAD
+#endif
+
+struct stackable_linux_patch_result {
+  int diagnostic; int stage; int os_errno; int patch_live; int restore_captured;
+  unsigned long target; unsigned long replacement; unsigned long patch_size;
+  unsigned char original[14];
+};
+struct stackable_linux_int3_patch_result {
+  int diagnostic; int stage; int os_errno; int patch_live; int restore_captured;
+  unsigned long target; unsigned char original_first_byte; unsigned char second_byte;
+};
+struct stackable_linux_syscall_regs {
+  long nr; long args[6]; long result;
+  unsigned long trap_rip; unsigned long syscall_address; unsigned long resume_rip;
+};
+struct stackable_linux_vdso_image {
+  int diagnostic; int os_errno; unsigned long base; unsigned long length;
+  unsigned long load_max_address; unsigned long dynamic_address;
+  unsigned long symbol_table; unsigned long string_table;
+  unsigned long symbol_entry_size; unsigned long symbol_count;
+  unsigned long string_table_size;
+};
+struct stackable_linux_vdso_symbol {
+  int diagnostic; unsigned long address; unsigned long size;
+  unsigned char info; unsigned char other; unsigned short section_index;
+};
+struct stackable_linux_vdso_patch_result {
+  int diagnostic; int path; int direct_diagnostic; int overlay_diagnostic;
+  int os_errno; int patch_live; int overlay_used;
+  unsigned long image_base; unsigned long image_length;
+  unsigned long symbol_address; unsigned long replacement;
+  struct stackable_linux_patch_result direct;
+};
+
+enum {
+  STACKABLE_LINUX_PATCH_OK = 0,
+  STACKABLE_LINUX_PATCH_UNSUPPORTED_PLATFORM = 1,
+  STACKABLE_LINUX_PATCH_UNSUPPORTED_ARCHITECTURE = 2,
+  STACKABLE_LINUX_PATCH_INVALID_ARGUMENT = 3,
+  STACKABLE_LINUX_PATCH_SYMBOL_NOT_FOUND = 4,
+  STACKABLE_LINUX_PATCH_ALREADY_PATCHED = 5,
+  STACKABLE_LINUX_PATCH_MPROTECT_FAILED = 6,
+  STACKABLE_LINUX_PATCH_PRE_MPROTECT_FAILED = 7,
+  STACKABLE_LINUX_PATCH_WRITE_FAILED = 8,
+  STACKABLE_LINUX_PATCH_POST_MPROTECT_BACK_FAILED = 9,
+  STACKABLE_LINUX_PATCH_RESTORE_FAILED = 10,
+  STACKABLE_LINUX_PATCH_UNSUPPORTED_INSTRUCTION = 11,
+  STACKABLE_LINUX_PATCH_TRAMPOLINE_ALLOC_FAILED = 12,
+  STACKABLE_LINUX_PATCH_TRAMPOLINE_BUILD_FAILED = 13,
+  STACKABLE_LINUX_PATCH_NOT_SYSCALL_SITE = 14,
+  STACKABLE_LINUX_PATCH_TRAP_INSTALL_FAILED = 15,
+  STACKABLE_LINUX_PATCH_TRAP_CHAIN_UNAVAILABLE = 16,
+  STACKABLE_LINUX_PATCH_VDSO_NOT_FOUND = 17,
+  STACKABLE_LINUX_PATCH_VDSO_NOT_ELF = 18,
+  STACKABLE_LINUX_PATCH_VDSO_NO_DYNAMIC = 19,
+  STACKABLE_LINUX_PATCH_VDSO_NO_SYMBOL_TABLE = 20,
+  STACKABLE_LINUX_PATCH_VDSO_SYMBOL_NOT_FOUND = 21,
+  STACKABLE_LINUX_PATCH_VDSO_DIRECT_PATCH_FAILED = 22,
+  STACKABLE_LINUX_PATCH_VDSO_OVERLAY_FAILED = 23
+};
+enum {
+  STACKABLE_LINUX_PATCH_STAGE_NONE = 0,
+  STACKABLE_LINUX_PATCH_STAGE_VALIDATE_TARGET = 1,
+  STACKABLE_LINUX_PATCH_STAGE_PRE_MPROTECT = 2,
+  STACKABLE_LINUX_PATCH_STAGE_WRITE_PATCH = 3,
+  STACKABLE_LINUX_PATCH_STAGE_POST_MPROTECT_BACK = 4,
+  STACKABLE_LINUX_PATCH_STAGE_COMPLETE = 5
+};
+
+#define STACKABLE_ARM_JUMP_SIZE 8
+/* `svc #0` and the `udf #0` we overwrite it with, per instruction set. */
+#define STACKABLE_ARM_SVC_WORD   0xef000000u   /* ARM   svc #0 */
+#define STACKABLE_ARM_UDF_WORD   0xe7f000f0u   /* ARM   udf #0 (perm. undefined) */
+#define STACKABLE_THUMB_SVC_HALF 0xdf00u       /* Thumb svc #0 */
+#define STACKABLE_THUMB_UDF_HALF 0xde00u       /* Thumb udf #0 */
+
+/* r7 is the frame pointer in Thumb code and cannot be a named asm operand, so
+ * the number rides in r6 and is swapped into r7 across the trap. Identical to
+ * io-mon's own ct_raw_syscall6; kept here so framework-internal forwarding
+ * does not route through libc (which this shim interposes). */
+long stackable_linux_raw_syscall6(long nr, long a1, long a2, long a3,
+                                  long a4, long a5, long a6) {
+  register long r0 __asm__("r0") = a1;
+  register long r1 __asm__("r1") = a2;
+  register long r2 __asm__("r2") = a3;
+  register long r3 __asm__("r3") = a4;
+  register long r4 __asm__("r4") = a5;
+  register long r5 __asm__("r5") = a6;
+  register long r6 __asm__("r6") = nr;
+  __asm__ volatile("push {r7}\n\t"
+                   "mov r7, r6\n\t"
+                   "svc #0\n\t"
+                   "pop {r7}"
+                   : "+r"(r0)
+                   : "r"(r1), "r"(r2), "r"(r3), "r"(r4), "r"(r5), "r"(r6)
+                   : "memory", "cc");
+  return r0;
+}
+
+long stackable_linux_static_raw_syscall6(long nr, long a1, long a2, long a3,
+                                         long a4, long a5, long a6) {
+  return stackable_linux_raw_syscall6(nr, a1, a2, a3, a4, a5, a6);
+}
+
+static long stackable_linux_raw_mprotect(uintptr_t addr, size_t len, int prot) {
+  return stackable_linux_raw_syscall6((long)SYS_mprotect, (long)addr,
+                                      (long)len, (long)prot, 0, 0, 0);
+}
+static long stackable_linux_raw_mmap(void *addr, size_t len, int prot,
+                                     int flags, int fd, long offset) {
+  /* ARM EABI has no SYS_mmap, only SYS_mmap2, whose final argument is the
+   * offset in PAGES. The callers here always pass offset 0. */
+  return stackable_linux_raw_syscall6((long)SYS_mmap2, (long)addr, (long)len,
+                                      (long)prot, (long)flags, (long)fd,
+                                      offset / (long)sysconf(_SC_PAGESIZE));
+}
+static long stackable_linux_raw_munmap(void *addr, size_t len) {
+  return stackable_linux_raw_syscall6((long)SYS_munmap, (long)(uintptr_t)addr,
+                                      (long)len, 0, 0, 0, 0);
+}
+
+void *stackable_linux_resolve_default_symbol(char *name) {
+  if (name == NULL || name[0] == '\0') return NULL;
+  return dlsym(RTLD_DEFAULT, name);
+}
+void *stackable_linux_open_library_noload(char *soname) {
+  if (soname == NULL || soname[0] == '\0') return NULL;
+  return dlopen(soname, RTLD_NOW | STACKABLE_LINUX_RTLD_NOLOAD);
+}
+void *stackable_linux_resolve_symbol_in_handle(void *handle, char *name) {
+  if (name == NULL || name[0] == '\0') return NULL;
+  return dlsym(handle == NULL ? RTLD_DEFAULT : handle, name);
+}
+
+static void stackable_linux_arm_write_abs_jump(unsigned char *p, void *target) {
+  uint32_t ldr_pc = 0xe51ff004u;            /* ldr pc, [pc, #-4] */
+  uint32_t addr = (uint32_t)(uintptr_t)target;
+  memcpy(p + 0, &ldr_pc, 4);
+  memcpy(p + 4, &addr, 4);
+}
+static int stackable_linux_arm_is_abs_jump(const unsigned char *p) {
+  uint32_t w; memcpy(&w, p, 4);
+  return w == 0xe51ff004u;
+}
+
+static void stackable_linux_init_patch_result(
+    struct stackable_linux_patch_result *out, void *target, void *replacement) {
+  if (out == NULL) return;
+  memset(out, 0, sizeof(*out));
+  out->diagnostic = STACKABLE_LINUX_PATCH_OK;
+  out->stage = STACKABLE_LINUX_PATCH_STAGE_NONE;
+  out->target = (unsigned long)(uintptr_t)target;
+  out->replacement = (unsigned long)(uintptr_t)replacement;
+  out->patch_size = STACKABLE_ARM_JUMP_SIZE;
+}
+
+int stackable_linux_patch_absolute_jump_tx(
+    void *target, void *replacement, int capture_restore,
+    struct stackable_linux_patch_result *out) {
+  stackable_linux_init_patch_result(out, target, replacement);
+  if (out) out->stage = STACKABLE_LINUX_PATCH_STAGE_VALIDATE_TARGET;
+  if (target == NULL || replacement == NULL) {
+    if (out) out->diagnostic = STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+    return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+  }
+  if (((uintptr_t)target & 0x3u) != 0) {
+    /* An A32 `ldr pc,[pc,#-4]` must land on a 4-byte boundary; a Thumb
+     * function (bit0 set) is not a valid body-patch target for this form. */
+    if (out) out->diagnostic = STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+    return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+  }
+  long page_size = sysconf(_SC_PAGESIZE);
+  if (page_size <= 0) page_size = 4096;
+  uintptr_t page_mask = (uintptr_t)(page_size - 1);
+  uintptr_t target_addr = (uintptr_t)target;
+  uintptr_t start = target_addr & ~page_mask;
+  uintptr_t end = (target_addr + STACKABLE_ARM_JUMP_SIZE + page_mask) & ~page_mask;
+  size_t span = (size_t)(end - start);
+
+  if (out) out->stage = STACKABLE_LINUX_PATCH_STAGE_PRE_MPROTECT;
+  long mp1 = stackable_linux_raw_mprotect(start, span, PROT_READ | PROT_WRITE | PROT_EXEC);
+  if (mp1 < 0) {
+    if (out) { out->diagnostic = STACKABLE_LINUX_PATCH_PRE_MPROTECT_FAILED; out->os_errno = (int)(-mp1); }
+    return STACKABLE_LINUX_PATCH_PRE_MPROTECT_FAILED;
+  }
+  unsigned char *p = (unsigned char *)target;
+  if (stackable_linux_arm_is_abs_jump(p)) {
+    long mpr = stackable_linux_raw_mprotect(start, span, PROT_READ | PROT_EXEC);
+    if (out) {
+      out->stage = STACKABLE_LINUX_PATCH_STAGE_VALIDATE_TARGET;
+      out->diagnostic = STACKABLE_LINUX_PATCH_ALREADY_PATCHED;
+      if (mpr < 0) out->os_errno = (int)(-mpr);
+    }
+    return STACKABLE_LINUX_PATCH_ALREADY_PATCHED;
+  }
+  if (out && capture_restore) {
+    memcpy(out->original, p, STACKABLE_ARM_JUMP_SIZE);
+    out->restore_captured = 1;
+  }
+  if (out) out->stage = STACKABLE_LINUX_PATCH_STAGE_WRITE_PATCH;
+  stackable_linux_arm_write_abs_jump(p, replacement);
+  __builtin___clear_cache((char *)p, (char *)p + STACKABLE_ARM_JUMP_SIZE);
+  if (out) out->patch_live = 1;
+  if (out) out->stage = STACKABLE_LINUX_PATCH_STAGE_POST_MPROTECT_BACK;
+  long mp2 = stackable_linux_raw_mprotect(start, span, PROT_READ | PROT_EXEC);
+  if (mp2 < 0) {
+    if (out) { out->diagnostic = STACKABLE_LINUX_PATCH_POST_MPROTECT_BACK_FAILED; out->os_errno = (int)(-mp2); }
+    return STACKABLE_LINUX_PATCH_POST_MPROTECT_BACK_FAILED;
+  }
+  if (out) { out->stage = STACKABLE_LINUX_PATCH_STAGE_COMPLETE; out->diagnostic = STACKABLE_LINUX_PATCH_OK; }
+  return STACKABLE_LINUX_PATCH_OK;
+}
+
+int stackable_linux_restore_absolute_jump(void *target, unsigned char *saved,
+                                          int *out_errno) {
+  if (out_errno) *out_errno = 0;
+  if (target == NULL || saved == NULL) return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+  long page_size = sysconf(_SC_PAGESIZE);
+  if (page_size <= 0) page_size = 4096;
+  uintptr_t page_mask = (uintptr_t)(page_size - 1);
+  uintptr_t ta = (uintptr_t)target;
+  uintptr_t start = ta & ~page_mask;
+  uintptr_t end = (ta + STACKABLE_ARM_JUMP_SIZE + page_mask) & ~page_mask;
+  size_t span = (size_t)(end - start);
+  long mp1 = stackable_linux_raw_mprotect(start, span, PROT_READ | PROT_WRITE | PROT_EXEC);
+  if (mp1 < 0) { if (out_errno) *out_errno = (int)(-mp1); return STACKABLE_LINUX_PATCH_PRE_MPROTECT_FAILED; }
+  memcpy(target, saved, STACKABLE_ARM_JUMP_SIZE);
+  __builtin___clear_cache((char *)target, (char *)target + STACKABLE_ARM_JUMP_SIZE);
+  long mp2 = stackable_linux_raw_mprotect(start, span, PROT_READ | PROT_EXEC);
+  if (mp2 < 0) { if (out_errno) *out_errno = (int)(-mp2); return STACKABLE_LINUX_PATCH_POST_MPROTECT_BACK_FAILED; }
+  return STACKABLE_LINUX_PATCH_OK;
+}
+
+/* ---- inline syscall-site trap: svc -> udf (SIGILL), equal width ---- */
+
+static void stackable_linux_init_int3_result(
+    struct stackable_linux_int3_patch_result *out, void *target) {
+  if (out == NULL) return;
+  memset(out, 0, sizeof(*out));
+  out->diagnostic = STACKABLE_LINUX_PATCH_OK;
+  out->stage = STACKABLE_LINUX_PATCH_STAGE_NONE;
+  out->target = (unsigned long)(uintptr_t)target;
+}
+
+/* Returns the width (2 Thumb / 4 ARM) of the `svc #0` at p, or 0 if none. */
+static int stackable_linux_arm_svc_width(const unsigned char *p) {
+  uint16_t h; memcpy(&h, p, 2);
+  if (h == STACKABLE_THUMB_SVC_HALF) return 2;
+  uint32_t w; memcpy(&w, p, 4);
+  if (w == STACKABLE_ARM_SVC_WORD) return 4;
+  return 0;
+}
+static int stackable_linux_arm_udf_width(const unsigned char *p) {
+  uint16_t h; memcpy(&h, p, 2);
+  if (h == STACKABLE_THUMB_UDF_HALF) return 2;
+  uint32_t w; memcpy(&w, p, 4);
+  if (w == STACKABLE_ARM_UDF_WORD) return 4;
+  return 0;
+}
+
+static int stackable_linux_patch_int3_syscall_tx_page_size(
+    void *target, unsigned long caller_page_size,
+    struct stackable_linux_int3_patch_result *out) {
+  stackable_linux_init_int3_result(out, target);
+  if (out) out->stage = STACKABLE_LINUX_PATCH_STAGE_VALIDATE_TARGET;
+  if (target == NULL) {
+    if (out) out->diagnostic = STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+    return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+  }
+  unsigned long page_size = caller_page_size ? caller_page_size : 4096;
+  uintptr_t page_mask = (uintptr_t)(page_size - 1);
+  uintptr_t ta = (uintptr_t)target;
+  uintptr_t start = ta & ~page_mask;
+  uintptr_t end = (ta + 4 + page_mask) & ~page_mask;
+  size_t span = (size_t)(end - start);
+
+  if (out) out->stage = STACKABLE_LINUX_PATCH_STAGE_PRE_MPROTECT;
+  long mp1 = stackable_linux_raw_mprotect(start, span, PROT_READ | PROT_WRITE | PROT_EXEC);
+  if (mp1 < 0) {
+    if (out) { out->diagnostic = STACKABLE_LINUX_PATCH_PRE_MPROTECT_FAILED; out->os_errno = (int)(-mp1); }
+    return STACKABLE_LINUX_PATCH_PRE_MPROTECT_FAILED;
+  }
+  unsigned char *p = (unsigned char *)target;
+  int uw = stackable_linux_arm_udf_width(p);
+  if (uw != 0) {
+    long mpr = stackable_linux_raw_mprotect(start, span, PROT_READ | PROT_EXEC);
+    if (out) {
+      out->stage = STACKABLE_LINUX_PATCH_STAGE_VALIDATE_TARGET;
+      out->diagnostic = STACKABLE_LINUX_PATCH_ALREADY_PATCHED;
+      if (mpr < 0) out->os_errno = (int)(-mpr);
+    }
+    return STACKABLE_LINUX_PATCH_ALREADY_PATCHED;
+  }
+  int w = stackable_linux_arm_svc_width(p);
+  if (w == 0) {
+    long mpr = stackable_linux_raw_mprotect(start, span, PROT_READ | PROT_EXEC);
+    if (out) {
+      out->stage = STACKABLE_LINUX_PATCH_STAGE_VALIDATE_TARGET;
+      out->diagnostic = STACKABLE_LINUX_PATCH_NOT_SYSCALL_SITE;
+      if (mpr < 0) out->os_errno = (int)(-mpr);
+    }
+    return STACKABLE_LINUX_PATCH_NOT_SYSCALL_SITE;
+  }
+  if (out) {
+    /* Informational: the svc bytes. Restore re-derives the width from the
+     * UDF currently present, so the (constant) svc need not be stored. */
+    out->original_first_byte = p[0];
+    out->second_byte = p[1];
+    out->restore_captured = 1;
+  }
+  if (out) out->stage = STACKABLE_LINUX_PATCH_STAGE_WRITE_PATCH;
+  if (w == 2) {
+    uint16_t udf = STACKABLE_THUMB_UDF_HALF;
+    memcpy(p, &udf, 2);
+  } else {
+    uint32_t udf = STACKABLE_ARM_UDF_WORD;
+    memcpy(p, &udf, 4);
+  }
+  __builtin___clear_cache((char *)p, (char *)p + w);
+  if (out) out->patch_live = 1;
+  if (out) out->stage = STACKABLE_LINUX_PATCH_STAGE_POST_MPROTECT_BACK;
+  long mp2 = stackable_linux_raw_mprotect(start, span, PROT_READ | PROT_EXEC);
+  if (mp2 < 0) {
+    if (out) { out->diagnostic = STACKABLE_LINUX_PATCH_POST_MPROTECT_BACK_FAILED; out->os_errno = (int)(-mp2); }
+    return STACKABLE_LINUX_PATCH_POST_MPROTECT_BACK_FAILED;
+  }
+  if (out) { out->stage = STACKABLE_LINUX_PATCH_STAGE_COMPLETE; out->diagnostic = STACKABLE_LINUX_PATCH_OK; }
+  return STACKABLE_LINUX_PATCH_OK;
+}
+
+int stackable_linux_patch_int3_syscall_tx(
+    void *target, struct stackable_linux_int3_patch_result *out) {
+  long ps = sysconf(_SC_PAGESIZE);
+  if (ps <= 0) ps = 4096;
+  return stackable_linux_patch_int3_syscall_tx_page_size(target, (unsigned long)ps, out);
+}
+int stackable_linux_patch_int3_syscall_tx_fixed_page(
+    void *target, unsigned long page_size,
+    struct stackable_linux_int3_patch_result *out) {
+  return stackable_linux_patch_int3_syscall_tx_page_size(target, page_size, out);
+}
+
+int stackable_linux_restore_int3_syscall(
+    void *target, unsigned char original_first_byte, int *out_errno) {
+  (void)original_first_byte;
+  if (out_errno) *out_errno = 0;
+  if (target == NULL) return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+  long ps = sysconf(_SC_PAGESIZE);
+  if (ps <= 0) ps = 4096;
+  uintptr_t page_mask = (uintptr_t)(ps - 1);
+  uintptr_t ta = (uintptr_t)target;
+  uintptr_t start = ta & ~page_mask;
+  uintptr_t end = (ta + 4 + page_mask) & ~page_mask;
+  size_t span = (size_t)(end - start);
+  long mp1 = stackable_linux_raw_mprotect(start, span, PROT_READ | PROT_WRITE | PROT_EXEC);
+  if (mp1 < 0) { if (out_errno) *out_errno = (int)(-mp1); return STACKABLE_LINUX_PATCH_PRE_MPROTECT_FAILED; }
+  unsigned char *p = (unsigned char *)target;
+  int w = stackable_linux_arm_udf_width(p);
+  if (w == 0) {
+    long mpr = stackable_linux_raw_mprotect(start, span, PROT_READ | PROT_EXEC);
+    if (out_errno && mpr < 0) *out_errno = (int)(-mpr);
+    return STACKABLE_LINUX_PATCH_NOT_SYSCALL_SITE;
+  }
+  if (w == 2) { uint16_t s = STACKABLE_THUMB_SVC_HALF; memcpy(p, &s, 2); }
+  else { uint32_t s = STACKABLE_ARM_SVC_WORD; memcpy(p, &s, 4); }
+  __builtin___clear_cache((char *)p, (char *)p + w);
+  long mp2 = stackable_linux_raw_mprotect(start, span, PROT_READ | PROT_EXEC);
+  if (mp2 < 0) { if (out_errno) *out_errno = (int)(-mp2); return STACKABLE_LINUX_PATCH_POST_MPROTECT_BACK_FAILED; }
+  return STACKABLE_LINUX_PATCH_OK;
+}
+
+static int stackable_linux_copy_ucontext_regs(
+    void *ucontext_ptr, struct stackable_linux_syscall_regs *out) {
+  if (ucontext_ptr == NULL || out == NULL) return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+  ucontext_t *uc = (ucontext_t *)ucontext_ptr;
+  mcontext_t *m = &uc->uc_mcontext;
+  out->nr = (long)m->arm_r7;
+  out->args[0] = (long)m->arm_r0;
+  out->args[1] = (long)m->arm_r1;
+  out->args[2] = (long)m->arm_r2;
+  out->args[3] = (long)m->arm_r3;
+  out->args[4] = (long)m->arm_r4;
+  out->args[5] = (long)m->arm_r5;
+  out->result = (long)m->arm_r0;
+  unsigned long pc = (unsigned long)m->arm_pc;
+  int thumb = (int)((m->arm_cpsr >> 5) & 1u);
+  out->trap_rip = pc;
+  /* SIGILL from an undefined instruction reports the saved PC AT the faulting
+   * instruction (not past it, unlike x86 INT3), so syscall_address is pc and
+   * resume is pc + the instruction width. */
+  out->syscall_address = pc;
+  out->resume_rip = pc + (thumb ? 2u : 4u);
+  return STACKABLE_LINUX_PATCH_OK;
+}
+
+int stackable_linux_capture_syscall_regs_from_ucontext(
+    void *ucontext_ptr, struct stackable_linux_syscall_regs *out) {
+  return stackable_linux_copy_ucontext_regs(ucontext_ptr, out);
+}
+
+int stackable_linux_write_syscall_result_to_ucontext(
+    void *ucontext_ptr, long result, unsigned long resume_rip) {
+  if (ucontext_ptr == NULL) return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+  ucontext_t *uc = (ucontext_t *)ucontext_ptr;
+  uc->uc_mcontext.arm_r0 = (unsigned long)result;
+  if (resume_rip != 0) uc->uc_mcontext.arm_pc = (unsigned long)resume_rip;
+  return STACKABLE_LINUX_PATCH_OK;
+}
+
+long stackable_linux_replay_syscall_regs(
+    struct stackable_linux_syscall_regs *regs) {
+  if (regs == NULL) return -EINVAL;
+  return stackable_linux_raw_syscall6(regs->nr, regs->args[0], regs->args[1],
+                                      regs->args[2], regs->args[3],
+                                      regs->args[4], regs->args[5]);
+}
+
+/* The inline-trap signal on ARM is SIGILL (an undefined instruction), not the
+ * SIGTRAP x86 uses for INT3. The function name is kept for API parity. */
+static struct sigaction stackable_linux_old_sigill_action;
+static int stackable_linux_sigill_installed = 0;
+
+int stackable_linux_install_sigtrap_handler(void *handler, int extra_flags) {
+  if (handler == NULL) return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+  if (stackable_linux_sigill_installed) return STACKABLE_LINUX_PATCH_ALREADY_PATCHED;
+  struct sigaction sa;
+  memset(&sa, 0, sizeof(sa));
+  sigemptyset(&sa.sa_mask);
+  sa.sa_sigaction = (void (*)(int, siginfo_t *, void *))handler;
+  sa.sa_flags = SA_SIGINFO | extra_flags;
+  if (sigaction(SIGILL, &sa, &stackable_linux_old_sigill_action) != 0)
+    return STACKABLE_LINUX_PATCH_TRAP_INSTALL_FAILED;
+  stackable_linux_sigill_installed = 1;
+  return STACKABLE_LINUX_PATCH_OK;
+}
+int stackable_linux_uninstall_sigtrap_handler(void) {
+  if (!stackable_linux_sigill_installed) return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+  if (sigaction(SIGILL, &stackable_linux_old_sigill_action, NULL) != 0)
+    return STACKABLE_LINUX_PATCH_TRAP_INSTALL_FAILED;
+  stackable_linux_sigill_installed = 0;
+  return STACKABLE_LINUX_PATCH_OK;
+}
+int stackable_linux_chain_sigtrap(int signum, void *siginfo_ptr, void *ucontext_ptr) {
+  if (!stackable_linux_sigill_installed) return STACKABLE_LINUX_PATCH_TRAP_CHAIN_UNAVAILABLE;
+  if (stackable_linux_old_sigill_action.sa_flags & SA_SIGINFO) {
+    if (stackable_linux_old_sigill_action.sa_sigaction == NULL)
+      return STACKABLE_LINUX_PATCH_TRAP_CHAIN_UNAVAILABLE;
+    stackable_linux_old_sigill_action.sa_sigaction(signum, (siginfo_t *)siginfo_ptr, ucontext_ptr);
+    return STACKABLE_LINUX_PATCH_OK;
+  }
+  if (stackable_linux_old_sigill_action.sa_handler == SIG_DFL ||
+      stackable_linux_old_sigill_action.sa_handler == SIG_IGN ||
+      stackable_linux_old_sigill_action.sa_handler == NULL)
+    return STACKABLE_LINUX_PATCH_TRAP_CHAIN_UNAVAILABLE;
+  stackable_linux_old_sigill_action.sa_handler(signum);
+  return STACKABLE_LINUX_PATCH_OK;
+}
+
+/* ---- executable-segment membership (ElfW == Elf32 here) ---- */
+typedef struct { unsigned long anchor; int found_in_text; } stackable_linux_phdr_query;
+static int stackable_linux_phdr_cb(struct dl_phdr_info *info, size_t size, void *data) {
+  (void)size;
+  stackable_linux_phdr_query *q = (stackable_linux_phdr_query *)data;
+  for (int i = 0; i < info->dlpi_phnum; i++) {
+    const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
+    if (ph->p_type != PT_LOAD) continue;
+    if ((ph->p_flags & PF_X) == 0) continue;
+    unsigned long seg_start = info->dlpi_addr + ph->p_vaddr;
+    unsigned long seg_end = seg_start + ph->p_memsz;
+    if (q->anchor >= seg_start && q->anchor < seg_end) { q->found_in_text = 1; return 1; }
+  }
+  return 0;
+}
+int stackable_linux_addr_in_executable_segment(unsigned long addr) {
+  if (addr == 0) return 0;
+  stackable_linux_phdr_query q; q.anchor = addr; q.found_in_text = 0;
+  dl_iterate_phdr(stackable_linux_phdr_cb, &q);
+  return q.found_in_text;
+}
+
+/* ---- vDSO (Elf32 / EM_ARM) ---- */
+static void stackable_linux_init_vdso_image(struct stackable_linux_vdso_image *out) {
+  if (out == NULL) return;
+  memset(out, 0, sizeof(*out));
+  out->diagnostic = STACKABLE_LINUX_PATCH_OK;
+}
+static unsigned long stackable_linux_vdso_ptr_value(unsigned long raw, unsigned long base, unsigned long load_max) {
+  if (raw < load_max || raw < base) return base + raw;
+  return raw;
+}
+static int stackable_linux_range_contains(unsigned long base, unsigned long length,
+                                          unsigned long addr, unsigned long span) {
+  unsigned long stop = base + length;
+  if (stop < base) return 0;
+  if (addr < base || addr > stop) return 0;
+  if (addr + span < addr) return 0;
+  return addr + span <= stop;
+}
+static int stackable_linux_vdso_offset_range(unsigned long off, unsigned long span, unsigned long load_max) {
+  if (off >= load_max) return 0;
+  if (off + span < off) return 0;
+  return off + span <= load_max;
+}
+
+static int stackable_linux_parse_vdso_image(unsigned long base_addr,
+                                            struct stackable_linux_vdso_image *out) {
+  stackable_linux_init_vdso_image(out);
+  if (base_addr == 0) { if (out) out->diagnostic = STACKABLE_LINUX_PATCH_VDSO_NOT_FOUND; return STACKABLE_LINUX_PATCH_VDSO_NOT_FOUND; }
+  if (out) out->base = base_addr;
+  unsigned char *base = (unsigned char *)(uintptr_t)base_addr;
+  Elf32_Ehdr ehdr; memcpy(&ehdr, base, sizeof(ehdr));
+  if (ehdr.e_ident[EI_MAG0] != ELFMAG0 || ehdr.e_ident[EI_MAG1] != ELFMAG1 ||
+      ehdr.e_ident[EI_MAG2] != ELFMAG2 || ehdr.e_ident[EI_MAG3] != ELFMAG3 ||
+      ehdr.e_ident[EI_CLASS] != ELFCLASS32 || ehdr.e_ident[EI_DATA] != ELFDATA2LSB ||
+      ehdr.e_machine != EM_ARM || ehdr.e_phoff == 0 || ehdr.e_phnum == 0 ||
+      ehdr.e_phnum > 64 || ehdr.e_phentsize < sizeof(Elf32_Phdr) ||
+      ehdr.e_phoff > 1024 * 1024 ||
+      (unsigned long)ehdr.e_phnum > ((1024 * 1024UL - (unsigned long)ehdr.e_phoff) / (unsigned long)ehdr.e_phentsize)) {
+    if (out) out->diagnostic = STACKABLE_LINUX_PATCH_VDSO_NOT_ELF; return STACKABLE_LINUX_PATCH_VDSO_NOT_ELF;
+  }
+  unsigned long dyn_off = 0, dyn_size = 0, load_max = 0;
+  for (int i = 0; i < ehdr.e_phnum; i++) {
+    Elf32_Phdr phdr; memcpy(&phdr, base + ehdr.e_phoff + (size_t)i * ehdr.e_phentsize, sizeof(phdr));
+    if (phdr.p_type == PT_DYNAMIC) { dyn_off = phdr.p_offset; dyn_size = phdr.p_filesz; }
+    if (phdr.p_type == PT_LOAD) {
+      unsigned long end = (unsigned long)phdr.p_vaddr + (unsigned long)phdr.p_memsz;
+      if (end < (unsigned long)phdr.p_vaddr || end > 1024 * 1024UL) { if (out) out->diagnostic = STACKABLE_LINUX_PATCH_VDSO_NOT_ELF; return STACKABLE_LINUX_PATCH_VDSO_NOT_ELF; }
+      if (end > load_max) load_max = end;
+    }
+  }
+  if (load_max == 0 || load_max > 1024 * 1024UL) { if (out) out->diagnostic = STACKABLE_LINUX_PATCH_VDSO_NOT_ELF; return STACKABLE_LINUX_PATCH_VDSO_NOT_ELF; }
+  if (base_addr + load_max <= base_addr) { if (out) out->diagnostic = STACKABLE_LINUX_PATCH_VDSO_NOT_ELF; return STACKABLE_LINUX_PATCH_VDSO_NOT_ELF; }
+  if (out) { out->load_max_address = load_max; out->length = load_max; }
+  if (dyn_off == 0 || dyn_size == 0 || !stackable_linux_vdso_offset_range(dyn_off, sizeof(Elf32_Dyn), load_max)) {
+    if (out) out->diagnostic = STACKABLE_LINUX_PATCH_VDSO_NO_DYNAMIC; return STACKABLE_LINUX_PATCH_VDSO_NO_DYNAMIC;
+  }
+  if (dyn_size > load_max - dyn_off) dyn_size = load_max - dyn_off;
+  unsigned long symtab_v = 0, strtab_v = 0, syment = 0, strsz = 0, hash_v = 0;
+  Elf32_Dyn *dynp = (Elf32_Dyn *)(base + dyn_off);
+  unsigned long dyn_count = dyn_size / sizeof(Elf32_Dyn);
+  for (unsigned long i = 0; i < dyn_count; i++) {
+    Elf32_Dyn d; memcpy(&d, &dynp[i], sizeof(d));
+    if (d.d_tag == DT_NULL) break;
+    switch (d.d_tag) {
+      case DT_SYMTAB: symtab_v = d.d_un.d_ptr; break;
+      case DT_STRTAB: strtab_v = d.d_un.d_ptr; break;
+      case DT_SYMENT: syment = d.d_un.d_val; break;
+      case DT_STRSZ: strsz = d.d_un.d_val; break;
+      case DT_HASH: hash_v = d.d_un.d_ptr; break;
+      default: break;
+    }
+  }
+  if (symtab_v == 0 || strtab_v == 0 || syment < sizeof(Elf32_Sym) || strsz == 0 || strsz > load_max) {
+    if (out) out->diagnostic = STACKABLE_LINUX_PATCH_VDSO_NO_SYMBOL_TABLE; return STACKABLE_LINUX_PATCH_VDSO_NO_SYMBOL_TABLE;
+  }
+  unsigned long symtab_p = stackable_linux_vdso_ptr_value(symtab_v, base_addr, load_max);
+  unsigned long strtab_p = stackable_linux_vdso_ptr_value(strtab_v, base_addr, load_max);
+  if (!stackable_linux_range_contains(base_addr, load_max, strtab_p, strsz) ||
+      !stackable_linux_range_contains(base_addr, load_max, symtab_p, sizeof(Elf32_Sym))) {
+    if (out) out->diagnostic = STACKABLE_LINUX_PATCH_VDSO_NO_SYMBOL_TABLE; return STACKABLE_LINUX_PATCH_VDSO_NO_SYMBOL_TABLE;
+  }
+  unsigned long symcount = 256;
+  if (hash_v != 0) {
+    unsigned long hash_p = stackable_linux_vdso_ptr_value(hash_v, base_addr, load_max);
+    if (stackable_linux_range_contains(base_addr, load_max, hash_p, 2 * sizeof(uint32_t))) {
+      uint32_t nchain = 0; memcpy(&nchain, (void *)(uintptr_t)(hash_p + sizeof(uint32_t)), sizeof(nchain));
+      if (nchain > 0) symcount = nchain;
+    }
+  } else if (strtab_p > symtab_p && ((strtab_p - symtab_p) % syment) == 0) {
+    symcount = (strtab_p - symtab_p) / syment;
+  }
+  unsigned long max_by_range = (base_addr + load_max - symtab_p) / syment;
+  if (symcount > max_by_range) symcount = max_by_range;
+  if (symcount == 0 || symcount > 4096) { if (out) out->diagnostic = STACKABLE_LINUX_PATCH_VDSO_NO_SYMBOL_TABLE; return STACKABLE_LINUX_PATCH_VDSO_NO_SYMBOL_TABLE; }
+  if (out) {
+    out->diagnostic = STACKABLE_LINUX_PATCH_OK;
+    out->dynamic_address = base_addr + dyn_off;
+    out->symbol_table = symtab_p; out->string_table = strtab_p;
+    out->symbol_entry_size = syment; out->symbol_count = symcount;
+    out->string_table_size = strsz;
+  }
+  return STACKABLE_LINUX_PATCH_OK;
+}
+
+int stackable_linux_locate_vdso_image(struct stackable_linux_vdso_image *out) {
+  stackable_linux_init_vdso_image(out);
+  unsigned long base = (unsigned long)getauxval(AT_SYSINFO_EHDR);
+  if (base == 0) { if (out) out->diagnostic = STACKABLE_LINUX_PATCH_VDSO_NOT_FOUND; return STACKABLE_LINUX_PATCH_VDSO_NOT_FOUND; }
+  return stackable_linux_parse_vdso_image(base, out);
+}
+int stackable_linux_parse_vdso_image_at(unsigned long base, struct stackable_linux_vdso_image *out) {
+  return stackable_linux_parse_vdso_image(base, out);
+}
+int stackable_linux_resolve_vdso_symbol(struct stackable_linux_vdso_image *image, char *name,
+                                        struct stackable_linux_vdso_symbol *out) {
+  if (out) memset(out, 0, sizeof(*out));
+  if (image == NULL || name == NULL || name[0] == '\0') { if (out) out->diagnostic = STACKABLE_LINUX_PATCH_INVALID_ARGUMENT; return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT; }
+  if (image->diagnostic != STACKABLE_LINUX_PATCH_OK || image->base == 0 || image->symbol_table == 0 ||
+      image->string_table == 0 || image->symbol_entry_size == 0 || image->string_table_size == 0) {
+    if (out) out->diagnostic = STACKABLE_LINUX_PATCH_VDSO_NO_SYMBOL_TABLE; return STACKABLE_LINUX_PATCH_VDSO_NO_SYMBOL_TABLE;
+  }
+  size_t nlen = strlen(name);
+  unsigned long symcount = image->symbol_count;
+  if (symcount == 0 || symcount > 4096) symcount = 256;
+  for (unsigned long i = 0; i < symcount; i++) {
+    unsigned long sym_addr = image->symbol_table + i * image->symbol_entry_size;
+    if (!stackable_linux_range_contains(image->base, image->length, sym_addr, sizeof(Elf32_Sym))) break;
+    Elf32_Sym sym; memcpy(&sym, (void *)(uintptr_t)sym_addr, sizeof(sym));
+    if (sym.st_name == 0 || sym.st_name >= image->string_table_size) continue;
+    const char *sname = (const char *)(uintptr_t)(image->string_table + sym.st_name);
+    size_t maxlen = image->string_table_size - sym.st_name;
+    if (strnlen(sname, maxlen) >= maxlen) continue;
+    if (strlen(sname) != nlen) continue;
+    if (memcmp(sname, name, nlen) != 0) continue;
+    unsigned long value = (unsigned long)sym.st_value;
+    unsigned long addr = stackable_linux_vdso_ptr_value(value, image->base, image->load_max_address);
+    if (!stackable_linux_range_contains(image->base, image->length, addr, 1)) continue;
+    if (out) { out->diagnostic = STACKABLE_LINUX_PATCH_OK; out->address = addr; out->size = sym.st_size;
+               out->info = sym.st_info; out->other = sym.st_other; out->section_index = sym.st_shndx; }
+    return STACKABLE_LINUX_PATCH_OK;
+  }
+  if (out) out->diagnostic = STACKABLE_LINUX_PATCH_VDSO_SYMBOL_NOT_FOUND;
+  return STACKABLE_LINUX_PATCH_VDSO_SYMBOL_NOT_FOUND;
+}
+
+static void stackable_linux_init_vdso_patch_result(struct stackable_linux_vdso_patch_result *out,
+    struct stackable_linux_vdso_image *image, void *replacement) {
+  if (out == NULL) return;
+  memset(out, 0, sizeof(*out));
+  out->diagnostic = STACKABLE_LINUX_PATCH_OK;
+  out->direct_diagnostic = STACKABLE_LINUX_PATCH_OK;
+  out->overlay_diagnostic = STACKABLE_LINUX_PATCH_OK;
+  out->image_base = image ? image->base : 0;
+  out->image_length = image ? image->length : 0;
+  out->replacement = (unsigned long)(uintptr_t)replacement;
+}
+
+int stackable_linux_vdso_overlay_patch_tx(unsigned long image_base, unsigned long image_len,
+    void *target, void *replacement, struct stackable_linux_vdso_patch_result *out) {
+  struct stackable_linux_vdso_image image; memset(&image, 0, sizeof(image));
+  image.base = image_base; image.length = image_len; image.diagnostic = STACKABLE_LINUX_PATCH_OK;
+  stackable_linux_init_vdso_patch_result(out, &image, replacement);
+  if (out) out->path = 2;
+  if (image_base == 0 || image_len == 0 || target == NULL || replacement == NULL) { if (out) out->diagnostic = STACKABLE_LINUX_PATCH_INVALID_ARGUMENT; return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT; }
+  uintptr_t b = (uintptr_t)image_base, stop = b + (uintptr_t)image_len, t = (uintptr_t)target;
+  if (stop <= b || t < b || t + STACKABLE_ARM_JUMP_SIZE > stop || (t & 0x3u) != 0) { if (out) out->diagnostic = STACKABLE_LINUX_PATCH_INVALID_ARGUMENT; return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT; }
+  long ps = sysconf(_SC_PAGESIZE); if (ps <= 0) ps = 4096;
+  uintptr_t pm = (uintptr_t)(ps - 1);
+  if ((b & pm) != 0 || (stop & pm) != 0) { if (out) out->diagnostic = STACKABLE_LINUX_PATCH_INVALID_ARGUMENT; return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT; }
+  uintptr_t ab = b & ~pm, ae = (stop + pm) & ~pm; size_t span = (size_t)(ae - ab);
+  if (span == 0 || span > (size_t)(1024 * 1024)) { if (out) out->diagnostic = STACKABLE_LINUX_PATCH_INVALID_ARGUMENT; return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT; }
+  unsigned char *snap = (unsigned char *)malloc(span);
+  if (snap == NULL) { if (out) { out->diagnostic = STACKABLE_LINUX_PATCH_VDSO_OVERLAY_FAILED; out->overlay_diagnostic = STACKABLE_LINUX_PATCH_VDSO_OVERLAY_FAILED; out->os_errno = ENOMEM; } return STACKABLE_LINUX_PATCH_VDSO_OVERLAY_FAILED; }
+  memcpy(snap, (void *)ab, span);
+  long mapped = stackable_linux_raw_mmap((void *)ab, span, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (mapped < 0 || (uintptr_t)mapped != ab) { if (out) { out->diagnostic = STACKABLE_LINUX_PATCH_VDSO_OVERLAY_FAILED; out->overlay_diagnostic = STACKABLE_LINUX_PATCH_VDSO_OVERLAY_FAILED; out->os_errno = mapped < 0 ? (int)(-mapped) : EINVAL; } free(snap); return STACKABLE_LINUX_PATCH_VDSO_OVERLAY_FAILED; }
+  memcpy((void *)ab, snap, span); free(snap);
+  stackable_linux_arm_write_abs_jump((unsigned char *)target, replacement);
+  __builtin___clear_cache((char *)target, (char *)target + STACKABLE_ARM_JUMP_SIZE);
+  long pr = stackable_linux_raw_mprotect(ab, span, PROT_READ | PROT_EXEC);
+  if (pr < 0 && out) out->os_errno = (int)(-pr);
+  if (out) { out->diagnostic = STACKABLE_LINUX_PATCH_OK; out->overlay_diagnostic = STACKABLE_LINUX_PATCH_OK; out->path = 2; out->patch_live = 1; out->overlay_used = 1; out->symbol_address = (unsigned long)(uintptr_t)target; }
+  return STACKABLE_LINUX_PATCH_OK;
+}
+
+int stackable_linux_vdso_patch_symbol_tx(struct stackable_linux_vdso_image *image, char *name,
+    void *replacement, int allow_overlay, struct stackable_linux_vdso_patch_result *out) {
+  stackable_linux_init_vdso_patch_result(out, image, replacement);
+  if (image == NULL || name == NULL || name[0] == '\0' || replacement == NULL) { if (out) out->diagnostic = STACKABLE_LINUX_PATCH_INVALID_ARGUMENT; return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT; }
+  if (image->diagnostic != STACKABLE_LINUX_PATCH_OK) { if (out) out->diagnostic = image->diagnostic; return image->diagnostic; }
+  struct stackable_linux_vdso_symbol sym;
+  int rc = stackable_linux_resolve_vdso_symbol(image, name, &sym);
+  if (rc != STACKABLE_LINUX_PATCH_OK) { if (out) out->diagnostic = rc; return rc; }
+  if (out) out->symbol_address = sym.address;
+  /* A vDSO symbol in Thumb state (bit0 set) cannot host an A32 body jump. */
+  if ((sym.address & 0x3u) != 0 ||
+      !stackable_linux_range_contains(image->base, image->length, sym.address, STACKABLE_ARM_JUMP_SIZE)) {
+    if (out) out->diagnostic = STACKABLE_LINUX_PATCH_INVALID_ARGUMENT; return STACKABLE_LINUX_PATCH_INVALID_ARGUMENT;
+  }
+  struct stackable_linux_patch_result direct; memset(&direct, 0, sizeof(direct));
+  rc = stackable_linux_patch_absolute_jump_tx((void *)(uintptr_t)sym.address, replacement, 1, &direct);
+  if (out) { out->direct = direct; out->direct_diagnostic = direct.diagnostic; }
+  if (rc == STACKABLE_LINUX_PATCH_OK || (rc == STACKABLE_LINUX_PATCH_POST_MPROTECT_BACK_FAILED && direct.patch_live)) {
+    if (out) { out->diagnostic = STACKABLE_LINUX_PATCH_OK; out->path = 1; out->patch_live = 1; out->os_errno = direct.os_errno; }
+    return STACKABLE_LINUX_PATCH_OK;
+  }
+  if (!allow_overlay) { if (out) { out->diagnostic = STACKABLE_LINUX_PATCH_VDSO_DIRECT_PATCH_FAILED; out->os_errno = direct.os_errno; out->patch_live = direct.patch_live; } return STACKABLE_LINUX_PATCH_VDSO_DIRECT_PATCH_FAILED; }
+  struct stackable_linux_vdso_patch_result overlay; memset(&overlay, 0, sizeof(overlay));
+  rc = stackable_linux_vdso_overlay_patch_tx(image->base, image->length, (void *)(uintptr_t)sym.address, replacement, &overlay);
+  if (out) { out->overlay_diagnostic = overlay.diagnostic; out->os_errno = overlay.os_errno; out->path = overlay.path; out->patch_live = overlay.patch_live; out->overlay_used = overlay.overlay_used; }
+  if (rc == STACKABLE_LINUX_PATCH_OK) { if (out) out->diagnostic = STACKABLE_LINUX_PATCH_OK; return STACKABLE_LINUX_PATCH_OK; }
+  if (out) out->diagnostic = STACKABLE_LINUX_PATCH_VDSO_OVERLAY_FAILED;
+  return STACKABLE_LINUX_PATCH_VDSO_OVERLAY_FAILED;
+}
+""".}
+
+  proc cRawSyscall6(nr, a1, a2, a3, a4, a5, a6: clong): clong
+    {.importc: "stackable_linux_raw_syscall6", cdecl.}
+  proc cStaticRawSyscall6(nr, a1, a2, a3, a4, a5, a6: clong): clong
+    {.importc: "stackable_linux_static_raw_syscall6", cdecl.}
+  proc cResolveDefaultSymbol(name: cstring): pointer
+    {.importc: "stackable_linux_resolve_default_symbol", cdecl.}
+  proc cOpenLibraryNoLoad(soname: cstring): pointer
+    {.importc: "stackable_linux_open_library_noload", cdecl.}
+  proc cResolveSymbolInHandle(handle: pointer; name: cstring): pointer
+    {.importc: "stackable_linux_resolve_symbol_in_handle", cdecl.}
+  proc cPatchAbsoluteJumpTx(target, replacement: pointer; captureRestore: cint;
+                            outResult: ptr CStackableLinuxPatchResult): cint
+    {.importc: "stackable_linux_patch_absolute_jump_tx", cdecl.}
+  proc cRestoreAbsoluteJump(target: pointer; saved14: ptr byte; outErrno: ptr cint): cint
+    {.importc: "stackable_linux_restore_absolute_jump", cdecl.}
+  proc cAddrInExecutableSegment(address: culong): cint
+    {.importc: "stackable_linux_addr_in_executable_segment", cdecl.}
+  proc cPatchInt3SyscallTx(target: pointer; outResult: ptr CStackableLinuxInt3PatchResult): cint
+    {.importc: "stackable_linux_patch_int3_syscall_tx", cdecl.}
+  proc cPatchInt3SyscallTxFixedPage(target: pointer; pageSize: culong;
+                                    outResult: ptr CStackableLinuxInt3PatchResult): cint
+    {.importc: "stackable_linux_patch_int3_syscall_tx_fixed_page", cdecl.}
+  proc cRestoreInt3Syscall(target: pointer; originalFirstByte: byte; outErrno: ptr cint): cint
+    {.importc: "stackable_linux_restore_int3_syscall", cdecl.}
+  proc cCaptureSyscallRegsFromUcontext(ucontext: pointer; outRegs: ptr CStackableLinuxSyscallRegs): cint
+    {.importc: "stackable_linux_capture_syscall_regs_from_ucontext", cdecl.}
+  proc cWriteSyscallResultToUcontext(ucontext: pointer; result: clong; resumeRip: culong): cint
+    {.importc: "stackable_linux_write_syscall_result_to_ucontext", cdecl.}
+  proc cReplaySyscallRegs(regs: ptr CStackableLinuxSyscallRegs): clong
+    {.importc: "stackable_linux_replay_syscall_regs", cdecl.}
+  proc cInstallSigtrapHandler(handler: pointer; extraFlags: cint): cint
+    {.importc: "stackable_linux_install_sigtrap_handler", cdecl.}
+  proc cUninstallSigtrapHandler(): cint
+    {.importc: "stackable_linux_uninstall_sigtrap_handler", cdecl.}
+  proc cChainSigtrap(signum: cint; siginfo: pointer; ucontext: pointer): cint
+    {.importc: "stackable_linux_chain_sigtrap", cdecl.}
+  proc cLocateVdsoImage(outImage: ptr CStackableLinuxVdsoImage): cint
+    {.importc: "stackable_linux_locate_vdso_image", cdecl.}
+  proc cParseVdsoImageAt(base: culong; outImage: ptr CStackableLinuxVdsoImage): cint
+    {.importc: "stackable_linux_parse_vdso_image_at", cdecl.}
+  proc cResolveVdsoSymbol(image: ptr CStackableLinuxVdsoImage; name: cstring;
+                          outSymbol: ptr CStackableLinuxVdsoSymbol): cint
+    {.importc: "stackable_linux_resolve_vdso_symbol", cdecl.}
+  proc cVdsoOverlayPatchTx(imageBase, imageLen: culong; target, replacement: pointer;
+                           outResult: ptr CStackableLinuxVdsoPatchResult): cint
+    {.importc: "stackable_linux_vdso_overlay_patch_tx", cdecl.}
+  proc cVdsoPatchSymbolTx(image: ptr CStackableLinuxVdsoImage; name: cstring;
+                          replacement: pointer; allowOverlay: cint;
+                          outResult: ptr CStackableLinuxVdsoPatchResult): cint
+    {.importc: "stackable_linux_vdso_patch_symbol_tx", cdecl.}
+
 proc rawSyscall6*(nr, a1, a2, a3, a4, a5, a6: int): int =
   ## Issue a Linux x86_64 raw syscall using the kernel calling convention.
   ## Unsupported platforms return `-38` (`ENOSYS`) instead of silently
   ## pretending success.
-  when defined(linux) and defined(amd64):
+  when defined(linux) and (defined(amd64) or defined(arm)):
     int(cRawSyscall6(clong(nr), clong(a1), clong(a2), clong(a3), clong(a4),
                      clong(a5), clong(a6)))
   else:
@@ -2515,7 +3355,7 @@ proc staticRawSyscall6*(nr, a1, a2, a3, a4, a5, a6: int): int =
   ## C ABI raw syscall entry intended for static-runtime/no-libc helper code.
   ## It has the same raw-kernel-result contract as `rawSyscall6`; the separate
   ## symbol lets C consumers avoid linking against libc's `syscall` wrapper.
-  when defined(linux) and defined(amd64):
+  when defined(linux) and (defined(amd64) or defined(arm)):
     int(cStaticRawSyscall6(clong(nr), clong(a1), clong(a2), clong(a3),
                            clong(a4), clong(a5), clong(a6)))
   else:
@@ -2545,7 +3385,7 @@ proc resolveDefaultSymbol*(name: cstring): pointer =
   ## belongs to libc, vDSO, or another interpose target set.
   if linuxRawSyscallSupported() != lrsOk or name == nil:
     return nil
-  when defined(linux) and defined(amd64):
+  when defined(linux) and (defined(amd64) or defined(arm)):
     cResolveDefaultSymbol(name)
   else:
     nil
@@ -2556,7 +3396,7 @@ proc openLibraryNoLoad*(soname: cstring): pointer =
   ## building block needed for resolver chains.
   if linuxRawSyscallSupported() != lrsOk or soname == nil:
     return nil
-  when defined(linux) and defined(amd64):
+  when defined(linux) and (defined(amd64) or defined(arm)):
     cOpenLibraryNoLoad(soname)
   else:
     nil
@@ -2566,7 +3406,7 @@ proc resolveSymbolInHandle*(handle: pointer; name: cstring): pointer =
   ## `RTLD_DEFAULT`, matching `dlsym`'s conventional resolver sentinel.
   if linuxRawSyscallSupported() != lrsOk or name == nil:
     return nil
-  when defined(linux) and defined(amd64):
+  when defined(linux) and (defined(amd64) or defined(arm)):
     cResolveSymbolInHandle(handle, name)
   else:
     nil
@@ -2634,7 +3474,7 @@ proc toPatchStage(stage: cint): LinuxPatchStage {.used.} =
   else: lpsNone
 
 proc fromCTransaction(cres: CStackableLinuxPatchResult): LinuxPatchTransaction {.used.} =
-  when defined(linux) and defined(amd64):
+  when defined(linux) and (defined(amd64) or defined(arm)):
     result.handle.target = cast[pointer](cres.target)
     result.handle.replacement = cast[pointer](cres.replacement)
     result.handle.patchSize = int(cres.patchSize)
@@ -2663,7 +3503,7 @@ proc fromCTrampoline(cres: CStackableLinuxTrampolineResult): LinuxOriginalTrampo
     discard
 
 proc fromCInt3Transaction(cres: CStackableLinuxInt3PatchResult): LinuxInt3PatchTransaction {.used.} =
-  when defined(linux) and defined(amd64):
+  when defined(linux) and (defined(amd64) or defined(arm)):
     result.handle.target = cast[pointer](cres.target)
     result.handle.originalFirstByte = cres.originalFirstByte
     result.handle.secondByte = cres.secondByte
@@ -2679,7 +3519,7 @@ proc fromCInt3Transaction(cres: CStackableLinuxInt3PatchResult): LinuxInt3PatchT
     discard
 
 proc fromCSyscallRegs(cres: CStackableLinuxSyscallRegs): LinuxX8664SyscallRegisters {.used.} =
-  when defined(linux) and defined(amd64):
+  when defined(linux) and (defined(amd64) or defined(arm)):
     result.syscallNumber = int(cres.nr)
     for i in 0 ..< 6:
       result.args[i] = int(cres.args[i])
@@ -2691,7 +3531,7 @@ proc fromCSyscallRegs(cres: CStackableLinuxSyscallRegs): LinuxX8664SyscallRegist
     discard
 
 proc toCSyscallRegs(regs: LinuxX8664SyscallRegisters): CStackableLinuxSyscallRegs {.used.} =
-  when defined(linux) and defined(amd64):
+  when defined(linux) and (defined(amd64) or defined(arm)):
     result.nr = clong(regs.syscallNumber)
     for i in 0 ..< 6:
       result.args[i] = clong(regs.args[i])
@@ -2718,7 +3558,7 @@ proc fromCCloneContinuation(cres: CStackableLinuxCloneContinuation):
     discard
 
 proc fromCVdsoImage(cres: CStackableLinuxVdsoImage): LinuxVdsoImage {.used.} =
-  when defined(linux) and defined(amd64):
+  when defined(linux) and (defined(amd64) or defined(arm)):
     result.base = cast[pointer](cres.base)
     result.length = int(cres.length)
     result.loadMaxAddress = uint(cres.loadMaxAddress)
@@ -2734,7 +3574,7 @@ proc fromCVdsoImage(cres: CStackableLinuxVdsoImage): LinuxVdsoImage {.used.} =
     discard
 
 proc toCVdsoImage(image: LinuxVdsoImage): CStackableLinuxVdsoImage {.used.} =
-  when defined(linux) and defined(amd64):
+  when defined(linux) and (defined(amd64) or defined(arm)):
     result.diagnostic = cint(ord(image.diagnostic))
     result.osErrno = image.osErrno
     result.base = culong(cast[uint](image.base))
@@ -2751,7 +3591,7 @@ proc toCVdsoImage(image: LinuxVdsoImage): CStackableLinuxVdsoImage {.used.} =
 
 proc fromCVdsoSymbol(cres: CStackableLinuxVdsoSymbol;
                      name: cstring): LinuxVdsoSymbol {.used.} =
-  when defined(linux) and defined(amd64):
+  when defined(linux) and (defined(amd64) or defined(arm)):
     result.name = if name == nil: "" else: $name
     result.address = cast[pointer](cres.address)
     result.size = int(cres.size)
@@ -2765,7 +3605,7 @@ proc fromCVdsoSymbol(cres: CStackableLinuxVdsoSymbol;
 proc fromCVdsoPatch(cres: CStackableLinuxVdsoPatchResult;
                     image: LinuxVdsoImage;
                     name: cstring): LinuxVdsoPatchTransaction {.used.} =
-  when defined(linux) and defined(amd64):
+  when defined(linux) and (defined(amd64) or defined(arm)):
     result.image = image
     result.symbol = LinuxVdsoSymbol(
       name: if name == nil: "" else: $name,
@@ -2854,7 +3694,7 @@ proc installAbsoluteJumpPatchTransaction*(target, replacement: pointer;
     result.diagnostic = support
     result.handle.diagnostic = support
     return
-  when defined(linux) and defined(amd64):
+  when defined(linux) and (defined(amd64) or defined(arm)):
     var cres: CStackableLinuxPatchResult
     discard cPatchAbsoluteJumpTx(target, replacement,
                                  if captureRestoreBytes: 1 else: 0,
@@ -2872,7 +3712,7 @@ proc locateLinuxVdsoImage*(): LinuxVdsoImage =
   if support != lrsOk:
     result.diagnostic = support
     return
-  when defined(linux) and defined(amd64):
+  when defined(linux) and (defined(amd64) or defined(arm)):
     var cimage: CStackableLinuxVdsoImage
     discard cLocateVdsoImage(addr cimage)
     result = fromCVdsoImage(cimage)
@@ -2890,7 +3730,7 @@ proc parseLinuxVdsoImageAt*(base: pointer): LinuxVdsoImage =
   if base == nil:
     result.diagnostic = lrsVdsoNotFound
     return
-  when defined(linux) and defined(amd64):
+  when defined(linux) and (defined(amd64) or defined(arm)):
     var cimage: CStackableLinuxVdsoImage
     discard cParseVdsoImageAt(culong(cast[uint](base)), addr cimage)
     result = fromCVdsoImage(cimage)
@@ -2909,7 +3749,7 @@ proc resolveLinuxVdsoSymbol*(image: LinuxVdsoImage;
   if name == nil:
     result.diagnostic = lrsInvalidArgument
     return
-  when defined(linux) and defined(amd64):
+  when defined(linux) and (defined(amd64) or defined(arm)):
     var cimage = toCVdsoImage(image)
     var csym: CStackableLinuxVdsoSymbol
     discard cResolveVdsoSymbol(addr cimage, name, addr csym)
@@ -2929,7 +3769,7 @@ proc installLinuxVdsoOverlayPatchTransaction*(imageBase: pointer;
     result.diagnostic = support
     result.overlayDiagnostic = support
     return
-  when defined(linux) and defined(amd64):
+  when defined(linux) and (defined(amd64) or defined(arm)):
     var cres: CStackableLinuxVdsoPatchResult
     discard cVdsoOverlayPatchTx(culong(cast[uint](imageBase)),
                                 culong(imageLength), target, replacement,
@@ -2956,7 +3796,7 @@ proc installLinuxVdsoSymbolPatchTransaction*(image: LinuxVdsoImage;
   if support != lrsOk:
     result.diagnostic = support
     return
-  when defined(linux) and defined(amd64):
+  when defined(linux) and (defined(amd64) or defined(arm)):
     var cimage = toCVdsoImage(image)
     var cres: CStackableLinuxVdsoPatchResult
     discard cVdsoPatchSymbolTx(addr cimage, name, replacement,
@@ -2972,7 +3812,7 @@ proc classifyLinuxX8664AtomicWindow*(bytes: openArray[byte]):
   ## instrumentation: LOCK-prefixed memory RMW instructions, implicit-lock
   ## memory XCHG, and MFENCE/SFENCE/LFENCE. This is not a complete decoder;
   ## ambiguous or unsupported windows return `lrsUnsupportedInstruction`.
-  let support = linuxRawSyscallSupported()
+  let support = linuxX8664RawSyscallSupported()
   result.modrmOffset = -1
   result.opcodeOffset = -1
   if support != lrsOk:
@@ -2996,7 +3836,7 @@ proc selectLinuxAtomicPatchStrategy*(target: uint;
   ## Select the generic POSIX atomic callsite patch shape. A 5-byte JMP-rel32
   ## is selected only when the original instruction window can host it and the
   ## trampoline is reachable from `target + 5`; otherwise INT3 is selected.
-  let support = linuxRawSyscallSupported()
+  let support = linuxX8664RawSyscallSupported()
   if support != lrsOk:
     result.diagnostic = support
     return
@@ -3019,7 +3859,7 @@ proc allocateLinuxNearTrampoline*(anchor: pointer; length: int):
   ## Allocate a caller-writable mapping near `anchor` where feasible. The helper
   ## owns only allocation/proximity; the caller owns trampoline bytes,
   ## executable-permission hardening, event callbacks, and lifetime policy.
-  let support = linuxRawSyscallSupported()
+  let support = linuxX8664RawSyscallSupported()
   if support != lrsOk:
     result.diagnostic = support
     return
@@ -3036,7 +3876,7 @@ proc freeLinuxNearTrampoline*(allocation: LinuxNearTrampolineAllocation):
   ## Release a mapping returned by `allocateLinuxNearTrampoline`.
   if allocation.address == nil or allocation.length <= 0:
     return lrsInvalidArgument
-  let support = linuxRawSyscallSupported()
+  let support = linuxX8664RawSyscallSupported()
   if support != lrsOk:
     return support
   when defined(linux) and defined(amd64):
@@ -3155,7 +3995,7 @@ proc measureOriginalCallTrampoline*(target: pointer;
   ## copied into an original-call trampoline. This is validation only: no memory
   ## is allocated and unsupported prologues are rejected with
   ## `lrsUnsupportedInstruction`.
-  let support = linuxRawSyscallSupported()
+  let support = linuxX8664RawSyscallSupported()
   if support != lrsOk:
     result.diagnostic = support
     return
@@ -3176,7 +4016,7 @@ proc buildOriginalCallTrampoline*(target: pointer;
   ## instructions, and RIP-relative memory operands are rejected rather than
   ## relocated incorrectly. Successful trampolines append a 14-byte absolute
   ## jump back to `target + copiedLen`.
-  let support = linuxRawSyscallSupported()
+  let support = linuxX8664RawSyscallSupported()
   if support != lrsOk:
     result.diagnostic = support
     return
@@ -3219,7 +4059,7 @@ proc addrInLinuxExecutableSegment*(address: pointer): bool =
   ## or whether they need a stricter libc/vDSO/self-exclusion policy.
   if linuxRawSyscallSupported() != lrsOk or address == nil:
     return false
-  when defined(linux) and defined(amd64):
+  when defined(linux) and (defined(amd64) or defined(arm)):
     cAddrInExecutableSegment(cast[culong](address)) != 0
   else:
     false
@@ -3266,7 +4106,7 @@ proc restoreAbsoluteJumpPatch*(handle: var LinuxPatchHandle): LinuxRawSyscallDia
     else:
       lrsRestoreFailed
   else:
-    linuxRawSyscallSupported()
+    linuxX8664RawSyscallSupported()
 
 proc addLinuxInt3Callsite*(table: var LinuxInt3CallsiteTable;
                            address: uint;
@@ -3322,7 +4162,7 @@ proc installInt3SyscallPatchTransaction*(target: pointer): LinuxInt3PatchTransac
     result.diagnostic = support
     result.handle.diagnostic = support
     return
-  when defined(linux) and defined(amd64):
+  when defined(linux) and (defined(amd64) or defined(arm)):
     var cres: CStackableLinuxInt3PatchResult
     discard cPatchInt3SyscallTx(target, addr cres)
     result = fromCInt3Transaction(cres)
@@ -3339,7 +4179,7 @@ proc installInt3SyscallPatchTransaction*(target: pointer; pageSize: uint):
     result.diagnostic = support
     result.handle.diagnostic = support
     return
-  when defined(linux) and defined(amd64):
+  when defined(linux) and (defined(amd64) or defined(arm)):
     var cres: CStackableLinuxInt3PatchResult
     discard cPatchInt3SyscallTxFixedPage(target, culong(pageSize), addr cres)
     result = fromCInt3Transaction(cres)
@@ -3353,7 +4193,7 @@ proc restoreInt3SyscallPatch*(handle: var LinuxInt3PatchHandle): LinuxRawSyscall
     return handle.diagnostic
   if not handle.active:
     return lrsInvalidArgument
-  when defined(linux) and defined(amd64):
+  when defined(linux) and (defined(amd64) or defined(arm)):
     var osErr: cint
     let rc = cRestoreInt3Syscall(handle.target, handle.originalFirstByte, addr osErr)
     handle.osErrno = osErr
@@ -3373,7 +4213,7 @@ proc captureLinuxX8664SyscallRegisters*(ucontext: pointer):
   let support = linuxRawSyscallSupported()
   if support != lrsOk:
     return (support, LinuxX8664SyscallRegisters())
-  when defined(linux) and defined(amd64):
+  when defined(linux) and (defined(amd64) or defined(arm)):
     var cres: CStackableLinuxSyscallRegs
     let rc = cCaptureSyscallRegsFromUcontext(ucontext, addr cres)
     (toDiagnostic(rc), fromCSyscallRegs(cres))
@@ -3388,7 +4228,7 @@ proc writeLinuxX8664SyscallResult*(ucontext: pointer; resultValue: int;
   let support = linuxRawSyscallSupported()
   if support != lrsOk:
     return support
-  when defined(linux) and defined(amd64):
+  when defined(linux) and (defined(amd64) or defined(arm)):
     toDiagnostic(cWriteSyscallResultToUcontext(
       ucontext, clong(resultValue), culong(resumeRip)))
   else:
@@ -3400,7 +4240,7 @@ proc replayLinuxX8664SyscallRegisters*(regs: LinuxX8664SyscallRegisters): int =
   ## safe to replay this way.
   if linuxRawSyscallSupported() != lrsOk:
     return -38
-  when defined(linux) and defined(amd64):
+  when defined(linux) and (defined(amd64) or defined(arm)):
     var cregs: CStackableLinuxSyscallRegs
     cregs.nr = clong(regs.syscallNumber)
     for i in 0 ..< 6:
@@ -3457,7 +4297,7 @@ proc computeLinuxX8664CloneContinuation*(regs: LinuxX8664SyscallRegisters;
   ## decide whether the clone path should be used. Parent handling writes
   ## `parentResult` into RAX and resumes at `regs.resumeRip`; child handling
   ## must arrange RAX=0 and jump directly to the same user-code resume RIP.
-  let support = linuxRawSyscallSupported()
+  let support = linuxX8664RawSyscallSupported()
   if support != lrsOk:
     return (support, LinuxX8664CloneContinuation())
   when defined(linux) and defined(amd64):
@@ -3487,7 +4327,7 @@ proc installLinuxSigtrapHandler*(handler: pointer; extraFlags: cint = 0):
   let support = linuxRawSyscallSupported()
   if support != lrsOk:
     return support
-  when defined(linux) and defined(amd64):
+  when defined(linux) and (defined(amd64) or defined(arm)):
     toDiagnostic(cInstallSigtrapHandler(handler, extraFlags))
   else:
     support
@@ -3497,7 +4337,7 @@ proc uninstallLinuxSigtrapHandler*(): LinuxRawSyscallDiagnostic =
   let support = linuxRawSyscallSupported()
   if support != lrsOk:
     return support
-  when defined(linux) and defined(amd64):
+  when defined(linux) and (defined(amd64) or defined(arm)):
     toDiagnostic(cUninstallSigtrapHandler())
   else:
     support
@@ -3509,7 +4349,7 @@ proc chainLinuxSigtrap*(signum: cint; siginfo: pointer; ucontext: pointer):
   let support = linuxRawSyscallSupported()
   if support != lrsOk:
     return support
-  when defined(linux) and defined(amd64):
+  when defined(linux) and (defined(amd64) or defined(arm)):
     toDiagnostic(cChainSigtrap(signum, siginfo, ucontext))
   else:
     support
@@ -3573,6 +4413,33 @@ proc visitLinuxX8664SyscallBytes*(bytes: openArray[byte];
     else:
       inc i
 
+proc looksLikeLinuxArmSvcSite*(bytes: openArray[byte]; offset: int): bool =
+  ## True when a word-aligned ARM (A32) `svc #0` (`0xef000000`, little-endian
+  ## bytes `00 00 00 ef`) begins at `offset`. This is the only encoding the
+  ## live ARM scanner reports: the EABI syscall number is in r7, so the svc
+  ## immediate is always 0 and the instruction is a fixed word. A halfword
+  ## Thumb `svc #0` scan is deliberately NOT offered as an automatic site
+  ## predicate — `0xdf00` is a common Thumb-2 instruction half and, without a
+  ## linear-sweep decoder, scanning for it is not instruction-boundary sound.
+  ## The Thumb svc -> UDF PATCH is still supported for an explicitly supplied
+  ## site (`installInt3SyscallPatchTransaction` self-detects the width).
+  if offset < 0 or (offset and 0x3) != 0 or offset + 4 > bytes.len:
+    return false
+  bytes[offset] == 0x00'u8 and bytes[offset + 1] == 0x00'u8 and
+    bytes[offset + 2] == 0x00'u8 and bytes[offset + 3] == 0xef'u8
+
+proc scanLinuxArmSvcBytes*(bytes: openArray[byte];
+                           baseAddress: uint = 0): seq[LinuxSyscallSite] =
+  ## Word-aligned scan of a controlled byte slice for ARM `svc #0` sites.
+  ## Exposed for deterministic tests; the live path uses
+  ## `visitLinuxX8664SyscallMemory`.
+  var i = 0
+  while i + 4 <= bytes.len:
+    if looksLikeLinuxArmSvcSite(bytes, i):
+      result.add LinuxSyscallSite(address: baseAddress + uint(i), offset: i,
+        nextByte: 0'u8)
+    inc i, 4
+
 when defined(linux) and defined(amd64):
   # FUP-H — reuse the (portable, length-only) x86-64 instruction-length
   # decoder from the inline-hook backend to give the LIVE syscall-site
@@ -3628,6 +4495,27 @@ proc visitLinuxX8664SyscallMemory*(start: pointer; length: int;
         if not keepGoing:
           return
       inc i, ilen
+  elif defined(linux) and defined(arm):
+    # ARM (A32) word-aligned `svc #0` scan. Every ARM instruction is a 4-byte
+    # word, so a word-aligned `0xef000000` is at an instruction boundary; the
+    # only residual false positive is a literal-pool constant equal to that
+    # word, which the subsequent `installInt3SyscallPatchTransaction` re-reads
+    # and which, even if patched, is still a `svc`-shaped word (see the ARM
+    # `{.emit.}` note). Thumb-state `svc` is NOT scanned here (not boundary
+    # sound without a decoder); the patch path supports an explicit Thumb site.
+    if (cast[uint](start) and 0x3) != 0:
+      return
+    let p = cast[ptr UncheckedArray[byte]](start)
+    let base = cast[uint](start)
+    var i = 0
+    while i + 4 <= length:
+      if p[i] == 0x00'u8 and p[i + 1] == 0x00'u8 and
+          p[i + 2] == 0x00'u8 and p[i + 3] == 0xef'u8:
+        let keepGoing = visitor LinuxSyscallSite(
+          address: base + uint(i), offset: i, nextByte: 0'u8)
+        if not keepGoing:
+          return
+      inc i, 4
 
 proc visitLinuxExecutableMappingSyscalls*(mapping: LinuxExecutableMapping;
                                           visitor: proc(site: LinuxSyscallSite): bool

@@ -4,6 +4,25 @@
 
 ### Added
 
+- **`platform/linux_image_code_ranges`: the executable-section ranges of a
+  mapped ELF image.** The inline raw-syscall scanner is a linear sweep that
+  stays in sync only over instructions, and an executable `PT_LOAD` routinely
+  holds data too: LLVM BOLT emits `.rodata`, `.eh_frame` and
+  `.gcc_except_table` into its `R E` segment, and GNU ld does the same under
+  `-z noseparate-code`. Sweeping a whole `r-xp` mapping INT3-patched a PIC
+  jump-table entry (`fa 0f 05 fe`) in the upstream Rust 1.94.0
+  `librustc_driver`, and rustc died with SIGILL on any crate with a
+  `macro_rules!`. The new module reads the ELF header, program headers and
+  section headers of the file a mapping names (bounded `pread`s, inode
+  checked against `fstat`), ties the mapping to its executable `PT_LOAD`
+  through the `/proc/self/maps` file offset, and returns the runtime ranges
+  of the `SHF_EXECINSTR` sections inside the mapping with a diagnostic per
+  failure class. `LinuxExecutableMapping` gained `offset`, `device` and
+  `inode`, and `parseLinuxMapsLine` refuses a line whose offset or inode
+  does not parse. A consumer scans those ranges and nothing else, and reports
+  an image whose table cannot be read as unscanned (event loss) instead of
+  sweeping it.
+
 - **32-bit ARM (armhf) raw-syscall substrate.** `platform/linux_raw_syscalls`
   now implements the subset io-mon's Linux shim consumes on ARM EABI as well
   as x86-64, behind the same `stackable_linux_*` C ABI and struct contract:
@@ -20,7 +39,7 @@
   discovery of inline Thumb-state syscalls is out of scope (not boundary-sound
   without a decoder), though the patch itself supports an explicit Thumb site.
   Verified on a Raspberry Pi 2 (Raspberry Pi OS 13 armhf): `tests/
-  test_linux_raw_syscalls_armhf.nim`, and a monitored `sh -c "gcc … && ./a"`
+test_linux_raw_syscalls_armhf.nim`, and a monitored `sh -c "gcc … && ./a"`
   through io-mon grading `mcComplete` with zero event loss where it was
   `mcIncomplete` on the two `unsupported-architecture` losses before.
 

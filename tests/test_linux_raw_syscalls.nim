@@ -66,7 +66,7 @@ suite "linux raw syscall primitives":
     check callSites[0].address == 0x200b'u
 
   test "maps parser exposes executable mappings without policy filtering":
-    let line = "7f0000001000-7f0000002000 r-xp 00000000 00:00 0 /tmp/libx.so"
+    let line = "7f0000001000-7f0000002000 r-xp 00001000 fd:01 1234567 /tmp/libx.so"
     let parsed = parseLinuxMapsLine(line)
     check parsed.ok
     check parsed.mapping.start == 0x7f0000001000'u
@@ -76,6 +76,17 @@ suite "linux raw syscall primitives":
     check parsed.mapping.executable
     check parsed.mapping.privateMapping
     check parsed.mapping.path == "/tmp/libx.so"
+    # The file offset, device and inode tie a file-backed mapping to one
+    # PT_LOAD of its image (linux_image_code_ranges).
+    check parsed.mapping.offset == 0x1000'u
+    check parsed.mapping.device == "fd:01"
+    check parsed.mapping.inode == 1234567'u64
+    let anon = parseLinuxMapsLine("7f0000003000-7f0000004000 rwxp 00000000 00:00 0")
+    check anon.ok
+    check anon.mapping.path == ""
+    check anon.mapping.offset == 0'u
+    check anon.mapping.inode == 0'u64
+    check not parseLinuxMapsLine("7f0000003000-7f0000004000 rwxp zz 00:00 0").ok
 
   test "enumerating executable mappings reports support diagnostics":
     let enumerated = enumerateLinuxExecutableMappings()

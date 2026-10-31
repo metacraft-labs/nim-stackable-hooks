@@ -265,6 +265,20 @@ type
     executable*: bool
     privateMapping*: bool
     path*: string
+    offset*: uint
+      ## File offset of the mapping's first byte (`/proc/self/maps` column 3).
+      ## For a file-backed mapping this is what ties the mapping back to one
+      ## `PT_LOAD` of the image, which is how `linux_image_code_ranges` finds
+      ## the load bias and, through it, the image's executable sections.
+    device*: string
+      ## `major:minor` of the backing device as `/proc/self/maps` prints it
+      ## (column 4). Kept as text: on some filesystems (btrfs) it does not
+      ## agree with `stat(2)`'s `st_dev`, so it is informational only.
+    inode*: uint64
+      ## Inode of the backing file (column 5), 0 for anonymous mappings. A
+      ## reader of the image file compares this with `fstat(2)` so that a
+      ## path replaced or deleted since it was mapped is never mistaken for
+      ## the mapped bytes.
 
 type CStackableLinuxPatchResult {.importc: "struct stackable_linux_patch_result",
                                   bycopy.} = object
@@ -4561,6 +4575,16 @@ proc parseLinuxMapsLine*(line: string): tuple[ok: bool, mapping: LinuxExecutable
   result.mapping.writable = parts[1][1] == 'w'
   result.mapping.executable = parts[1][2] == 'x'
   result.mapping.privateMapping = parts[1][3] == 'p'
+  # Columns 3..5 (offset, device, inode) are always present in a kernel-written
+  # line, and a line without them was refused above. A malformed value makes
+  # the whole line unparseable rather than a silent zero, because an `offset`
+  # of 0 would tie the mapping to the wrong `PT_LOAD` of its image.
+  try:
+    result.mapping.offset = parseHexInt(parts[2]).uint
+    result.mapping.inode = uint64(parseBiggestUInt(parts[4]))
+  except ValueError:
+    return (false, LinuxExecutableMapping())
+  result.mapping.device = parts[3]
   result.mapping.path = if parts.len >= 6: parts[5] else: ""
   result.ok = true
 

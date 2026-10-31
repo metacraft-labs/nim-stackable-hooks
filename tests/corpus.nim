@@ -238,6 +238,11 @@ const testCorpus*: seq[TestEntry] = @[
          "process for every target below that is not the host's own."),
 
   # ---- genuinely platform-gated: the source cannot be COMPILED elsewhere
+  TestEntry(stem: "test_linux_image_code_ranges", targets: LinuxOnlyTargets,
+    why: "Opens with `when not defined(linux): {.error.}` and imports " &
+         "stackable_hooks/platform/linux_image_code_ranges, which is itself " &
+         "`{.error.}`-guarded off Linux. Its live arm links a C library " &
+         "with `-z noseparate-code` through the lane's compiler."),
   TestEntry(stem: "test_linux_preload_helpers", targets: LinuxOnlyTargets,
     why: "Opens with `when not defined(linux): {.error.}` and imports " &
          "stackable_hooks/platform/linux_preload, which is itself " &
@@ -311,6 +316,10 @@ const moduleCorpus*: seq[ModuleEntry] = @[
   ModuleEntry(path: "src/stackable_hooks/platform/linux_preload.nim",
     targets: LinuxOnlyTargets,
     why: "`when not defined(linux): {.error.}` module head."),
+  ModuleEntry(path: "src/stackable_hooks/platform/linux_image_code_ranges.nim",
+    targets: LinuxOnlyTargets,
+    why: "`when not defined(linux): {.error.}` module head; reads ELF " &
+         "section tables with std/posix `open`/`fstat`/`pread`."),
   ModuleEntry(path: "src/stackable_hooks/platform/linux_raw_syscalls.nim",
     targets: @[tLinuxAmd64, tLinuxArm64, tMacosArm64, tWindowsAmd64],
     why: "Compiles everywhere; its live body is " &

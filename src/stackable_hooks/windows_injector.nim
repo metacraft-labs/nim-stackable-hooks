@@ -200,6 +200,15 @@ proc GetExitCodeProcess(hProcess: HANDLE, lpExitCode: ptr DWORD): BOOL
   {.importc, stdcall, dynlib: "kernel32".}
 proc TerminateProcess(hProcess: HANDLE, uExitCode: DWORD): BOOL
   {.importc, stdcall, dynlib: "kernel32".}
+# Job Objects. Only the assignment and the membership probe live here: the
+# job itself belongs to the caller, who created it and owns its lifetime.
+# https://learn.microsoft.com/en-us/windows/win32/api/jobapi2/nf-jobapi2-assignprocesstojobobject
+# https://learn.microsoft.com/en-us/windows/win32/api/jobapi/nf-jobapi-isprocessinjob
+proc AssignProcessToJobObject(hJob: HANDLE, hProcess: HANDLE): BOOL
+  {.importc, stdcall, dynlib: "kernel32".}
+proc IsProcessInJob(ProcessHandle: HANDLE, JobHandle: HANDLE,
+                    Result: ptr BOOL): BOOL
+  {.importc, stdcall, dynlib: "kernel32".}
 
 proc GetStdHandle(nStdHandle: DWORD): HANDLE
   {.importc, stdcall, dynlib: "kernel32".}
@@ -238,6 +247,16 @@ const
   PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002'u32
 
 type
+  RootJobMembership* = enum
+    ## Whether the root already belonged to a job when it could not be
+    ## assigned to the caller's. Only consulted when the assignment FAILED:
+    ## it is what tells "the inherited job hierarchy refused nesting" apart
+    ## from every other refusal.
+    rjmNotChecked  ## no job was requested, or the assignment succeeded
+    rjmUnknown     ## `IsProcessInJob` itself failed
+    rjmNotInJob    ## the root was in no job
+    rjmInJob       ## the root had inherited a job from this process
+
   WindowsInjectionResult* = object
     exitCode*: int
     monitoringSkipped*: bool
@@ -248,6 +267,17 @@ type
       ## that emits nothing is indistinguishable from one that was never
       ## hooked, and the only party who knows which pid SHOULD have
       ## appeared is the launcher. 0 when no process was started.
+    jobAssigned*: bool
+      ## The caller passed a `job` and the root was assigned to it while it
+      ## was still suspended, before it had executed a single instruction.
+      ## `false` when no job was passed, and when the assignment failed.
+    jobAssignError*: uint32
+      ## `GetLastError()` of a FAILED `AssignProcessToJobObject`; 0 when the
+      ## assignment succeeded or was not requested. The spawn is NOT failed
+      ## over it: the root still runs, and the caller decides what an
+      ## unguarded tree means for its own guarantees.
+    jobAssignRootMembership*: RootJobMembership
+      ## For a failed assignment, whether the root was already in a job.
 
 # ---------------------------------------------------------------------------
 # WOW64 (32-bit child) support
@@ -588,7 +618,10 @@ proc wow64ExportRva*(probeExe, dllPath32, procName: string): uint32
 proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
     cwd = ""; captureStdio = false;
     captureStdioPath = ""; env: StringTableRef = nil;
-    parkTimeoutMs: DWORD = DefaultInjectDeadlineMs): WindowsInjectionResult =
+    parkTimeoutMs: DWORD = DefaultInjectDeadlineMs;
+    job: pointer = nil;
+    onBorrowTimeout: BorrowTimeoutPolicy = btpTerminate):
+    WindowsInjectionResult =
   ## Windows: Spawn `argv` in a CREATE_SUSPENDED state, inject the monitor
   ## shim DLL via CreateRemoteThread+LoadLibraryW, optionally invoke the
   ## shim's `repro_runtime_init` entry point, then resume the main thread.
@@ -634,9 +667,21 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
   ##
   ## ``parkTimeoutMs`` is a HARD deadline for a wedged child, applied to the
   ## park and to each call borrowed on the parked thread; it is not a
-  ## performance budget (see ``docs/windows-borrowed-call-deadline.md``). A
-  ## borrowed call that outlives it leaves the child TERMINATED rather than
-  ## resumed mid-call, and this proc raises.
+  ## performance budget (see ``docs/windows-borrowed-call-deadline.md``). To
+  ## wait for as long as the child lives, pass ``InfiniteDeadline`` -- that,
+  ## not a policy value, is "keep waiting" at this entry point.
+  ##
+  ## ``onBorrowTimeout`` is the CALLER's policy for a borrowed call that
+  ## outlives ``parkTimeoutMs``; the library no longer decides it (the owner's
+  ## 2026-10-13 "building blocks; tool decides"). ``btpTerminate`` (the
+  ## API-compatibility default, which every io-mon call site names explicitly)
+  ## terminates the child and this proc RAISES, exactly as before.
+  ## ``btpDetach`` lets the borrowed call finish on its own and the child run
+  ## its real entry point with its monitoring UNKNOWN (a detached load leaves
+  ## the shim mapped but never initialised; a detached init may install all,
+  ## some or none of its hooks). That is reported through
+  ## ``monitoringSkipped`` / ``skipReason`` (never swallowed) rather than
+  ## raised. A detach that cannot be carried out terminates and raises.
   ##
   ## ``parkTimeoutMs = 0`` DISABLES the park and restores the pre-park
   ## behaviour verbatim: a child carrying an MSYS2/Cygwin fork runtime is then
@@ -645,6 +690,24 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
   ## arm and observe the refusal -- the passing arm cannot then pass
   ## vacuously -- and is the same "0 means no park" encoding
   ## ``propagation_windows.injectShimIntoChild`` already uses.
+  ##
+  ## ``job``, when non-nil, is a Job Object handle (with
+  ## ``JOB_OBJECT_ASSIGN_PROCESS``) that the root is assigned to IMMEDIATELY
+  ## after ``CreateProcessW`` returns: before the entry-point park (which
+  ## resumes the main thread to run the loader), before any remote thread, and
+  ## before the final ``ResumeThread``. A process that has executed nothing has
+  ## created nothing, so every process the tree ever creates is created by a
+  ## member, and joins the job unless the job permits breakaway. That is what
+  ## lets a caller prove, by the job's active-process count, that the whole
+  ## tree has exited (io-mon's Windows tree-lifetime guard). The job stays the
+  ## caller's: this proc neither creates, configures nor closes it.
+  ##
+  ## A failed assignment does NOT fail the spawn. It is reported through
+  ## ``jobAssigned`` / ``jobAssignError`` / ``jobAssignRootMembership`` and the
+  ## root runs exactly as it would have with ``job = nil``; whether an
+  ## unguarded tree is acceptable is the caller's decision, not this proc's.
+  ## ``job = nil`` (the default) leaves this proc's behaviour byte-identical to
+  ## what it was before the parameter existed.
   ##
   ## WHAT IS **NOT** SILENTLY COMPLETE. ``monitoringSkipped`` is set only
   ## when the park did not happen AND the target carries a fork runtime; when
@@ -827,6 +890,32 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
       "CreateProcessW failed (err=" & $GetLastError() & "): " & commandLine)
   result.rootPid = uint64(pi.dwProcessId)
 
+  # ASSIGN THE ROOT TO THE CALLER'S JOB WHILE IT HAS EXECUTED NOTHING.
+  #
+  # This has to come before EVERYTHING below that can run code in the child:
+  # the entry-point park resumes the main thread so the loader runs (and a
+  # loader-run TLS callback or DllMain may already create a process), and the
+  # remote-thread and borrowed-thread loads run the shim's initialisation. A
+  # child created by the root before it is a member is created OUTSIDE the
+  # job, and a job that misses one descendant proves nothing about the tree.
+  #
+  # Failure is reported, never raised: the spawn itself is sound, and turning
+  # "the tree cannot be guarded" into "the command cannot run" would make a
+  # host inside a job that refuses nesting unable to build at all. Nested
+  # jobs exist since Windows 8; see
+  # https://learn.microsoft.com/en-us/windows/win32/procthread/nested-jobs
+  if job != nil:
+    if AssignProcessToJobObject(cast[HANDLE](job), pi.hProcess) != 0:
+      result.jobAssigned = true
+    else:
+      # Read the error before any other call can replace it.
+      result.jobAssignError = GetLastError()
+      var inJob: BOOL = 0
+      result.jobAssignRootMembership =
+        if IsProcessInJob(pi.hProcess, nil, addr inJob) == 0: rjmUnknown
+        elif inJob != 0: rjmInJob
+        else: rjmNotInJob
+
   template safeClose(h: HANDLE) =
     if h != nil:
       discard CloseHandle(h)
@@ -971,19 +1060,38 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
     var llExit: DWORD = 1
     var llModule: uint64 = 0
     var borrowedLoad = false
+    var rootDetached = false
     if not skipInjection:
       if park.status == epsParked and not childIsWow64:
-        let borrowed = borrowParkedThread(park, pi.hThread, childIsWow64,
+        var borrowed = borrowParkedThread(park, pi.hThread, childIsWow64,
           loadLibraryW, remoteBuf, parkTimeoutMs)
         llModule = borrowed.ret
-        if borrowed.status != bcsReturned:
-          discard VirtualFreeEx(pi.hProcess, remoteBuf, 0, MEM_RELEASE)
-          if park.status == epsAbandoned:
+        if borrowed.status == bcsTimedOut:
+          # The library left the thread lent out and terminated nothing. Apply
+          # the CALLER's policy. Either way `remoteBuf` is NOT freed here: a
+          # mid-flight LoadLibraryW (detached) or a still-exiting child
+          # (terminated) may read it, and it is reclaimed when the child exits.
+          case applyBorrowTimeoutPolicy(borrowed.timedOut, onBorrowTimeout)
+          of atpTerminated:
             raise newException(OSError,
               "the child's main thread did not return from loading the " &
               "shim within " & $parkTimeoutMs & " ms; it was mid-call, so " &
-              "it was terminated rather than resumed. shim=" &
+              "it was terminated (onBorrowTimeout=" & $onBorrowTimeout &
+              "; a detach that cannot be carried out terminates). shim=" &
               effectiveDllPath)
+          of atpDetached, atpChildExited:
+            # The child runs its real entry point with no injector. The load
+            # finishes on its own, so the shim ends up mapped but never
+            # initialised. Report the loss; skip init; resume+wait below.
+            result.monitoringSkipped = true
+            result.skipReason =
+              "shim load did not return within " & $parkTimeoutMs &
+              " ms; child detached (onBorrowTimeout=btpDetach) and runs " &
+              "UNMONITORED: the shim may finish loading but is never " &
+              "initialised. shim=" & effectiveDllPath
+            rootDetached = true
+        elif borrowed.status != bcsReturned:
+          discard VirtualFreeEx(pi.hProcess, remoteBuf, 0, MEM_RELEASE)
           raise newException(OSError,
             "the parked child's main thread could not be borrowed to load " &
             "the shim. Falling back to CreateRemoteThread here is NOT an " &
@@ -992,12 +1100,13 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
             "owned by a heap region that dies with it. borrowedStatus=" &
             $borrowed.status & " parkStatus=" & $park.status &
             " shim=" & effectiveDllPath)
-        borrowedLoad = true
-        # The borrowed call returns LoadLibraryW's HMODULE in RAX. Only
-        # "did it load" is wanted below, and a 64-bit base cannot be
-        # narrowed to a DWORD without risking a 4 GiB-aligned base
-        # reporting as a failure.
-        llExit = (if llModule != 0: 1'u32 else: 0'u32)
+        if not rootDetached:
+          borrowedLoad = true
+          # The borrowed call returns LoadLibraryW's HMODULE in RAX. Only
+          # "did it load" is wanted below, and a 64-bit base cannot be
+          # narrowed to a DWORD without risking a 4 GiB-aligned base
+          # reporting as a failure.
+          llExit = (if llModule != 0: 1'u32 else: 0'u32)
       else:
         let llThread = CreateRemoteThread(pi.hProcess, nil, 0,
           loadLibraryW, remoteBuf, 0, nil)
@@ -1016,7 +1125,10 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
         llExit = 0
         discard GetExitCodeThread(llThread, addr llExit)
         discard CloseHandle(llThread)
-    discard VirtualFreeEx(pi.hProcess, remoteBuf, 0, MEM_RELEASE)
+    if not rootDetached:
+      # A detached child may still be reading the path string from a borrowed
+      # LoadLibraryW; the reservation is leaked and reclaimed when it exits.
+      discard VirtualFreeEx(pi.hProcess, remoteBuf, 0, MEM_RELEASE)
 
     if llExit == 0:
       # Report enough to tell the three causes apart without a rebuild: a
@@ -1049,7 +1161,7 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
       tail
     var childMods: array[1024, HANDLE]
     var modCb: DWORD = 0
-    if not skipInjection and
+    if not skipInjection and not rootDetached and
         EnumProcessModulesEx(pi.hProcess, cast[ptr pointer](addr childMods[0]),
         DWORD(sizeof(childMods)), addr modCb, 0x3'u32) != 0:
       let modCount = int(modCb) div sizeof(HANDLE)
@@ -1103,16 +1215,37 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
         if borrowedLoad:
           # Same thread that mapped the shim, for the same reason: the init
           # entry point installs hooks and touches the shim's thread-locals,
-          # and the thread whose locals must be sound is the child's own.
-          var initRet: uint64 = 0
-          if not callOnParkedThread(park, pi.hThread, childIsWow64,
-              childInit, nil, parkTimeoutMs, initRet):
-            if park.status == epsAbandoned:
+          # and the thread whose locals must be sound is the child's own. The
+          # library reports a timeout and terminates nothing; this entry point
+          # applies the CALLER's `onBorrowTimeout`.
+          var init = borrowParkedThread(park, pi.hThread, childIsWow64,
+            childInit, nil, parkTimeoutMs)
+          case init.status
+          of bcsReturned:
+            discard
+          of bcsTimedOut:
+            case applyBorrowTimeoutPolicy(init.timedOut, onBorrowTimeout)
+            of atpTerminated:
               raise newException(OSError,
                 "repro_runtime_init did not return on the child's main " &
                 "thread within " & $parkTimeoutMs & " ms; it was mid-call, " &
-                "so the child was terminated rather than resumed with its " &
-                "hooks half-installed")
+                "so the child was terminated (onBorrowTimeout=" &
+                $onBorrowTimeout & "; a detach that cannot be carried out " &
+                "terminates) rather than resumed with its hooks " &
+                "half-installed")
+            of atpDetached, atpChildExited:
+              # The child reaches its real entry point with no injector, and
+              # init runs on to completion by itself: it may install all,
+              # some or none of its hooks. The monitoring is UNKNOWN, which
+              # for the consumer is the same as lost. Report it.
+              result.monitoringSkipped = true
+              result.skipReason =
+                "repro_runtime_init did not return within " &
+                $parkTimeoutMs & " ms; child detached " &
+                "(onBorrowTimeout=btpDetach) and runs with its monitoring " &
+                "UNKNOWN: init continues without the injector and may " &
+                "install all, some or none of its hooks"
+          of bcsNotRun, bcsNoResult, bcsChildExited:
             raise newException(OSError,
               "the shim loaded into the child but repro_runtime_init could " &
               "not be called on its parked main thread; the child would run " &

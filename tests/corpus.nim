@@ -89,6 +89,7 @@ type
 const
   tLinuxAmd64* = CheckTarget(os: "linux", cpu: "amd64")
   tLinuxArm64* = CheckTarget(os: "linux", cpu: "arm64")
+  tLinuxArm* = CheckTarget(os: "linux", cpu: "arm")
   tMacosArm64* = CheckTarget(os: "macosx", cpu: "arm64")
   tWindowsAmd64* = CheckTarget(os: "windows", cpu: "amd64")
   tWindowsArm64* = CheckTarget(os: "windows", cpu: "arm64")
@@ -133,6 +134,13 @@ const testCorpus*: seq[TestEntry] = @[
          "everywhere. linux/arm64 is listed explicitly because that is " &
          "the ONLY target on which its body is live; before this corpus " &
          "the file was in no lane at all and ran on no host."),
+  TestEntry(stem: "test_linux_raw_syscalls_armhf",
+    targets: @[tLinuxAmd64, tLinuxArm, tLinuxArm64, tMacosArm64, tWindowsAmd64],
+    why: "Self-gating `when defined(linux) and defined(arm)` with an " &
+         "`else: static: doAssert` arm. The portable `svc`-site byte-scanner " &
+         "checks run on every host; the body-patch / svc->UDF trap primitives " &
+         "run live only on linux/arm (armhf), which is listed explicitly as " &
+         "the ONLY target on which that body is live."),
   TestEntry(stem: "test_macos_bodypatch_minimal_consumer",
     targets: AllHostTargets,
     why: "Self-gating `when defined(macosx)` with an " &
@@ -169,6 +177,12 @@ const testCorpus*: seq[TestEntry] = @[
     why: "stackable_hooks/windows_env_block is deliberately NOT " &
          "`when defined(windows)`-gated -- the lpEnvironment encoding is " &
          "pure string/UTF-16 work -- so this runs for real on every host."),
+  TestEntry(stem: "test_windows_hook_freeze", targets: AllHostTargets,
+    why: "Real peer threads and executable pages on Windows x86: every " &
+         "default patching entry point refuses, unpatched and with peers " &
+         "resumed and handles closed, when a live thread cannot be frozen. " &
+         "Other hosts compile the platform guard; native Windows ARM64 " &
+         "inline hooks remain deferred."),
   TestEntry(stem: "test_windows_hook_page_preparation", targets: AllHostTargets,
     why: "Real executable pages, trampolines and peer threads on Windows x86. " &
          "Other hosts compile the platform guard; native Windows ARM64 " &
@@ -224,6 +238,11 @@ const testCorpus*: seq[TestEntry] = @[
          "process for every target below that is not the host's own."),
 
   # ---- genuinely platform-gated: the source cannot be COMPILED elsewhere
+  TestEntry(stem: "test_linux_image_code_ranges", targets: LinuxOnlyTargets,
+    why: "Opens with `when not defined(linux): {.error.}` and imports " &
+         "stackable_hooks/platform/linux_image_code_ranges, which is itself " &
+         "`{.error.}`-guarded off Linux. Its live arm links a C library " &
+         "with `-z noseparate-code` through the lane's compiler."),
   TestEntry(stem: "test_linux_preload_helpers", targets: LinuxOnlyTargets,
     why: "Opens with `when not defined(linux): {.error.}` and imports " &
          "stackable_hooks/platform/linux_preload, which is itself " &
@@ -238,6 +257,10 @@ const testCorpus*: seq[TestEntry] = @[
     targets: WindowsOnlyTargets,
     why: "Exercises real Windows process/pipe inheritance through the " &
          "Windows-only injector, including a surviving descendant writer."),
+  TestEntry(stem: "test_windows_injector_job",
+    targets: WindowsOnlyTargets,
+    why: "Assigns real roots to real Job Objects through the Windows-only " &
+         "injector, and provokes a real nesting refusal."),
   TestEntry(stem: "test_windows_injector_fork_runtime",
     targets: WindowsOnlyTargets,
     why: "Unconditionally imports stackable_hooks/windows_injector, whose " &
@@ -293,6 +316,10 @@ const moduleCorpus*: seq[ModuleEntry] = @[
   ModuleEntry(path: "src/stackable_hooks/platform/linux_preload.nim",
     targets: LinuxOnlyTargets,
     why: "`when not defined(linux): {.error.}` module head."),
+  ModuleEntry(path: "src/stackable_hooks/platform/linux_image_code_ranges.nim",
+    targets: LinuxOnlyTargets,
+    why: "`when not defined(linux): {.error.}` module head; reads ELF " &
+         "section tables with std/posix `open`/`fstat`/`pread`."),
   ModuleEntry(path: "src/stackable_hooks/platform/linux_raw_syscalls.nim",
     targets: @[tLinuxAmd64, tLinuxArm64, tMacosArm64, tWindowsAmd64],
     why: "Compiles everywhere; its live body is " &

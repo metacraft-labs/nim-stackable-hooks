@@ -8,8 +8,14 @@ import stackable_hooks/platform/linux_raw_syscalls
 
 suite "linux raw syscall primitives":
   test "platform support is explicit":
-    when defined(linux) and defined(amd64):
+    when defined(linux) and (defined(amd64) or defined(arm)):
+      # x86-64 and 32-bit ARM implement the shared raw-syscall subset; the
+      # x86-only helpers keep their own predicate.
       check linuxRawSyscallSupported() == lrsOk
+      when defined(amd64):
+        check linuxX8664RawSyscallSupported() == lrsOk
+      else:
+        check linuxX8664RawSyscallSupported() == lrsUnsupportedArchitecture
     elif defined(linux):
       check linuxRawSyscallSupported() == lrsUnsupportedArchitecture
       check rawSyscall6(0, 0, 0, 0, 0, 0, 0) == -38
@@ -60,7 +66,7 @@ suite "linux raw syscall primitives":
     check callSites[0].address == 0x200b'u
 
   test "maps parser exposes executable mappings without policy filtering":
-    let line = "7f0000001000-7f0000002000 r-xp 00000000 00:00 0 /tmp/libx.so"
+    let line = "7f0000001000-7f0000002000 r-xp 00001000 fd:01 1234567 /tmp/libx.so"
     let parsed = parseLinuxMapsLine(line)
     check parsed.ok
     check parsed.mapping.start == 0x7f0000001000'u
@@ -70,10 +76,21 @@ suite "linux raw syscall primitives":
     check parsed.mapping.executable
     check parsed.mapping.privateMapping
     check parsed.mapping.path == "/tmp/libx.so"
+    # The file offset, device and inode tie a file-backed mapping to one
+    # PT_LOAD of its image (linux_image_code_ranges).
+    check parsed.mapping.offset == 0x1000'u
+    check parsed.mapping.device == "fd:01"
+    check parsed.mapping.inode == 1234567'u64
+    let anon = parseLinuxMapsLine("7f0000003000-7f0000004000 rwxp 00000000 00:00 0")
+    check anon.ok
+    check anon.mapping.path == ""
+    check anon.mapping.offset == 0'u
+    check anon.mapping.inode == 0'u64
+    check not parseLinuxMapsLine("7f0000003000-7f0000004000 rwxp zz 00:00 0").ok
 
   test "enumerating executable mappings reports support diagnostics":
     let enumerated = enumerateLinuxExecutableMappings()
-    when defined(linux) and defined(amd64):
+    when defined(linux) and (defined(amd64) or defined(arm)):
       check enumerated.diagnostic == lrsOk
       check enumerated.mappings.len > 0
       var foundExecutable = false
@@ -89,7 +106,7 @@ suite "linux raw syscall primitives":
       check enumerated.mappings.len == 0
 
   test "default symbol resolution is explicit":
-    when defined(linux) and defined(amd64):
+    when defined(linux) and (defined(amd64) or defined(arm)):
       check resolveDefaultSymbol(cstring("syscall")) != nil
       check resolveDefaultSymbol(cstring("__stackable_missing_symbol")) == nil
     else:

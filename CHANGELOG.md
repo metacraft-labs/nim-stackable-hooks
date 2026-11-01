@@ -2,8 +2,93 @@
 
 ## Unreleased
 
+### Added
+
+- **`platform/linux_image_code_ranges`: the executable-section ranges of a
+  mapped ELF image.** The inline raw-syscall scanner is a linear sweep that
+  stays in sync only over instructions, and an executable `PT_LOAD` routinely
+  holds data too: LLVM BOLT emits `.rodata`, `.eh_frame` and
+  `.gcc_except_table` into its `R E` segment, and GNU ld does the same under
+  `-z noseparate-code`. Sweeping a whole `r-xp` mapping INT3-patched a PIC
+  jump-table entry (`fa 0f 05 fe`) in the upstream Rust 1.94.0
+  `librustc_driver`, and rustc died with SIGILL on any crate with a
+  `macro_rules!`. The new module reads the ELF header, program headers and
+  section headers of the file a mapping names (bounded `pread`s, inode
+  checked against `fstat`), ties the mapping to its executable `PT_LOAD`
+  through the `/proc/self/maps` file offset, and returns the runtime ranges
+  of the `SHF_EXECINSTR` sections inside the mapping with a diagnostic per
+  failure class. `LinuxExecutableMapping` gained `offset`, `device` and
+  `inode`, and `parseLinuxMapsLine` refuses a line whose offset or inode
+  does not parse. A consumer scans those ranges and nothing else, and reports
+  an image whose table cannot be read as unscanned (event loss) instead of
+  sweeping it.
+
+- **32-bit ARM (armhf) raw-syscall substrate.** `platform/linux_raw_syscalls`
+  now implements the subset io-mon's Linux shim consumes on ARM EABI as well
+  as x86-64, behind the same `stackable_linux_*` C ABI and struct contract:
+  `rawSyscall6`, the glibc `syscall` body patch (8-byte `ldr pc,[pc,#-4]` +
+  target word), the inline syscall-site trap (an equal-width `udf` over
+  `svc #0`, 4 bytes ARM / 2 bytes Thumb, handled on **SIGILL** since ARM has
+  no one-byte breakpoint and `bkpt` is not catchable without a ptracer), the
+  `ucontext` register capture/write/replay, and the Elf32 vDSO image
+  discovery/patch. `linuxRawSyscallSupported()` is `lrsOk` on `linux/arm`;
+  the x86-only helpers (atomic-window classifier, near trampolines, INT3
+  clone-continuation) report through the new `linuxX8664RawSyscallSupported()`
+  so they never return a default-initialised (falsely OK) result elsewhere.
+  The live ARM scanner reports word-aligned ARM-state `svc #0` only; automatic
+  discovery of inline Thumb-state syscalls is out of scope (not boundary-sound
+  without a decoder), though the patch itself supports an explicit Thumb site.
+  Verified on a Raspberry Pi 2 (Raspberry Pi OS 13 armhf): `tests/
+test_linux_raw_syscalls_armhf.nim`, and a monitored `sh -c "gcc … && ./a"`
+  through io-mon grading `mcComplete` with zero event loss where it was
+  `mcIncomplete` on the two `unsupported-architecture` losses before.
+
+### Changed
+
+- **ARM substrate review fixes.** The body patch writes the target word
+  before the `ldr pc` word; `restoreInt3SyscallPatch` is idempotent on ARM
+  (a site already holding `svc #0` is a success, as on x86-64);
+  `restoreAbsoluteJumpPatch` is available on ARM. The armhf test's live-trap
+  stub preserves r7 (callee-saved under AAPCS; the clobber crashed the
+  `-d:release` driver on rpi2) and is guarded by an alarm so a wrong resume
+  width fails in seconds instead of hanging.
+
+- **A borrowed call that misses its deadline is reported; the caller picks
+  what happens next** (owner decision, 2026-10-13: "building blocks; tool
+  decides"). `windows_entry_park` no longer terminates anything on its own.
+  `borrowParkedThread` returns `bcsTimedOut` (replacing `bcsPoisoned`) with
+  the thread still suspended, its context still lent out and one extra
+  suspend held, so a caller's reflexive `releaseEntryPark` + `ResumeThread`
+  cannot run it (the park is `epsLentOut`). The `TimedOutBorrow` it carries
+  has three building blocks: `keepWaitingForBorrow`, `terminateBorrowedChild`
+  and `detachBorrowedChild`. Detach restores the entry bytes and releases the
+  thread, and the call stub's tail carries it into the real entry point; the
+  borrowed call is not cancelled, so a detached child's monitoring is
+  unknown. A detach that cannot be carried out (`doFailed`) leaves the
+  handle live so the child can still be terminated.
+  `applyBorrowTimeoutPolicy` applies a `BorrowTimeoutPolicy`
+  (`btpTerminate`, `btpDetach`; under `btpDetach` an impossible detach
+  terminates). The entry points take the policy from their caller:
+  `InjectionConfig.onBorrowTimeout` and `runWithMonitorShim(onBorrowTimeout)`
+  default to `btpTerminate` for source compatibility, and
+  `callOnParkedThread` now requires an `onTimeout` argument (**breaking**).
+  `btpDetach` is reported as `ioChildDetached`, or through
+  `monitoringSkipped` / `skipReason`. See
+  `docs/windows-borrowed-call-deadline.md`.
+
 ### Fixed
 
+- **A borrowed call no longer kills a /CETCOMPAT child.** The parked thread
+  was borrowed by writing the entry point onto its stack as a return address
+  and pointing `RIP` at the callee, so no `call` ever executed and the
+  callee's `ret` had no matching shadow-stack entry. On a host that enforces
+  user shadow stacks (CET), every /CETCOMPAT child (`pwsh.exe`, System32
+  `curl.exe`, `conhost.exe`) died with `0xC0000409` before running any code
+  of its own, which broke Windows `repro build .#apps` from 2026-09-18. The
+  borrow now goes through a small stub written into the child that makes a
+  real `call`, then restores the parked `RSP` and `RCX` and `jmp`s to the
+  entry point. `tests/test_windows_entry_park_shadow_stack.nim` builds a
+  genuine AMD64 CETCOMPAT child for it.
 - **A slow Windows child is no longer turned into a corrupted one.** A call
   borrowed on a parked child's main thread (`LoadLibraryW`, then the shim's
   init) had a 5 s deadline. When a call missed it, the thread was suspended
@@ -13,8 +98,9 @@
   The park and every borrowed call now keep waiting while the child is
   alive, up to a hard deadline of `DefaultInjectDeadlineMs` (10 min;
   `InfiniteDeadline` waits for as long as the child lives). A call that
-  outlives the hard deadline no longer resumes the thread: the child is
-  terminated (`InjectionAbandonedExitCode`) and reported as its own outcome,
+  outlives the hard deadline no longer resumes the thread. Under the
+  default `btpTerminate` policy (see Changed) the child is terminated
+  (`InjectionAbandonedExitCode`) and reported as its own outcome,
   `ioChildTerminated`. `autoPropagateCreateProcessW` then fails the spawn
   with `ERROR_TIMEOUT`, and `runWithMonitorShim` raises. See
   `docs/windows-borrowed-call-deadline.md`.

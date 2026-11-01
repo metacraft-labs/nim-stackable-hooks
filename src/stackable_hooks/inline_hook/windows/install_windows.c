@@ -423,8 +423,14 @@ static ct_tramp_page_t *find_owning_page(uint8_t *slot)
  * heap is held by some other thread we may have just suspended; a
  * HeapAlloc here would deadlock.  4096 is way above the realistic
  * thread count for a recorder process (typically <100); the alternative
- * is a VirtualAlloc'd grow-buffer which is overkill for this scope. */
+ * is a VirtualAlloc'd grow-buffer which is overkill for this scope.
+ * A process with more live peers than this cannot be frozen, and the
+ * freeze then fails rather than leaving the excess threads running.
+ * Overridable only so the capacity test can reach the bound with a few
+ * real threads. */
+#ifndef CT_FROZEN_MAX
 #define CT_FROZEN_MAX 4096
+#endif
 #define CT_FROZEN_THREAD_ACCESS \
     (THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION)
 
@@ -456,6 +462,57 @@ unsigned long ct_inline_hook_suspend_round_count(void)
     return g_suspend_rounds;
 }
 
+static void resume_other_threads(ct_frozen_t *f)
+{
+    for (DWORD i = 0; i < f->count; i++) {
+        ResumeThread(f->handles[i]);
+        CloseHandle(f->handles[i]);
+    }
+    f->count = 0;
+}
+
+/* True when the thread behind `h` has finished: it has an exit code other
+ * than STILL_ACTIVE, or the TID now names a thread of another process (the
+ * thread we enumerated exited and its TID was reused).  A thread that
+ * exited with the code STILL_ACTIVE (259) reads as live, which errs towards
+ * refusing the freeze, never towards patching beside a running thread. */
+static int thread_has_exited(HANDLE h, DWORD my_pid)
+{
+    DWORD owner = GetProcessIdOfThread(h);
+    if (owner != 0 && owner != my_pid) return 1;
+    DWORD code;
+    return GetExitCodeThread(h, &code) && code != STILL_ACTIVE;
+}
+
+/* SuspendThread refuses a thread that is terminating before its exit code
+ * is published, so a refusal is re-checked for exit a bounded number of
+ * times before it is treated as a live thread that could not be stopped. */
+#define CT_EXIT_CONFIRM_ATTEMPTS 64
+
+static int thread_exit_confirmed(HANDLE h, DWORD my_pid)
+{
+    for (int i = 0; i < CT_EXIT_CONFIRM_ATTEMPTS; i++) {
+        if (thread_has_exited(h, my_pid)) return 1;
+        Sleep(1);
+    }
+    return 0;
+}
+
+/* Suspend every other thread of this process.
+ *
+ * Returns 0 only when every thread of this process other than the caller
+ * that was in the snapshot is either suspended (recorded in `out`) or
+ * confirmed to have exited.  Confirmed exit means OpenThread reports that
+ * the TID no longer names a thread (ERROR_INVALID_PARAMETER), or the opened
+ * thread has an exit code / belongs to another process (thread_has_exited).
+ *
+ * Returns -1 when that cannot be established: the snapshot or its walk
+ * fails, a live thread cannot be opened or suspended, or there are more
+ * live peers than CT_FROZEN_MAX.  Before returning -1 it resumes every
+ * thread it suspended and closes every handle it acquired, so callers can
+ * return an error without writing patch bytes and without further cleanup.
+ * (The default install/uninstall/commit entry points rely on exactly this:
+ * a zero return is their licence to write executable bytes.) */
 static int suspend_other_threads(ct_frozen_t *out)
 {
     out->count = 0;
@@ -465,45 +522,63 @@ static int suspend_other_threads(ct_frozen_t *out)
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (snap == INVALID_HANDLE_VALUE) return -1;
 
-    DWORD my_pid = GetCurrentProcessId();
-    DWORD my_tid = GetCurrentThreadId();
+    const DWORD my_pid = GetCurrentProcessId();
+    const DWORD my_tid = GetCurrentThreadId();
+    const DWORD min_entry =
+        (DWORD)(FIELD_OFFSET(THREADENTRY32, th32OwnerProcessID) + sizeof(DWORD));
 
     THREADENTRY32 te;
     te.dwSize = sizeof(te);
-    if (Thread32First(snap, &te)) {
-        do {
-            if (te.dwSize >= FIELD_OFFSET(THREADENTRY32, th32OwnerProcessID) + sizeof(DWORD) &&
-                te.th32OwnerProcessID == my_pid &&
-                te.th32ThreadID != my_tid &&
-                te.th32ThreadID != 0 &&
-                out->count < CT_FROZEN_MAX)
-            {
-                HANDLE h = OpenThread(CT_FROZEN_THREAD_ACCESS, FALSE, te.th32ThreadID);
-                if (h != NULL) {
-                    DWORD prev = SuspendThread(h);
-                    if (prev == (DWORD)-1) {
-                        CloseHandle(h);
-                    } else {
-                        out->tids[out->count] = te.th32ThreadID;
-                        out->handles[out->count] = h;
-                        out->count++;
-                    }
-                }
-            }
-            te.dwSize = sizeof(te);
-        } while (Thread32Next(snap, &te));
-    }
+    /* The snapshot always contains at least the calling thread, so a
+     * failing first entry -- even ERROR_NO_MORE_FILES -- means the walk
+     * cannot vouch for anything. */
+    if (!Thread32First(snap, &te)) goto fail;
+    do {
+        if (te.dwSize < min_entry) goto fail;  /* owner unknown: cannot filter */
+        if (te.th32OwnerProcessID != my_pid ||
+            te.th32ThreadID == my_tid || te.th32ThreadID == 0)
+            goto next;
+
+        HANDLE h = OpenThread(CT_FROZEN_THREAD_ACCESS, FALSE, te.th32ThreadID);
+        if (h == NULL) {
+            /* The TID no longer names any thread: it exited after the
+             * snapshot.  Anything else (access denied, ...) is a live
+             * thread we cannot stop. */
+            if (GetLastError() == ERROR_INVALID_PARAMETER) goto next;
+            goto fail;
+        }
+        if (thread_has_exited(h, my_pid)) {
+            CloseHandle(h);
+            goto next;
+        }
+        if (out->count >= CT_FROZEN_MAX) {
+            /* A live peer with no slot left would keep running. */
+            CloseHandle(h);
+            goto fail;
+        }
+        if (SuspendThread(h) == (DWORD)-1) {
+            const int exited = thread_exit_confirmed(h, my_pid);
+            CloseHandle(h);
+            if (exited) goto next;
+            goto fail;
+        }
+        out->tids[out->count] = te.th32ThreadID;
+        out->handles[out->count] = h;
+        out->count++;
+    next:
+        te.dwSize = sizeof(te);
+    } while (Thread32Next(snap, &te));
+    /* Thread32Next also returns FALSE on a real error; only the end of the
+     * list means every entry was seen. */
+    if (GetLastError() != ERROR_NO_MORE_FILES) goto fail;
+
     CloseHandle(snap);
     return 0;
-}
 
-static void resume_other_threads(ct_frozen_t *f)
-{
-    for (DWORD i = 0; i < f->count; i++) {
-        ResumeThread(f->handles[i]);
-        CloseHandle(f->handles[i]);
-    }
-    f->count = 0;
+fail:
+    resume_other_threads(out);
+    CloseHandle(snap);
+    return -1;
 }
 
 /* ---- Install helpers --------------------------------------------- */

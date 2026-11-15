@@ -661,25 +661,56 @@ __asm__(
   ".size stackable_linux_rt_sigreturn_restorer, .-stackable_linux_rt_sigreturn_restorer\n"
 );
 
+/* The raw syscall entry, and its static-runtime alias, as ONE hand-written
+ * function, like glibc's sysdeps/unix/sysv/linux/x86_64/syscall.S.
+ *
+ * It must not be a C function. Callers forward clone, clone3 and vfork through
+ * it (a libc syscall(2) replacement does), and a clone with CLONE_VM and a new
+ * stack starts the child at the instruction after 'syscall', with the child's
+ * stack pointer but every other register, %rbp included, still the parent's.
+ * Whatever the function does between 'syscall' and its return then runs twice
+ * in one address space. A C body compiled without optimisation keeps its
+ * result in a frame slot ('mov %rax,-8(%rbp)'), so the child stores its 0
+ * into the PARENT's stack -- by then possibly a return address of a later
+ * call, which the parent eventually jumps to: a SIGSEGV at address 0. The
+ * optimised build happened to need no frame, so only -O0 builds failed.
+ *
+ * Here nothing touches memory between 'syscall' and 'ret' at any optimisation
+ * level: the child's 'ret' pops its own new stack, exactly as with glibc's
+ * syscall(2). x86-64 SysV puts the 7th argument (a6) at 8(%rsp) on entry; the
+ * kernel takes the number in %rax and its args in %rdi, %rsi, %rdx, %r10, %r8,
+ * %r9, and clobbers %rcx and %r11, both caller-saved. See syscall(2), "Architecture
+ * calling conventions". 'endbr64' is emitted only for an -fcf-protection build,
+ * whose objects are marked IBT-compatible. */
 long stackable_linux_raw_syscall6(long nr, long a1, long a2, long a3,
-                                  long a4, long a5, long a6) {
-  long ret;
-  register long r10 __asm__("r10") = a4;
-  register long r8  __asm__("r8")  = a5;
-  register long r9  __asm__("r9")  = a6;
-  __asm__ volatile (
-    "syscall"
-    : "=a"(ret)
-    : "0"(nr), "D"(a1), "S"(a2), "d"(a3), "r"(r10), "r"(r8), "r"(r9)
-    : "rcx", "r11", "memory"
-  );
-  return ret;
-}
-
+                                  long a4, long a5, long a6);
 long stackable_linux_static_raw_syscall6(long nr, long a1, long a2, long a3,
-                                         long a4, long a5, long a6) {
-  return stackable_linux_raw_syscall6(nr, a1, a2, a3, a4, a5, a6);
-}
+                                         long a4, long a5, long a6);
+__asm__(
+  ".text\n"
+  ".globl stackable_linux_raw_syscall6\n"
+  ".type  stackable_linux_raw_syscall6, @function\n"
+  ".globl stackable_linux_static_raw_syscall6\n"
+  ".type  stackable_linux_static_raw_syscall6, @function\n"
+  "stackable_linux_raw_syscall6:\n"
+  "stackable_linux_static_raw_syscall6:\n"
+  "    .cfi_startproc\n"
+#if defined(__CET__) && (__CET__ & 1)
+  "    endbr64\n"
+#endif
+  "    movq %rdi, %rax\n"
+  "    movq %rsi, %rdi\n"
+  "    movq %rdx, %rsi\n"
+  "    movq %rcx, %rdx\n"
+  "    movq %r8, %r10\n"
+  "    movq %r9, %r8\n"
+  "    movq 8(%rsp), %r9\n"
+  "    syscall\n"
+  "    ret\n"
+  "    .cfi_endproc\n"
+  ".size stackable_linux_raw_syscall6, .-stackable_linux_raw_syscall6\n"
+  ".size stackable_linux_static_raw_syscall6, .-stackable_linux_static_raw_syscall6\n"
+);
 
 long stackable_linux_clone_continuation_trampoline(
     long nr, long a0, long a1, long a2, long a3, long a4, long a5,
@@ -2684,33 +2715,55 @@ enum {
 #define STACKABLE_THUMB_SVC_HALF 0xdf00u       /* Thumb svc #0 */
 #define STACKABLE_THUMB_UDF_HALF 0xde00u       /* Thumb udf #0 */
 
-/* r7 is the frame pointer in Thumb code and cannot be a named asm operand, so
- * the number rides in r6 and is swapped into r7 across the trap. Identical to
- * io-mon's own ct_raw_syscall6; kept here so framework-internal forwarding
- * does not route through libc (which this shim interposes). */
+/* The raw syscall entry, and its static-runtime alias, as ONE hand-written
+ * function, like glibc's sysdeps/unix/sysv/linux/arm/syscall.S. Kept here so
+ * framework-internal forwarding does not route through libc (which a
+ * consumer's shim interposes).
+ *
+ * It must not be a C function, for the reason given at the x86-64 entry: a
+ * CLONE_VM child with a new stack resumes after 'svc' with the parent's frame
+ * registers. The C version restored sp from the frame pointer ('sub sp, fp,
+ * #12' in ARM state, 'mov sp, r7' in Thumb), so the child went on running on
+ * the PARENT's stack, and an -O0 build also stored its result into the
+ * parent's frame. Here nothing writes memory between 'svc' and 'bx lr'; the
+ * child's 'pop' reads its own new stack, as glibc's does.
+ *
+ * AAPCS: nr, a1, a2, a3 arrive in r0-r3 and a4, a5, a6 on the stack. EABI
+ * syscalls take the number in r7 and the arguments in r0-r5, and return the
+ * kernel's -errno in r0. r4, r5 and r7 are callee-saved. Assembled in ARM
+ * state whatever the surrounding code uses; 'bx lr' interworks with a Thumb
+ * caller. */
 long stackable_linux_raw_syscall6(long nr, long a1, long a2, long a3,
-                                  long a4, long a5, long a6) {
-  register long r0 __asm__("r0") = a1;
-  register long r1 __asm__("r1") = a2;
-  register long r2 __asm__("r2") = a3;
-  register long r3 __asm__("r3") = a4;
-  register long r4 __asm__("r4") = a5;
-  register long r5 __asm__("r5") = a6;
-  register long r6 __asm__("r6") = nr;
-  __asm__ volatile("push {r7}\n\t"
-                   "mov r7, r6\n\t"
-                   "svc #0\n\t"
-                   "pop {r7}"
-                   : "+r"(r0)
-                   : "r"(r1), "r"(r2), "r"(r3), "r"(r4), "r"(r5), "r"(r6)
-                   : "memory", "cc");
-  return r0;
-}
-
+                                  long a4, long a5, long a6);
 long stackable_linux_static_raw_syscall6(long nr, long a1, long a2, long a3,
-                                         long a4, long a5, long a6) {
-  return stackable_linux_raw_syscall6(nr, a1, a2, a3, a4, a5, a6);
-}
+                                         long a4, long a5, long a6);
+__asm__(
+  ".text\n"
+  ".syntax unified\n"
+  ".arm\n"
+  ".p2align 2\n"
+  ".globl stackable_linux_raw_syscall6\n"
+  ".type  stackable_linux_raw_syscall6, %function\n"
+  ".globl stackable_linux_static_raw_syscall6\n"
+  ".type  stackable_linux_static_raw_syscall6, %function\n"
+  "stackable_linux_raw_syscall6:\n"
+  "stackable_linux_static_raw_syscall6:\n"
+  "    mov   ip, sp\n"
+  "    push  {r4, r5, r7}\n"
+  "    mov   r7, r0\n"
+  "    mov   r0, r1\n"
+  "    mov   r1, r2\n"
+  "    mov   r2, r3\n"
+  "    ldm   ip, {r3, r4, r5}\n"
+  "    svc   #0\n"
+  "    pop   {r4, r5, r7}\n"
+  "    bx    lr\n"
+  ".size stackable_linux_raw_syscall6, .-stackable_linux_raw_syscall6\n"
+  ".size stackable_linux_static_raw_syscall6, .-stackable_linux_static_raw_syscall6\n"
+#if defined(__thumb__)
+  ".thumb\n"
+#endif
+);
 
 static long stackable_linux_raw_mprotect(uintptr_t addr, size_t len, int prot) {
   return stackable_linux_raw_syscall6((long)SYS_mprotect, (long)addr,

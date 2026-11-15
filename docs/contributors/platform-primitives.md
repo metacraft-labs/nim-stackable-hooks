@@ -24,7 +24,7 @@ The x86_64-specific helpers below (atomic-window classification, the INT3 clone-
 
 The low-level Linux x86_64 helpers:
 
-- `rawSyscall6` for internal forwarding without calling libc wrappers. It returns the kernel result directly (failed syscalls are negative errno values).
+- `rawSyscall6` for internal forwarding without calling libc wrappers. It returns the kernel result directly (failed syscalls are negative errno values). Its C ABI entry (`stackable_linux_raw_syscall6`, and `stackable_linux_static_raw_syscall6` at the same address) is hand-written assembly on x86-64 and ARM, as the AArch64 `stackable_linux_aarch64_raw_syscall6` is, because callers forward `clone`, `clone3` and `vfork` through it: a `CLONE_VM` child with a new stack resumes after the syscall instruction with the parent's frame registers, so nothing between that instruction and the return may touch memory. Keep it that way; a C body compiled at -O0 stores its result into the parent's stack.
 - `resolveDefaultSymbol`, `openLibraryNoLoad`, `resolveSymbolInHandle`, and `resolveSymbolChain` for consumer-controlled symbol resolver chains.
 - `installAbsoluteJumpPatchTransaction`, `installAbsoluteJumpPatch`, `installNamedAbsoluteJumpPatch`, and `restoreAbsoluteJumpPatch` for explicit wrapper/body-patch installation.
 - `locateLinuxVdsoImage`, `parseLinuxVdsoImageAt`, `resolveLinuxVdsoSymbol`, `installLinuxVdsoSymbolPatchTransaction`, and `installLinuxVdsoOverlayPatchTransaction` for vDSO image discovery and Elf parsing/patching.

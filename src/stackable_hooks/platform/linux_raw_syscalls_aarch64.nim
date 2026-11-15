@@ -102,21 +102,43 @@ enum {
 
 #define STACKABLE_AARCH64_PATCH_SIZE 16
 
+/* A hand-written function, like glibc's
+ * sysdeps/unix/sysv/linux/aarch64/syscall.S, and not C with an inline 'svc':
+ * a CLONE_VM child with a new stack resumes after 'svc' with the parent's
+ * registers but its own sp, so whatever runs between 'svc' and the return
+ * runs in both. The C version's epilogue ('ldp x29, x30, [sp], N') took the
+ * child's return address from its new stack instead of x30, and an -O0 build
+ * also kept its arguments in a frame. Here nothing touches memory between
+ * 'svc' and 'ret', and the child returns through x30 as with glibc.
+ *
+ * AAPCS64: nr and a1-a6 arrive in x0-x6. The kernel takes the number in x8
+ * and the arguments in x0-x5, and returns the kernel's -errno in x0. 'bti c'
+ * (a hint, so a no-op without BTI) is emitted only for a branch-protected
+ * build, whose objects are marked BTI-compatible. */
 long stackable_linux_aarch64_raw_syscall6(long nr, long a1, long a2, long a3,
-                                          long a4, long a5, long a6) {
-  register long x8 __asm__("x8") = nr;
-  register long x0 __asm__("x0") = a1;
-  register long x1 __asm__("x1") = a2;
-  register long x2 __asm__("x2") = a3;
-  register long x3 __asm__("x3") = a4;
-  register long x4 __asm__("x4") = a5;
-  register long x5 __asm__("x5") = a6;
-  __asm__ volatile("svc #0"
-                   : "+r"(x0)
-                   : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
-                   : "memory", "cc");
-  return x0;
-}
+                                          long a4, long a5, long a6);
+__asm__(
+  ".text\n"
+  ".p2align 2\n"
+  ".globl stackable_linux_aarch64_raw_syscall6\n"
+  ".type  stackable_linux_aarch64_raw_syscall6, %function\n"
+  "stackable_linux_aarch64_raw_syscall6:\n"
+  "    .cfi_startproc\n"
+#if defined(__ARM_FEATURE_BTI_DEFAULT) && __ARM_FEATURE_BTI_DEFAULT
+  "    hint  #34\n"
+#endif
+  "    mov   x8, x0\n"
+  "    mov   x0, x1\n"
+  "    mov   x1, x2\n"
+  "    mov   x2, x3\n"
+  "    mov   x3, x4\n"
+  "    mov   x4, x5\n"
+  "    mov   x5, x6\n"
+  "    svc   #0\n"
+  "    ret\n"
+  "    .cfi_endproc\n"
+  ".size stackable_linux_aarch64_raw_syscall6, .-stackable_linux_aarch64_raw_syscall6\n"
+);
 
 static long stackable_linux_aarch64_raw_mprotect(uintptr_t addr, size_t len,
                                                  int prot) {

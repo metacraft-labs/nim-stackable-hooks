@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Fixed
+
+- **`rawSyscall6` / `staticRawSyscall6` are safe to forward a CLONE_VM clone
+  through at every optimisation level.** A clone with `CLONE_VM` and a new
+  stack resumes the child after the syscall instruction with its own stack
+  pointer but the parent's frame registers. The x86-64 entry was a C function
+  with an inline `syscall`; built at -O0 it kept the result in a frame slot,
+  so the child stored its 0 into the parent's stack, where a later return
+  address lived, and the parent jumped to address 0 (SIGSEGV). The 32-bit ARM
+  entry restored `sp` from the frame pointer at any level, so the child ran on
+  with the parent's stack. Both, and the AArch64
+  `stackable_linux_aarch64_raw_syscall6`, are now single hand-written
+  functions, as glibc's `syscall(2)` is: nothing touches memory between the
+  syscall instruction and the return. `stackable_linux_static_raw_syscall6` is
+  now a second entry label of the same function instead of a C wrapper.
+  `tests/test_linux_raw_syscall_clone_vm.nim` clones through both entries at
+  -O0 and checks the creator's stack, with a positive control that runs the
+  old C body.
+
 ### Added
 
 - **`platform/linux_image_code_ranges`: the executable-section ranges of a

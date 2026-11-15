@@ -17,9 +17,12 @@
   functions, as glibc's `syscall(2)` is: nothing touches memory between the
   syscall instruction and the return. `stackable_linux_static_raw_syscall6` is
   now a second entry label of the same function instead of a C wrapper.
-  `tests/test_linux_raw_syscall_clone_vm.nim` clones through both entries at
-  -O0 and checks the creator's stack, with a positive control that runs the
-  old C body.
+  `tests/test_linux_raw_syscall_clone_vm.nim`, built at -O0, reads both
+  entries from its own executable file and requires `ret` straight after the
+  syscall instruction, and, when no syscall monitor has rewritten that
+  instruction in memory, clones through both entries and checks the
+  creator's stack. Both checks have a positive control that must see the old
+  C body's store.
 
 ### Added
 

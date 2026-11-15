@@ -130,10 +130,12 @@ const testCorpus*: seq[TestEntry] = @[
          "unsupported-platform contract off Linux."),
   TestEntry(stem: "test_linux_raw_syscall_clone_vm", targets: AllHostTargets,
     why: "Self-gating `when defined(linux) and defined(amd64)` with an " &
-         "`else: static: doAssert` arm. Live on linux/amd64: a real " &
-         "CLONE_VM|CLONE_VFORK clone through `rawSyscall6` and " &
-         "`staticRawSyscall6`, built at -O0, must leave its creator's " &
-         "stack untouched."),
+         "`else: static: doAssert` arm. Live on linux/amd64, built at " &
+         "-O0: both raw syscall entries, read from the test's executable " &
+         "file, must `ret` straight after `syscall`; when the code in " &
+         "memory is unmodified (no syscall monitor), a real " &
+         "CLONE_VM|CLONE_VFORK clone through each must also leave its " &
+         "creator's stack untouched."),
   TestEntry(stem: "test_linux_raw_syscalls_aarch64",
     targets: @[tLinuxAmd64, tLinuxArm64, tMacosArm64, tWindowsAmd64],
     why: "Self-gating `when defined(linux) and defined(arm64)` with an " &

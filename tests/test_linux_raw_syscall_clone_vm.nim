@@ -18,33 +18,75 @@
 ## optimised anyway is caught by the `__OPTIMIZE__` check below rather than
 ## passing vacuously.
 ##
-## Determinism: the clone uses CLONE_VFORK as well as CLONE_VM, so the creator
-## is suspended until the child exits. The child runs the entry's whole
-## post-syscall path, then copies the creator's stack region the entry's frame
-## occupies while the creator cannot yet have overwritten it. That region was
-## painted with a canary first, so any word the child stored there shows up
-## as a 0 (the child's return value). No timing, no retries.
+## The test makes two checks.
 ##
-## A positive control runs the same probe through a C copy of the old entry
-## and requires the probe to see that store, so a probe that can no longer see
-## the hazard fails instead of passing.
+## 1. The static check, which always runs. For each entry it finds the
+##    entry's `syscall` (`0f 05`) and requires the next instruction to be
+##    `ret` (`c3`), so that nothing runs, and nothing touches memory, between
+##    the two. A positive control applies the same reader to a C copy of the
+##    old entry, compiled at -O0 in this file, and requires the opposite: the
+##    old body's store of its result to its frame (`mov %rax,disp8(%rbp)`).
+##    So a reader that can no longer see the hazard fails instead of passing.
 ##
-## Real kernel, real clone; no mocks. x86-64 Linux only: elsewhere the file
-## compiles to a static assertion, as its siblings do.
+##    The bytes are read from the test's executable FILE, not from memory.
+##    The property belongs to the code the compiler and assembler produced,
+##    and memory need not hold that code: `repro test` runs every test under
+##    a syscall monitor, and that monitor rewrites each `syscall` instruction
+##    it finds in a loaded image into a trap and emulates the call from its
+##    signal handler. The file is mapped MAP_PRIVATE, so the rewrite never
+##    reaches it. Each entry is located through the line of
+##    `/proc/self/maps` whose range holds the entry's address: the file
+##    offset is that line's offset plus the entry's distance from the start
+##    of the range (proc(5)). That reads exactly the bytes the call jumps to,
+##    needs no symbol table (the test binary may be stripped, and the
+##    positive control is a `static` function), and needs no ELF parser.
+##    The line must name the same inode as `/proc/self/exe`, which is the
+##    file the bytes are then read from.
+##
+## 2. The behavioural check, which runs only when the code in memory is the
+##    code in the file. It clones through each entry with
+##    CLONE_VM|CLONE_VFORK, so the creator is suspended until the child
+##    exits. The child runs the entry's whole post-syscall path, then copies
+##    the creator's stack region the entry's frame occupies while the
+##    creator cannot yet have overwritten it. That region was painted with a
+##    canary first, so any word the child stored there shows up as a 0 (the
+##    child's return value). No timing, no retries. The positive control
+##    must see the old body's store here too.
+##
+##    Under the monitor this check does not apply: the instruction after the
+##    clone is the monitor's trap, so the child continues in the monitor's
+##    handler instead of the entry. The handler's own frame lands in the
+##    painted region, and a vfork child that leaves through a rewritten
+##    syscall while its creator is suspended is a known limit of the monitor
+##    (it is killed by SIGTRAP), not a property of the entry. The signal used
+##    is therefore the difference itself: the behavioural check runs when the
+##    bytes of every entry, up to the instruction after its `syscall`, are
+##    the same in memory as in the file, and otherwise prints why it did not
+##    run and is reported as skipped. The static check carries the assertion
+##    in either case.
+##
+## Real kernel, real clone, the test's own executable; no mocks. x86-64 Linux
+## only: elsewhere the file compiles to a static assertion, as its siblings
+## do. The ARM and AArch64 entries were checked by cross disassembly.
 
 when defined(linux) and defined(amd64):
-  import std/unittest
+  import std/[os, unittest]
   import stackable_hooks/platform/linux_raw_syscalls
 
   {.passC: "-O0".}
 
   {.emit: """
 #define _GNU_SOURCE
+#include <fcntl.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <unistd.h>
 
 #if defined(__OPTIMIZE__)
 #error "test_linux_raw_syscall_clone_vm must be compiled at -O0 (see its header)"
@@ -56,7 +98,8 @@ extern long stackable_linux_static_raw_syscall6(long, long, long, long, long,
                                                 long, long);
 
 /* The entry as it was before it became hand-written assembly. Kept only as
- * the positive control: the probe must see this body's post-syscall store. */
+ * the positive control: both checks must see this body's post-syscall
+ * store. */
 __attribute__((noinline, optimize("O0")))
 static long shk_test_legacy_c_raw_syscall6(long nr, long a1, long a2, long a3,
                                            long a4, long a5, long a6) {
@@ -73,6 +116,104 @@ static long shk_test_legacy_c_raw_syscall6(long nr, long a1, long a2, long a3,
 }
 
 typedef long (*shk_test_entry_fn)(long, long, long, long, long, long, long);
+
+/* The entries, by the index the Nim side passes: 0 the raw entry, 1 the
+ * static entry, 2 the positive control. */
+static shk_test_entry_fn shk_test_entry(int which) {
+  switch (which) {
+  case 0: return stackable_linux_raw_syscall6;
+  case 1: return stackable_linux_static_raw_syscall6;
+  case 2: return shk_test_legacy_c_raw_syscall6;
+  default: return NULL;
+  }
+}
+
+/* ---- Reading an entry's bytes from the executable file. ---- */
+
+/* How far from an entry's start its 'syscall' is looked for. The
+ * hand-written entry is 34 bytes; the old body at -O0 is under 100 with its
+ * 'syscall' well inside the first 64. */
+#define SHK_TEST_SCAN_BYTES 64
+/* The bytes after the 'syscall' the checks look at: one instruction. */
+#define SHK_TEST_AFTER_BYTES 4
+
+/* Copies 'n' bytes of the executable file, from the place the code at 'fn'
+ * was mapped from, into 'out'. Returns 0, or a negative code: -1 maps or the
+ * executable could not be opened, -2 no line of /proc/self/maps holds 'fn'
+ * through 'fn + n' as an executable mapping of the executable's inode, -3
+ * the file could not be read there. */
+static int shk_test_read_from_exe(const void *fn, unsigned char *out,
+                                  size_t n) {
+  uintptr_t want = (uintptr_t)fn;
+  int exe = open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
+  if (exe < 0) return -1;
+  struct stat st;
+  if (fstat(exe, &st) != 0) { close(exe); return -1; }
+  FILE *maps = fopen("/proc/self/maps", "re");
+  if (maps == NULL) { close(exe); return -1; }
+  /* proc(5): "address perms offset dev inode pathname". */
+  char line[4096];
+  int rc = -2;
+  while (fgets(line, sizeof line, maps) != NULL) {
+    unsigned long start = 0, end = 0, offset = 0, inode = 0;
+    char perms[8] = {0};
+    if (sscanf(line, "%lx-%lx %7s %lx %*s %lu", &start, &end, perms, &offset,
+               &inode) != 5)
+      continue;
+    if (want < start || want >= end) continue;
+    if (want + n > end || perms[2] != 'x' || inode != (unsigned long)st.st_ino)
+      break;
+    ssize_t got = pread(exe, out, n, (off_t)(offset + (want - start)));
+    rc = (got == (ssize_t)n) ? 0 : -3;
+    break;
+  }
+  fclose(maps);
+  close(exe);
+  return rc;
+}
+
+/* Index of the first 'syscall' (0f 05) in 'p', or -1. */
+static int shk_test_find_syscall(const unsigned char *p) {
+  for (int i = 0; i + 1 < SHK_TEST_SCAN_BYTES; i++)
+    if (p[i] == 0x0f && p[i + 1] == 0x05) return i;
+  return -1;
+}
+
+/* Copies the SHK_TEST_AFTER_BYTES bytes that follow entry 'which''s
+ * 'syscall', as the executable file holds them, into 'out'. Returns 0, a
+ * code of shk_test_read_from_exe, -4 when no 'syscall' is in the scanned
+ * bytes, or -5 for an unknown entry. */
+int shk_test_file_bytes_after_syscall(int which, unsigned char *out) {
+  shk_test_entry_fn fn = shk_test_entry(which);
+  if (fn == NULL) return -5;
+  unsigned char code[SHK_TEST_SCAN_BYTES + SHK_TEST_AFTER_BYTES];
+  int rc = shk_test_read_from_exe((const void *)fn, code, sizeof code);
+  if (rc != 0) return rc;
+  int at = shk_test_find_syscall(code);
+  if (at < 0) return -4;
+  memcpy(out, code + at + 2, SHK_TEST_AFTER_BYTES);
+  return 0;
+}
+
+/* 1 when the bytes of entry 'which' in memory, from its start through the
+ * instruction after its 'syscall', are those the executable file holds; 0
+ * when they differ (something rewrote the code at run time); or a negative
+ * code of shk_test_file_bytes_after_syscall. Only the entry's own bytes are
+ * compared: a rewritten 'syscall' in a neighbouring function is not this
+ * entry's business. */
+int shk_test_entry_runs_as_built(int which) {
+  shk_test_entry_fn fn = shk_test_entry(which);
+  if (fn == NULL) return -5;
+  unsigned char code[SHK_TEST_SCAN_BYTES + SHK_TEST_AFTER_BYTES];
+  int rc = shk_test_read_from_exe((const void *)fn, code, sizeof code);
+  if (rc != 0) return rc;
+  int at = shk_test_find_syscall(code);
+  if (at < 0) return -4;
+  return memcmp((const void *)fn, code, (size_t)at + 2 + SHK_TEST_AFTER_BYTES)
+             == 0;
+}
+
+/* ---- The behavioural CLONE_VM probe. ---- */
 
 #define SHK_TEST_CANARY 0x5afe5afe5afe5afeUL
 #define SHK_TEST_PAINT_WORDS 256
@@ -121,10 +262,13 @@ static long shk_test_clone_through(shk_test_entry_fn entry) {
                0x1111, 0x2222, 0x3333, 0x4444);
 }
 
-/* Returns the number of words of the creator's stack the child zeroed, or a
- * negative code: -1 the clone failed, -2 the child never reached its entry,
- * -3 waitpid failed or the child did not exit with status 0. */
-static long shk_test_creator_words_zeroed_by_child(shk_test_entry_fn entry) {
+/* Returns the number of words of the creator's stack the child zeroed when
+ * it cloned through entry 'which', or a negative code: -1 the clone failed,
+ * -2 the child never reached its entry, -3 waitpid failed or the child did
+ * not exit with status 0, -5 an unknown entry. */
+long shk_test_creator_words_zeroed_by_child(int which) {
+  shk_test_entry_fn entry = shk_test_entry(which);
+  if (entry == NULL) return -5;
   long pid = shk_test_clone_through(entry);
   if (pid <= 0) return -1;
   int status = 0;
@@ -136,63 +280,95 @@ static long shk_test_creator_words_zeroed_by_child(shk_test_entry_fn entry) {
     if (shk_test_snapshot[i] == 0) zeroed++;
   return zeroed;
 }
-
-long shk_test_zeroed_via_raw(void) {
-  return shk_test_creator_words_zeroed_by_child(stackable_linux_raw_syscall6);
-}
-long shk_test_zeroed_via_static(void) {
-  return shk_test_creator_words_zeroed_by_child(
-      stackable_linux_static_raw_syscall6);
-}
-long shk_test_zeroed_via_legacy_c(void) {
-  return shk_test_creator_words_zeroed_by_child(shk_test_legacy_c_raw_syscall6);
-}
-
-/* Bytes from the entry's 'syscall' (0f 05) to the next byte: 0xc3 ('ret') iff
- * nothing runs between them. -1 when no 'syscall' is found in the first 64
- * bytes. */
-static int shk_test_byte_after_syscall(const unsigned char *p) {
-  for (int i = 0; i + 2 < 64; i++)
-    if (p[i] == 0x0f && p[i + 1] == 0x05) return p[i + 2];
-  return -1;
-}
-int shk_test_raw_byte_after_syscall(void) {
-  return shk_test_byte_after_syscall(
-      (const unsigned char *)stackable_linux_raw_syscall6);
-}
-int shk_test_static_byte_after_syscall(void) {
-  return shk_test_byte_after_syscall(
-      (const unsigned char *)stackable_linux_static_raw_syscall6);
-}
 """.}
 
-  proc zeroedViaRaw(): clong {.importc: "shk_test_zeroed_via_raw", cdecl.}
-  proc zeroedViaStatic(): clong {.importc: "shk_test_zeroed_via_static", cdecl.}
-  proc zeroedViaLegacyC(): clong {.importc: "shk_test_zeroed_via_legacy_c", cdecl.}
-  proc rawByteAfterSyscall(): cint {.importc: "shk_test_raw_byte_after_syscall", cdecl.}
-  proc staticByteAfterSyscall(): cint {.importc: "shk_test_static_byte_after_syscall", cdecl.}
+  type Entry = enum
+    ## The order is the C side's `shk_test_entry` index.
+    eRaw = "stackable_linux_raw_syscall6"
+    eStatic = "stackable_linux_static_raw_syscall6"
+    eLegacyC = "the old C entry (positive control)"
+
+  proc fileBytesAfterSyscall(which: cint; output: ptr array[4, uint8]): cint
+    {.importc: "shk_test_file_bytes_after_syscall", cdecl.}
+  proc entryRunsAsBuilt(which: cint): cint
+    {.importc: "shk_test_entry_runs_as_built", cdecl.}
+  proc creatorWordsZeroedByChild(which: cint): clong
+    {.importc: "shk_test_creator_words_zeroed_by_child", cdecl.}
+
+  proc afterSyscall(entry: Entry; bytes: var array[4, uint8]): cint =
+    ## Reads the instruction bytes that follow `entry`'s `syscall` in the
+    ## executable file into `bytes`; 0, or the C side's negative code (and
+    ## `bytes` stays zero, which no check below accepts).
+    fileBytesAfterSyscall(cint(ord(entry)), addr bytes)
+
+  proc behaviourNotApplicableReason(): string =
+    ## Empty when every entry's code in memory is the code in the file, so
+    ## the behavioural check exercises the entries as built. Otherwise why it
+    ## does not. A read failure is not a reason: it fails the static check.
+    for entry in Entry:
+      if entryRunsAsBuilt(cint(ord(entry))) == 0:
+        return $entry & " differs in memory from the executable file, so " &
+          "its syscall instruction was rewritten at run time (a syscall " &
+          "monitor is active; LD_PRELOAD=" & getEnv("LD_PRELOAD") & "). A " &
+          "clone through it continues in the monitor's handler, not in the " &
+          "entry, so the clone would test the monitor."
+    ""
 
   const Rounds = 200
     ## The probe is deterministic; the rounds only show that it stays so.
 
+  suite "the raw syscall entries as built return straight after `syscall`":
+    test "positive control: the old C entry stores to its frame after `syscall`":
+      # `mov %rax, disp8(%rbp)`: REX.W, opcode 89 (store r64), ModRM with
+      # mod 01 and r/m 101 (rbp + disp8), reg 000 (rax).
+      var after: array[4, uint8]
+      check afterSyscall(eLegacyC, after) == 0
+      check after[0] == 0x48
+      check after[1] == 0x89
+      check after[2] == 0x45
+
+    test "rawSyscall6's next instruction after `syscall` is `ret`":
+      var after: array[4, uint8]
+      check afterSyscall(eRaw, after) == 0
+      check after[0] == 0xc3
+
+    test "staticRawSyscall6's next instruction after `syscall` is `ret`":
+      var after: array[4, uint8]
+      check afterSyscall(eStatic, after) == 0
+      check after[0] == 0xc3
+
+    test "every entry's code can be compared with the executable file":
+      for entry in Entry:
+        check entryRunsAsBuilt(cint(ord(entry))) in [0.cint, 1.cint]
+
+  let notApplicable = behaviourNotApplicableReason()
+  if notApplicable.len > 0:
+    echo "[test_linux_raw_syscall_clone_vm] the CLONE_VM behavioural check " &
+      "does not apply here: " & notApplicable & " The static check " &
+      "above carries the assertion."
+
   suite "a CLONE_VM child does not write into its creator's stack":
+    setup:
+      if notApplicable.len > 0:
+        skip()
+
     test "positive control: the probe sees a C entry's post-syscall store":
-      for _ in 0 ..< Rounds:
-        check zeroedViaLegacyC() >= 1
+      if notApplicable.len == 0:
+        for _ in 0 ..< Rounds:
+          check creatorWordsZeroedByChild(cint(ord(eLegacyC))) >= 1
 
     test "rawSyscall6 leaves the creator's stack untouched":
-      for _ in 0 ..< Rounds:
-        check zeroedViaRaw() == 0
+      if notApplicable.len == 0:
+        for _ in 0 ..< Rounds:
+          check creatorWordsZeroedByChild(cint(ord(eRaw))) == 0
 
     test "staticRawSyscall6 leaves the creator's stack untouched":
-      for _ in 0 ..< Rounds:
-        check zeroedViaStatic() == 0
+      if notApplicable.len == 0:
+        for _ in 0 ..< Rounds:
+          check creatorWordsZeroedByChild(cint(ord(eStatic))) == 0
 
-    test "both entries return straight after the syscall instruction":
-      check rawByteAfterSyscall() == 0xc3
-      check staticByteAfterSyscall() == 0xc3
-
-    test "the Nim wrappers still forward an ordinary syscall":
+  suite "the Nim wrappers":
+    test "still forward an ordinary syscall":
       # getpid(2) through both bindings: the entry is the kernel ABI, unchanged.
       const SysGetpid = 39
       check rawSyscall6(SysGetpid, 0, 0, 0, 0, 0, 0) > 0

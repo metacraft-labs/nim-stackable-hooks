@@ -58,7 +58,7 @@ Three runners execute this repo's tests:
 
 | Runner        | Entry point                                                         |
 | ------------- | ------------------------------------------------------------------- |
-| `just test`   | delegates to `nimble test`                                          |
+| `just test`   | delegates to `repro test`                                           |
 | `nimble test` | the `test` task in `stackable_hooks.nimble`                         |
 | `repro test`  | the edges `repro.nim` emits (`.github/workflows/ci-reprobuild.yml`) |
 
@@ -79,13 +79,12 @@ also fails if either lane grows a test path of its own.
   nim c -r tests/test_reentrancy_guard_prevents_recursion.nim
   ```
 
-Note that `just build` alone is not sufficient verification of the
-Windows/macOS arms: `src/stackable_hooks.nim` imports the Windows tree only
-`when defined(windows)`, so a bogus symbol in
-`src/stackable_hooks/windows_injector.nim` does not redden a plain
-`nim check` of the umbrella on Linux or macOS. `just build` therefore also
-checks that file for both Windows CPUs, and the exhaustive matrix runs
-inside the suite.
+Note that a plain `nim check` of the umbrella is not sufficient verification
+of the Windows/macOS arms: `src/stackable_hooks.nim` imports the Windows tree
+only `when defined(windows)`, so a bogus symbol in
+`src/stackable_hooks/windows_injector.nim` does not redden it on Linux or
+macOS. `just check` therefore also checks that file for both Windows CPUs, and
+the exhaustive matrix runs inside the suite.
 
 ## Consumer Integration
 

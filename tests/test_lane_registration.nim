@@ -2,7 +2,7 @@
 ##
 ## WHAT WENT WRONG, AND WHY A GUARD IS NEEDED AT ALL
 ## -------------------------------------------------
-## This repo has three runners -- ``Justfile`` (-> ``nimble test``),
+## This repo has three runners -- ``Justfile`` (-> ``nimble test``, now ``repro test``),
 ## ``stackable_hooks.nimble``'s test list, and ``repro.nim``'s reprobuild
 ## edges (a separate CI lane: ``.github/workflows/ci-reprobuild.yml`` runs
 ## ``repro build`` / ``repro test`` beside ``just test``). Two of them each

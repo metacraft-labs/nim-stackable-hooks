@@ -6,7 +6,8 @@
 ## This repo has three test runners, and until this file landed each one
 ## carried its own hand-written copy of the corpus:
 ##
-## * ``Justfile`` (``just test`` -> ``nimble test``)
+## * ``Justfile`` (``just test``; it ran ``nimble test``, and now runs
+##   ``repro test``, so it follows ``repro.nim``)
 ## * ``stackable_hooks.nimble`` -- ``selectedTests()``
 ## * ``repro.nim`` -- ``portableTestSpecs`` / ``linuxOnlyTestSpecs`` /
 ##   ``windowsOnlyTestSpecs``, the reprobuild CI lane (``ci-reprobuild.yml``

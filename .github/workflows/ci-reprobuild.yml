@@ -123,10 +123,10 @@ jobs:
           # The selected source bootstrap supplies the runtime closure on
           # every host, including a usable macOS shell and Windows compiler.
           repro-from-source: true
-          repro-build-pin: c14b1e618d7c4b64476d89792e80b8e8f10b8a52
-          repro-runquota-pin: 292e578d57eb85d6037f9e2d3a03f0bcb0489dbb
-          repro-io-mon-pin: 5e71adf033b860c0fdbe13dda4320cf4a580f632
-          repro-stackable-hooks-pin: d36cab880711c2f50f57079623a1ce89ba4a83dc
+          repro-build-pin: b9cf09b07e2c780f314c4244e4c8df7988fc2e78
+          repro-runquota-pin: 98ea3e58df67f736a8527788d1563e31291a4881
+          repro-io-mon-pin: 30d85793e891c1a80859d52a9eb197b42d56752c
+          repro-stackable-hooks-pin: d715806424e8373708494913e59a48237978cc2a
           gh-token: ${{ steps.ci_token.outputs.token }}
 
       - name: repro build

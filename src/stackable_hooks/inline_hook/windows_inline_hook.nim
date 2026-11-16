@@ -41,6 +41,10 @@ const inlineDir = currentSourcePath().replace("\\", "/").rsplit("/", 1)[0] & "/w
 {.compile: inlineDir & "/length_decoder.c".}
 {.compile: inlineDir & "/rel32_fixup.c".}
 {.compile: inlineDir & "/install_windows.c".}
+# Windows on Arm64 relocation (reprobuild-pm Monitor-Hook-Shim.md, "Windows on
+# Arm64 install backend"); pure C, compiled on every Windows CPU so the x86
+# build and the ARM64 build share one source list.
+{.compile: inlineDir & "/a64_relocate.c".}
 
 proc inlineHookInstall*(target: pointer; hook: pointer;
                         outTrampoline: ptr pointer): cint

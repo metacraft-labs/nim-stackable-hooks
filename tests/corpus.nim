@@ -190,12 +190,22 @@ const testCorpus*: seq[TestEntry] = @[
     why: "Real peer threads and executable pages on Windows x86: every " &
          "default patching entry point refuses, unpatched and with peers " &
          "resumed and handles closed, when a live thread cannot be frozen. " &
-         "Other hosts compile the platform guard; native Windows ARM64 " &
-         "inline hooks remain deferred."),
+         "Other hosts compile the platform guard. Native Windows ARM64 " &
+         "inline hooks are covered by test_windows_arm64_inline_hook."),
   TestEntry(stem: "test_windows_hook_page_preparation", targets: AllHostTargets,
     why: "Real executable pages, trampolines and peer threads on Windows x86. " &
-         "Other hosts compile the platform guard; native Windows ARM64 " &
-         "inline hooks remain deferred. Windows ARM CI runs the x64 binary."),
+         "Other hosts compile the platform guard. Native Windows ARM64 " &
+         "inline hooks are covered by test_windows_arm64_inline_hook."),
+  TestEntry(stem: "test_a64_relocate", targets: AllHostTargets & @[tWindowsArm64],
+    why: "Portable: the Windows on Arm64 inline hook's instruction " &
+         "relocation is pure encoding, so its exact words are checked on " &
+         "every host."),
+  TestEntry(stem: "test_windows_arm64_inline_hook",
+    targets: @[tLinuxAmd64, tMacosArm64, tWindowsAmd64, tWindowsArm64],
+    why: "Self-gating `when defined(windows) and defined(arm64)` with an " &
+         "`else: static: doAssert` arm. Live only on native Windows ARM64, " &
+         "where it hooks real ARM64 code through the production backend; " &
+         "elsewhere the cross-target lane compile-verifies it."),
   TestEntry(stem: "test_windows_inline_hook_api", targets: AllHostTargets,
     why: "Off Windows its `else` arm compiles install_windows.c and runs " &
          "real C-ABI doAsserts, so it is genuine coverage everywhere."),

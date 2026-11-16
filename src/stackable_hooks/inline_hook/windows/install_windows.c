@@ -434,10 +434,10 @@ static ct_tramp_page_t *find_owning_page(uint8_t *slot)
         if (slot >= pg->base && slot < pg->base + CT_TRAMP_PAGE_BYTES) {
             return pg;
         }
-#endif
     }
     return NULL;
 }
+#endif
 
 /* ---- Thread-suspend orchestration --------------------------------
  *

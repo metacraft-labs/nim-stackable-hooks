@@ -48,6 +48,20 @@
 #include "install_windows.h"
 #include "length_decoder.h"
 #include "rel32_fixup.h"
+#include "a64_relocate.h"
+
+/* Windows on Arm64 (reprobuild-pm spec/Monitor-Hook-Shim.md, "Windows on Arm64
+ * install backend", approved by Zahary Karadjov, 2026-11-16). The registry,
+ * trampoline pages, thread freeze and transactions below are shared; what
+ * differs is the patch (one `B <stub>` instead of `JMP rel32`), its reach
+ * (+/-128 MB instead of +/-2 GB), the absence of a hot-patch shape, and the
+ * relocation of the displaced instruction (a64_relocate.c instead of the x86
+ * length decoder and rel32 fixup). */
+#if defined(_M_ARM64) || defined(__aarch64__)
+#define CT_INLINE_HOOK_ARM64 1
+#else
+#define CT_INLINE_HOOK_ARM64 0
+#endif
 
 #include <string.h>
 
@@ -221,7 +235,14 @@ static void free_hook(ct_hook_entry_t *e)
  * (no copy needed), so no slot is allocated. */
 
 #define CT_TRAMP_PAGE_BYTES   (64u * 1024u)
+#if CT_INLINE_HOOK_ARM64
+/* Forwarding stub (16) + relocated instruction and its branch back (at most
+ * CT_A64_RELOCATED_MAX_WORDS words, 64 bytes), or the noreturn layout
+ * (literal 8 + entry stub 24 + the same 64). */
+#define CT_TRAMP_SLOT_BYTES   128u
+#else
 #define CT_TRAMP_SLOT_BYTES   64u
+#endif
 #define CT_TRAMP_SLOTS_PER_PAGE (CT_TRAMP_PAGE_BYTES / CT_TRAMP_SLOT_BYTES)
 
 typedef struct ct_tramp_page {
@@ -259,6 +280,15 @@ static int64_t signed_delta(uintptr_t from, uintptr_t to)
     return (int64_t)to - (int64_t)from;
 }
 
+#if CT_INLINE_HOOK_ARM64
+/* ARM64: the patch is a `B` (+/-128 MB). The same 64 KB headroom applies:
+ * every instruction of the slot must stay in reach, not only its base. */
+static int in_rel32_range(uintptr_t from, uintptr_t to)
+{
+    int64_t d = signed_delta(from, to);
+    return d >= -(CT_A64_B_REACH - 0x10000) && d <= (CT_A64_B_REACH - 0x10000);
+}
+#else
 static int in_rel32_range(uintptr_t from, uintptr_t to)
 {
     int64_t d = signed_delta(from, to);
@@ -267,6 +297,7 @@ static int in_rel32_range(uintptr_t from, uintptr_t to)
     return d >= ((int64_t)INT32_MIN + 0x10000) &&
             d <= ((int64_t)INT32_MAX - 0x10000);
 }
+#endif
 
 /* Find or allocate a trampoline slot within ±2 GB of `target_addr`. */
 static uint8_t *alloc_tramp_slot(uintptr_t target_addr)
@@ -295,7 +326,11 @@ static uint8_t *alloc_tramp_slot(uintptr_t target_addr)
     if (granularity == 0) granularity = 65536u;
 
     uintptr_t base = target_addr & ~((uintptr_t)granularity - 1u);
+#if CT_INLINE_HOOK_ARM64
+    const int64_t window = (int64_t)0x07000000;  /* 112 MB, inside B's 128 MB */
+#else
     const int64_t window = (int64_t)0x60000000;  /* 1.5 GB */
+#endif
 
     LPVOID got = NULL;
     int64_t up_off = (int64_t)granularity;
@@ -388,6 +423,7 @@ static uint8_t *alloc_tramp_slot(uintptr_t target_addr)
     return pg->base;
 }
 
+#if !CT_INLINE_HOOK_ARM64   /* the x86 rel32 thunk arena's page */
 /* Locate the page that owns `slot`.  Used to attach a thunk arena to
  * each install. */
 static ct_tramp_page_t *find_owning_page(uint8_t *slot)
@@ -398,6 +434,7 @@ static ct_tramp_page_t *find_owning_page(uint8_t *slot)
         if (slot >= pg->base && slot < pg->base + CT_TRAMP_PAGE_BYTES) {
             return pg;
         }
+#endif
     }
     return NULL;
 }
@@ -593,6 +630,11 @@ fail:
  * upstream of the function entry). */
 static int detect_hotpatch(const uint8_t *target)
 {
+#if CT_INLINE_HOOK_ARM64
+    /* No /hotpatch shape exists on ARM64: every patch is one B. */
+    (void)target;
+    return 0;
+#endif
     /* We may be asked to inspect bytes upstream of a function entry,
      * which on a tightly-packed code page might cross into a
      * non-existent preceding page.  Earlier revisions wrapped the
@@ -639,6 +681,7 @@ static int detect_hotpatch(const uint8_t *target)
     return 1;
 }
 
+#if !CT_INLINE_HOOK_ARM64
 /* Write a 5-byte JMP rel32 at `at` jumping to `to`. */
 static void emit_jmp_rel32(uint8_t *at, uintptr_t to)
 {
@@ -650,6 +693,7 @@ static void emit_jmp_rel32(uint8_t *at, uintptr_t to)
     at[3] = (uint8_t)((disp >> 16) & 0xFFu);
     at[4] = (uint8_t)((disp >> 24) & 0xFFu);
 }
+#endif
 
 /* Write a 2-byte JMP rel8 at `at` jumping to `to`. */
 static int emit_jmp_rel8(uint8_t *at, uintptr_t to)
@@ -839,7 +883,11 @@ int ct_inline_hook_commit_transaction(void)
             find_hook(op->target) != NULL)
             continue;
         uint8_t *from = (uint8_t *)op->target;
+#if CT_INLINE_HOOK_ARM64
+        size_t len = 4;   /* one B */
+#else
         size_t len = 5;
+#endif
         /* A distant hook falls back from hotpatch to a five-byte overwrite. */
         const int64_t hotpatch_disp = (int64_t)(uintptr_t)op->hook -
                                       (int64_t)(uintptr_t)from;
@@ -921,6 +969,71 @@ static int ct_dbg_enabled(void)
 }
 #define CT_DBG(...) do { if (ct_dbg_enabled()) { fprintf(stderr, __VA_ARGS__); fflush(stderr); } } while (0)
 
+#if CT_INLINE_HOOK_ARM64
+/* ARM64 install. One instruction is displaced, so the patch is a single
+ * aligned 32-bit store -- another thread sees either the old instruction or
+ * the new branch, never a torn one -- and only that instruction needs
+ * relocating.
+ *
+ *   target+0 : B slot+0                       (the patch)
+ *   slot+0   : LDR X16, #8 ; BR X16 ; .quad hook   (forwarding stub)
+ *   slot+16  : relocated target[0] ; B target+4    (the trampoline)
+ *
+ * The slot is within B's reach of the target by construction, so the branch
+ * back is direct: it clobbers no register, and the displaced instruction may
+ * itself write X16 (the import-thunk shape `ADRP X16 ; LDR X16 ; BR X16`). */
+static int install_locked(void *target, void *hook, void **out_trampoline)
+{
+    CT_DBG("[ct_inline_hook] install_locked(arm64) target=%p hook=%p\n", target, hook);
+    if (target == NULL || hook == NULL || ((uintptr_t)target & 3u) != 0) return -1;
+    if (find_hook(target) != NULL) return -5;
+
+    ct_hook_entry_t *entry = alloc_hook();
+    if (entry == NULL) return -4;
+
+    uint32_t *t = (uint32_t *)target;
+    const uint32_t original = t[0];
+
+    uint8_t *slot = alloc_tramp_slot((uintptr_t)t);
+    if (slot == NULL) { free_hook(entry); return -4; }
+    if (!in_rel32_range((uintptr_t)t, (uintptr_t)slot) ||
+        !in_rel32_range((uintptr_t)t, (uintptr_t)slot + CT_TRAMP_SLOT_BYTES)) {
+        free_hook(entry);
+        return -3;
+    }
+
+    uint32_t *stub = (uint32_t *)slot;
+    ct_a64_emit_abs_jump(stub, (uintptr_t)hook);
+
+    uint32_t *body = (uint32_t *)(slot + 16);
+    int words = ct_a64_relocate(original, (uintptr_t)t, (uintptr_t)body,
+                                (uintptr_t)t + 4, body, CT_A64_RELOCATED_MAX_WORDS);
+    CT_DBG("[ct_inline_hook] a64_relocate(0x%08x) rc=%d\n", original, words);
+    if (words == -2) { free_hook(entry); return -2; }
+    if (words <= 0) { free_hook(entry); return -3; }
+    FlushInstructionCache(GetCurrentProcess(), slot, CT_TRAMP_SLOT_BYTES);
+
+    uint32_t patch;
+    if (ct_a64_encode_b((uintptr_t)t, (uintptr_t)slot, &patch) != 0) {
+        free_hook(entry);
+        return -3;
+    }
+    memcpy(entry->orig_prologue, t, 4);
+    entry->prologue_len = 4;
+    if (write_patch((void *)t, 4, (const uint8_t *)&patch) != 0) {
+        free_hook(entry);
+        return -4;
+    }
+
+    entry->target = target;
+    entry->hook = hook;
+    entry->trampoline = body;
+    entry->install_mode = CT_INSTALL_MODE_OVERWRITE;
+    g_last_install_mode = CT_INSTALL_MODE_OVERWRITE;
+    if (out_trampoline != NULL) *out_trampoline = entry->trampoline;
+    return 0;
+}
+#else
 static int install_locked(void *target, void *hook, void **out_trampoline)
 {
     CT_DBG("[ct_inline_hook] install_locked target=%p hook=%p\n", target, hook);
@@ -1156,6 +1269,8 @@ static int install_locked(void *target, void *hook, void **out_trampoline)
     return 0;
 }
 
+#endif /* CT_INLINE_HOOK_ARM64 */
+
 static int uninstall_locked(void *target)
 {
     ct_hook_entry_t *entry = find_hook(target);
@@ -1315,6 +1430,83 @@ int ct_inline_hook_install_no_suspend(void *target, void *hook,
 /* Emit the noreturn-mode entry stub at `at`.  Returns the number of
  * bytes written (must equal CT_NORETURN_STUB_BYTES). */
 #define CT_NORETURN_STUB_BYTES 30
+
+#if CT_INLINE_HOOK_ARM64
+/* ARM64 noreturn install: the same record-then-continue contract as the x64
+ * stub below, in AAPCS64 terms. Nothing remains on the stack by the time the
+ * displaced instruction runs, so the NT stub's caller sees the frame it
+ * expects.
+ *
+ *   slot+0   : .quad record_callback
+ *   slot+8   : STP X29, X30, [SP, #-48]!   ; frame, keeps SP 16-aligned
+ *              STP X0, X1, [SP, #16]       ; the stub's two arguments
+ *              LDR X16, slot+0
+ *              BLR X16                     ; record
+ *              LDP X0, X1, [SP, #16]
+ *              LDP X29, X30, [SP], #48
+ *   slot+32  : relocated target[0] ; B target+4
+ *
+ * As on x64, only the first two argument registers are preserved: the one
+ * client (NtTerminateThread) takes two. Volatile registers are the
+ * callback's to clobber, as in any call. */
+static int install_locked_noreturn(void *target, void *record_callback,
+                                    void **out_trampoline)
+{
+    CT_DBG("[ct_inline_hook] install_locked_noreturn(arm64) target=%p cb=%p\n",
+            target, record_callback);
+    if (target == NULL || record_callback == NULL || ((uintptr_t)target & 3u) != 0)
+        return -1;
+    if (find_hook(target) != NULL) return -5;
+    ct_hook_entry_t *entry = alloc_hook();
+    if (entry == NULL) return -4;
+
+    uint32_t *t = (uint32_t *)target;
+    const uint32_t original = t[0];
+    uint8_t *slot = alloc_tramp_slot((uintptr_t)t);
+    if (slot == NULL) { free_hook(entry); return -4; }
+    if (!in_rel32_range((uintptr_t)t, (uintptr_t)slot) ||
+        !in_rel32_range((uintptr_t)t, (uintptr_t)slot + CT_TRAMP_SLOT_BYTES)) {
+        free_hook(entry);
+        return -3;
+    }
+
+    const uint64_t cb = (uint64_t)(uintptr_t)record_callback;
+    uint32_t *w = (uint32_t *)slot;
+    w[0] = (uint32_t)(cb & 0xFFFFFFFFu);
+    w[1] = (uint32_t)(cb >> 32);
+    w[2] = 0xA9BD7BFDu;                                   /* STP X29,X30,[SP,#-48]! */
+    w[3] = 0xA90107E0u;                                   /* STP X0,X1,[SP,#16] */
+    w[4] = 0x58000000u | (((uint32_t)-4 & 0x7FFFFu) << 5) | 16u;  /* LDR X16, slot+0 */
+    w[5] = 0xD63F0200u;                                   /* BLR X16 */
+    w[6] = 0xA94107E0u;                                   /* LDP X0,X1,[SP,#16] */
+    w[7] = 0xA8C37BFDu;                                   /* LDP X29,X30,[SP],#48 */
+    uint32_t *body = w + 8;
+    int words = ct_a64_relocate(original, (uintptr_t)t, (uintptr_t)body,
+                                (uintptr_t)t + 4, body, CT_A64_RELOCATED_MAX_WORDS);
+    if (words == -2) { free_hook(entry); return -2; }
+    if (words <= 0) { free_hook(entry); return -3; }
+    FlushInstructionCache(GetCurrentProcess(), slot, CT_TRAMP_SLOT_BYTES);
+
+    uint32_t patch;
+    if (ct_a64_encode_b((uintptr_t)t, (uintptr_t)(slot + 8), &patch) != 0) {
+        free_hook(entry);
+        return -3;
+    }
+    memcpy(entry->orig_prologue, t, 4);
+    entry->prologue_len = 4;
+    if (write_patch((void *)t, 4, (const uint8_t *)&patch) != 0) {
+        free_hook(entry);
+        return -4;
+    }
+    entry->target = target;
+    entry->hook = record_callback;
+    entry->trampoline = NULL;
+    entry->install_mode = CT_INSTALL_MODE_OVERWRITE;
+    g_last_install_mode = CT_INSTALL_MODE_OVERWRITE;
+    if (out_trampoline != NULL) *out_trampoline = NULL;
+    return 0;
+}
+#else /* !CT_INLINE_HOOK_ARM64 */
 
 #if !CT_ILD_MODE64
 /* The noreturn entry stub below is hand-assembled x86-64 against the Win64
@@ -1486,6 +1678,8 @@ static int install_locked_noreturn(void *target, void *record_callback,
     if (out_trampoline != NULL) *out_trampoline = NULL;
     return 0;
 }
+
+#endif /* CT_INLINE_HOOK_ARM64 */
 
 int ct_inline_hook_install_noreturn(void *target, void *record_callback,
                                     void **out_trampoline)

@@ -206,6 +206,12 @@ const testCorpus*: seq[TestEntry] = @[
          "`else: static: doAssert` arm. Live only on native Windows ARM64, " &
          "where it hooks real ARM64 code through the production backend; " &
          "elsewhere the cross-target lane compile-verifies it."),
+  TestEntry(stem: "test_windows_arm64_entry_park",
+    targets: @[tLinuxAmd64, tMacosArm64, tWindowsAmd64, tWindowsArm64],
+    why: "Self-gating `when defined(windows) and defined(arm64)` with an " &
+         "`else: static: doAssert` arm. Live only on native Windows ARM64: " &
+         "parks a real ARM64 child, borrows its main thread and runs it to " &
+         "its own exit code; elsewhere the cross-target lane compiles it."),
   TestEntry(stem: "test_windows_inline_hook_api", targets: AllHostTargets,
     why: "Off Windows its `else` arm compiles install_windows.c and runs " &
          "real C-ABI doAsserts, so it is genuine coverage everywhere."),

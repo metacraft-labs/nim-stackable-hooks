@@ -1,0 +1,93 @@
+# DEVELOPMENT PROBE for the Windows on Arm64 inline-hook backend and entry
+# park (reprobuild-pm spec/Monitor-Hook-Shim.md, "Windows on Arm64 install
+# backend"). Runs only on its own branch. GitHub's hosted windows-11-arm image
+# is a documented exception (metacraft-dev-guidelines ci-workflow-standards.md):
+# named leg "nim-stackable-hooks windows-arm64 probe", owner the windows-aarch64
+# leg (reprobuild-pm Distribution-And-Packaging.md §7.1), follow-up: delete this
+# workflow before the branch lands; qualification moves to the native
+# windows-arm64 reprobuild leg on eph-win-arm64, which was down on 2026-11-16.
+#
+# The test binaries are built by a native ARM64 Nim that this job rebuilds with
+# koch boot from the pinned 2.2.8 source; only the one-off seed compile runs
+# the x64 compiler. Every test image is ARM64.
+name: probe-windows-arm64
+
+on:
+  push:
+    branches: [windows-arm64-inline-hook]
+    paths:
+      - .github/workflows/probe-windows-arm64.yml
+      - src/stackable_hooks/inline_hook/**
+      - src/stackable_hooks/windows_entry_park.nim
+      - tests/test_a64_relocate.nim
+      - tests/test_windows_arm64_inline_hook.nim
+      - tests/test_windows_arm64_entry_park.nim
+      - tests/fixtures/windows_arm64_inline_hook.c
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: windows-11-arm
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      WORK: C:\w
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Native toolchain
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          New-Item -ItemType Directory -Force $env:WORK | Out-Null
+          Set-Location $env:WORK
+          $pins = @(
+            @{ n = 'llvm-mingw.zip'; u = 'https://github.com/mstorsjo/llvm-mingw/releases/download/20261104/llvm-mingw-20261104-ucrt-aarch64.zip'; s = '7d7f8387a8706639b0b47a629d6e23f8b3ef9acce67e9832b8cd4c5bb2816eab' },
+            @{ n = 'nim-x64.zip'; u = 'https://nim-lang.org/download/nim-2.2.8_x64.zip'; s = '11fe2415a64a791b899cc78e2eeacdde93b5f122f2fabc447db36d38002bfb8c' }
+          )
+          foreach ($p in $pins) {
+            Invoke-WebRequest -Uri $p.u -OutFile $p.n
+            if ((Get-FileHash -Algorithm SHA256 $p.n).Hash.ToLowerInvariant() -ne $p.s) { throw "sha256 $($p.n)" }
+            & "$env:SystemRoot\System32\tar.exe" -xf $p.n
+            if ($LASTEXITCODE) { throw "extract $($p.n)" }
+          }
+          $bin = "$env:WORK\llvm-mingw-20261104-ucrt-aarch64\bin"
+          $src = "$env:WORK\nim-2.2.8"
+          $env:PATH = "$bin;$env:PATH"
+          foreach ($i in @('nim', 'koch')) {
+            aarch64-w64-mingw32-windres -i "$src\icons\$i.rc" -O coff -o "$src\icons\${i}_icon.o"
+            if ($LASTEXITCODE) { throw "windres $i" }
+          }
+          & "$src\bin\nim.exe" c --hints:off -d:release --cpu:arm64 --cc:gcc --nimcache:"$env:WORK\nc-seed" -o:"$src\bin\nim-arm64.exe" "$src\compiler\nim.nim"
+          if ($LASTEXITCODE) { throw 'seed compile' }
+          Set-Location $src
+          Move-Item -Force bin\nim.exe bin\nim-x64-seed.exe
+          Copy-Item bin\nim-arm64.exe bin\nim.exe
+          & bin\nim.exe c --hints:off -d:release -o:koch-arm64.exe koch.nim
+          if ($LASTEXITCODE) { throw 'koch' }
+          & .\koch-arm64.exe boot -d:release --hints:off | Select-Object -Last 5
+          if ($LASTEXITCODE) { throw 'koch boot' }
+          & bin\nim.exe -v | Select-Object -First 1
+          "$src\bin;$bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Tests
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          nim -v | Select-Object -First 1
+          $failed = @()
+          foreach ($t in @('test_a64_relocate', 'test_windows_inline_hook_api',
+                           'test_windows_arm64_inline_hook', 'test_windows_arm64_entry_park')) {
+            if (-not (Test-Path "tests/$t.nim")) { continue }
+            Write-Host "::group::$t"
+            nim c -r --hints:off --path:src --nimcache:"$env:WORK\nc-$t" "-o:$env:WORK\$t.exe" "tests/$t.nim"
+            $rc = $LASTEXITCODE
+            Write-Host "::endgroup::"
+            "$t exit=$rc"
+            if ($rc -ne 0) { $failed += $t }
+          }
+          if ($failed.Count) { throw "failed: $($failed -join ', ')" }

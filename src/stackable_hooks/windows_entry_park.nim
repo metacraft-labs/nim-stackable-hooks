@@ -60,11 +60,15 @@
 ##
 ## PORTABILITY
 ## -----------
-## The self-jump encoding is x86. On Windows/ARM64 the park reports
-## ``epsUnsupported`` and the caller keeps the legacy technique. A 32-bit
-## host cannot address a 64-bit child's PEB or thread context either, so
-## that combination reports ``epsUnsupported`` too; it is already handled
-## by the 64-bit inject helper.
+## The park and the borrowed-call stub exist for x86/x64 (``EB FE``, a
+## ``CONTEXT_AMD64`` / ``CONTEXT_i386``) and for native Windows/ARM64
+## (``B .`` = ``0x14000000``, a ``CONTEXT_ARM64``; reprobuild-pm
+## spec/Monitor-Hook-Shim.md, "Windows on Arm64 install backend", approved by
+## Zahary Karadjov, 2026-11-16). Each host parks only children of its own
+## machine: an ARM64 host refuses an x64-emulated child, an x64 host an ARM64
+## one. A 32-bit host cannot address a 64-bit child's PEB or thread context
+## either, so that combination reports ``epsUnsupported`` too; it is already
+## handled by the 64-bit inject helper.
 
 when not defined(windows):
   {.error: "stackable_hooks/windows_entry_park is Windows-only".}
@@ -122,7 +126,9 @@ type
     status*: EntryParkStatus
     entry*: pointer
     hProcess: pointer
-    origBytes: array[2, byte]
+    origBytes: array[4, byte]
+      ## The entry bytes the self-jump replaced: two on x86/x64, four on
+      ## ARM64 (``EntryPatchLen``).
     oldProtect: uint32
 
   BorrowedCallStatus* = enum
@@ -186,11 +192,12 @@ type
       ## so detach is unsound without it.
     stubLen: uint
     savedCtx: array[1248, byte]
-      ## The parked context (``ContextAmd64Size`` = 1232, plus 16 for 16-byte
-      ## alignment), saved before the borrow, handed back verbatim if the call
-      ## later returns under ``keepWaitingForBorrow``. Sized by literal because
-      ## this type is compiled on every architecture, while ``ContextAmd64Size``
-      ## lives in the amd64/i386 branch below.
+      ## The parked context (``NativeCtxSize``: 1232 for ``CONTEXT_AMD64``,
+      ## 912 for ``CONTEXT_ARM64``, plus 16 for 16-byte alignment), saved
+      ## before the borrow, handed back verbatim if the call later returns
+      ## under ``keepWaitingForBorrow``. Sized by literal because this type is
+      ## compiled on every architecture, while ``NativeCtxSize`` lives in the
+      ## architecture branch below.
     live: bool
       ## ``true`` until a building block consumes the handle, so a second
       ## building block on the same handle is a no-op rather than a
@@ -282,7 +289,7 @@ const
     ## ``STATUS_IO_TIMEOUT``. The exit code a poisoned child is terminated
     ## with, so a post-mortem can tell it from a crash.
 
-when defined(i386) or defined(amd64):
+when defined(i386) or defined(amd64) or defined(arm64):
 
   type
     NtStatus = int32
@@ -308,23 +315,48 @@ when defined(i386) or defined(amd64):
     NtSignature = 0x00004550'u32          # "PE\0\0"
     EntryPointOffset = 0x28'u
 
-    # CONTEXT_AMD64 | CONTEXT_CONTROL, and the field offsets we read. We
-    # address the structure by offset rather than transcribing 1232 bytes
-    # of register file that we never touch.
-    ContextAmd64Control = 0x00100001'u32
-    # CONTEXT_AMD64 | CONTROL | INTEGER | FLOATING_POINT. `callOnParkedThread`
-    # saves and restores the whole register file, not just the three
-    # registers it overwrites: the thread it borrows is the child's MAIN
-    # thread, parked mid-loader-handoff, and handing it back with anything
-    # but the state it arrived in would be a corruption we could not see.
-    ContextAmd64Full = 0x0010000B'u32
-    ContextAmd64Size = 1232
-    ContextAmd64FlagsOffset = 0x30'u
-    ContextAmd64RaxOffset = 0x78'u
-    ContextAmd64RcxOffset = 0x80'u
-    ContextAmd64RspOffset = 0x98'u
-    ContextAmd64RipOffset = 0xF8'u
+  when defined(arm64):
+    const
+      # CONTEXT_ARM64 (winnt.h `_ARM64_NT_CONTEXT`, 0x390 bytes):
+      # ContextFlags @0, Cpsr @4, X0..X28/Fp/Lr @8 + 8*n, Sp @0x100,
+      # Pc @0x108. Addressed by offset, as for x64 below.
+      # CONTEXT_ARM64 | CONTEXT_CONTROL (Fp, Lr, Sp, Pc, Cpsr).
+      NativeCtxControl = 0x00400001'u32
+      # CONTEXT_ARM64 | CONTROL | INTEGER | FLOATING_POINT: the whole
+      # register file, saved and restored for the same reason as on x64.
+      NativeCtxFull = 0x00400007'u32
+      NativeCtxSize = 0x390
+      NativeCtxFlagsOffset = 0x0'u
+      NativeCtxArg0Offset = 0x08'u        # X0: first argument
+      NativeCtxResultOffset = 0x50'u      # X9: where the stub parks fn's result
+      NativeCtxSpOffset = 0x100'u
+      NativeCtxIpOffset = 0x108'u
+      # `B .` -- a branch to itself (imm26 = 0). One aligned word.
+      SelfJump: array[4, byte] = [0x00'u8, 0x00, 0x00, 0x14]
+      EntryPatchLen = 4
+      NativeMachine = 0xAA64'u16          # IMAGE_FILE_MACHINE_ARM64
+  else:
+    const
+      # CONTEXT_AMD64 | CONTEXT_CONTROL, and the field offsets we read. We
+      # address the structure by offset rather than transcribing 1232 bytes
+      # of register file that we never touch.
+      NativeCtxControl = 0x00100001'u32
+      # CONTEXT_AMD64 | CONTROL | INTEGER | FLOATING_POINT. `callOnParkedThread`
+      # saves and restores the whole register file, not just the three
+      # registers it overwrites: the thread it borrows is the child's MAIN
+      # thread, parked mid-loader-handoff, and handing it back with anything
+      # but the state it arrived in would be a corruption we could not see.
+      NativeCtxFull = 0x0010000B'u32
+      NativeCtxSize = 1232
+      NativeCtxFlagsOffset = 0x30'u
+      NativeCtxResultOffset = 0x78'u      # RAX
+      NativeCtxArg0Offset = 0x80'u        # RCX
+      NativeCtxSpOffset = 0x98'u          # RSP
+      NativeCtxIpOffset = 0xF8'u          # RIP
+      SelfJump: array[2, byte] = [0xEB'u8, 0xFE'u8]
+      EntryPatchLen = 2
 
+  const
     # CONTEXT_i386 | CONTEXT_CONTROL. WOW64_CONTEXT has the same layout.
     ContextI386Control = 0x00010001'u32
     ContextI386Size = 716
@@ -340,7 +372,6 @@ when defined(i386) or defined(amd64):
     MemCommit = 0x00001000'u32
     MemReserve = 0x00002000'u32
     MemRelease = 0x00008000'u32
-    SelfJump: array[2, byte] = [0xEB'u8, 0xFE'u8]
 
   proc NtQueryInformationProcess(hProcess: pointer; infoClass: uint32;
                                  info: pointer; infoLen: uint32;
@@ -401,9 +432,10 @@ when defined(i386) or defined(amd64):
     not (GetExitCodeProcess(hProcess, addr exitCode) != 0 and
          exitCode != StillActive)
 
-  when sizeof(pointer) == 8:
+  when defined(amd64):
     # Only exists on 64-bit Windows. Declaring it on a 32-bit build would
-    # make Nim's dynlib loader abort at module init.
+    # make Nim's dynlib loader abort at module init. The ARM64 park never
+    # looks at a WOW64 thread (the machine check refuses the child).
     proc Wow64GetThreadContext(hThread: pointer; ctx: pointer): int32
       {.importc, stdcall, dynlib: "kernel32".}
 
@@ -443,17 +475,22 @@ when defined(i386) or defined(amd64):
         cast[pointer](cast[uint](imageBase) + uint(lfanew)),
         addr signature, 4'u, addr got) == 0 or signature != NtSignature:
       return false
-    # The entry park and borrowed-call stubs execute x86 instructions. A
-    # native ARM64 image can share the parent's pointer width but cannot
-    # execute the two-byte self-jump. Refuse it before changing child memory.
+    # The self-jump and the borrowed-call stub are this host's own machine
+    # code, so the child must be of the host's machine: an x86 self-jump in
+    # an ARM64 image (or the reverse, an x64 child emulated on an ARM64 host)
+    # would be garbage. Refuse it before changing child memory.
     var machine: uint16 = 0
     if ReadProcessMemory(hProcess,
         cast[pointer](cast[uint](imageBase) + uint(lfanew) + 4'u),
         addr machine, 2'u, addr got) == 0 or got != 2'u:
       return false
-    if machine notin [0x8664'u16, 0x014c'u16]:
-      # IMAGE_FILE_MACHINE_AMD64 / IMAGE_FILE_MACHINE_I386.
-      return false
+    when defined(arm64):
+      if machine != NativeMachine:
+        return false
+    else:
+      if machine notin [0x8664'u16, 0x014c'u16]:
+        # IMAGE_FILE_MACHINE_AMD64 / IMAGE_FILE_MACHINE_I386.
+        return false
     var entryRva: uint32 = 0
     if ReadProcessMemory(hProcess,
         cast[pointer](cast[uint](imageBase) + uint(lfanew) + EntryPointOffset),
@@ -470,21 +507,24 @@ when defined(i386) or defined(amd64):
     ## are comparing against.
     when sizeof(pointer) == 8:
       if childIsWow64:
-        var raw: array[ContextI386Size + 16, byte]
-        let ctx = alignUp16(addr raw[0])
-        cast[ptr uint32](cast[uint](ctx) + ContextI386FlagsOffset)[] =
-          ContextI386Control
-        if Wow64GetThreadContext(hThread, ctx) == 0:
+        when defined(arm64):
           return false
-        ip = uint64(cast[ptr uint32](cast[uint](ctx) + ContextI386EipOffset)[])
-        return true
-      var raw: array[ContextAmd64Size + 16, byte]
+        else:
+          var raw: array[ContextI386Size + 16, byte]
+          let ctx = alignUp16(addr raw[0])
+          cast[ptr uint32](cast[uint](ctx) + ContextI386FlagsOffset)[] =
+            ContextI386Control
+          if Wow64GetThreadContext(hThread, ctx) == 0:
+            return false
+          ip = uint64(cast[ptr uint32](cast[uint](ctx) + ContextI386EipOffset)[])
+          return true
+      var raw: array[NativeCtxSize + 16, byte]
       let ctx = alignUp16(addr raw[0])
-      cast[ptr uint32](cast[uint](ctx) + ContextAmd64FlagsOffset)[] =
-        ContextAmd64Control
+      cast[ptr uint32](cast[uint](ctx) + NativeCtxFlagsOffset)[] =
+        NativeCtxControl
       if GetThreadContext(hThread, ctx) == 0:
         return false
-      ip = cast[ptr uint64](cast[uint](ctx) + ContextAmd64RipOffset)[]
+      ip = cast[ptr uint64](cast[uint](ctx) + NativeCtxIpOffset)[]
       true
     else:
       # A 32-bit host only ever parks a WOW64 child; the 64-bit case is
@@ -502,10 +542,10 @@ when defined(i386) or defined(amd64):
     var written: uint = 0
     var prot: uint32 = 0
     let ok = WriteProcessMemory(park.hProcess, park.entry,
-      addr park.origBytes[0], 2'u, addr written) != 0
-    discard VirtualProtectEx(park.hProcess, park.entry, 2'u,
+      addr park.origBytes[0], uint(EntryPatchLen), addr written) != 0
+    discard VirtualProtectEx(park.hProcess, park.entry, uint(EntryPatchLen),
       park.oldProtect, addr prot)
-    discard FlushInstructionCache(park.hProcess, park.entry, 2'u)
+    discard FlushInstructionCache(park.hProcess, park.entry, uint(EntryPatchLen))
     ok
 
   proc parkChildAtEntryPoint*(hProcess, hThread: pointer;
@@ -535,24 +575,24 @@ when defined(i386) or defined(amd64):
     result.entry = entry
 
     var got: uint = 0
-    if ReadProcessMemory(hProcess, entry, addr result.origBytes[0], 2'u,
-        addr got) == 0 or got != 2:
+    if ReadProcessMemory(hProcess, entry, addr result.origBytes[0],
+        uint(EntryPatchLen), addr got) == 0 or got != uint(EntryPatchLen):
       result.status = epsSetupFailed
       return
-    if VirtualProtectEx(hProcess, entry, 2'u, PageExecuteReadWrite,
+    if VirtualProtectEx(hProcess, entry, uint(EntryPatchLen), PageExecuteReadWrite,
         addr result.oldProtect) == 0:
       result.status = epsSetupFailed
       return
     var written: uint = 0
     var selfJump = SelfJump
-    if WriteProcessMemory(hProcess, entry, addr selfJump[0], 2'u,
-        addr written) == 0 or written != 2:
+    if WriteProcessMemory(hProcess, entry, addr selfJump[0], uint(EntryPatchLen),
+        addr written) == 0 or written != uint(EntryPatchLen):
       var prot: uint32 = 0
-      discard VirtualProtectEx(hProcess, entry, 2'u, result.oldProtect,
+      discard VirtualProtectEx(hProcess, entry, uint(EntryPatchLen), result.oldProtect,
         addr prot)
       result.status = epsSetupFailed
       return
-    discard FlushInstructionCache(hProcess, entry, 2'u)
+    discard FlushInstructionCache(hProcess, entry, uint(EntryPatchLen))
 
     # From here the child HAS BEEN RESUMED and no failure path may leave
     # the patched bytes behind.
@@ -659,7 +699,7 @@ when defined(i386) or defined(amd64):
     result = TimedOutBorrow(hThread: hThread, childIsWow64: childIsWow64,
       park: addr park, stub: stub, stubLen: stubLen, live: true,
       stubBacked: stub != nil, lentMs: elapsedMs)
-    copyMem(savedCtxPtr(result), saved, ContextAmd64Size)
+    copyMem(savedCtxPtr(result), saved, NativeCtxSize)
 
   proc resumeFully(hThread: pointer): bool {.discardable.} =
     ## Drive the suspend count to zero so the thread actually runs. A lent-out
@@ -714,10 +754,10 @@ when defined(i386) or defined(amd64):
       discard
     # Back on the parked entry point and suspended: hand the thread back.
     b.live = false
-    var doneRaw: array[ContextAmd64Size + 16, byte]
+    var doneRaw: array[NativeCtxSize + 16, byte]
     let done = alignUp16(addr doneRaw[0])
-    cast[ptr uint32](cast[uint](done) + ContextAmd64FlagsOffset)[] =
-      ContextAmd64Full
+    cast[ptr uint32](cast[uint](done) + NativeCtxFlagsOffset)[] =
+      NativeCtxFull
     let haveResult = GetThreadContext(b.hThread, done) != 0
     if SetThreadContext(b.hThread, savedCtxPtr(b)) == 0:
       # Cannot restore the parked context: the thread is parked on the
@@ -733,7 +773,7 @@ when defined(i386) or defined(amd64):
     # is freed exactly as a prompt return frees it.
     discard VirtualFreeEx(b.park[].hProcess, b.stub, 0'u, MemRelease)
     if haveResult:
-      result.ret = cast[ptr uint64](cast[uint](done) + ContextAmd64RaxOffset)[]
+      result.ret = cast[ptr uint64](cast[uint](done) + NativeCtxResultOffset)[]
       result.status = bcsReturned
     else:
       result.status = bcsNoResult
@@ -936,15 +976,15 @@ when defined(i386) or defined(amd64):
           fn == nil or deadlineMs == 0:
         return
 
-      var savedRaw: array[ContextAmd64Size + 16, byte]
+      var savedRaw: array[NativeCtxSize + 16, byte]
       let saved = alignUp16(addr savedRaw[0])
-      cast[ptr uint32](cast[uint](saved) + ContextAmd64FlagsOffset)[] =
-        ContextAmd64Full
+      cast[ptr uint32](cast[uint](saved) + NativeCtxFlagsOffset)[] =
+        NativeCtxFull
       if GetThreadContext(hThread, saved) == 0:
         return
 
       let savedRsp = cast[ptr uint64](cast[uint](saved) +
-        ContextAmd64RspOffset)[]
+        NativeCtxSpOffset)[]
       if savedRsp < 0x10000'u64:
         return
 
@@ -963,39 +1003,80 @@ when defined(i386) or defined(amd64):
         return
       let rsp = (savedRsp - StubGap) and not 0xF'u64
 
-      # 0: sub rsp, 20h       48 83 EC 20
-      # 4: mov rax, imm64     48 B8 <fn>
-      # 14: call rax          FF D0
-      # 16: mov rsp, imm64    48 BC <savedRsp>
-      # 26: mov rcx, imm64    48 B9 <savedRcx>
-      # 36: mov r11, imm64    49 BB <entry>
-      # 46: jmp r11           41 FF E3
-      # `RAX` -- the callee's result -- is left alone for the caller to read.
-      # `RCX` is put back because it is the entry point's one argument (the
-      # PEB, from `BaseThreadInitThunk`) and the callee is free to clobber
-      # it. When the call comes back to the self-jump the saved context
-      # restores it anyway. When the caller DETACHES a timed-out borrow
-      # (``detachBorrowedChild``), the entry bytes are restored first and
-      # this tail is what carries the thread into the program: on the
-      # parked RSP, with the entry point's RCX, by a `jmp` that leaves the
-      # CET shadow stack exactly as the park found it.
-      var stubCode: array[49, byte] = [
-        0x48'u8, 0x83, 0xEC, 0x20,
-        0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0,
-        0xFF, 0xD0,
-        0x48, 0xBC, 0, 0, 0, 0, 0, 0, 0, 0,
-        0x48, 0xB9, 0, 0, 0, 0, 0, 0, 0, 0,
-        0x49, 0xBB, 0, 0, 0, 0, 0, 0, 0, 0,
-        0x41, 0xFF, 0xE3]
-      proc putImm64(code: var array[49, byte]; at: int; value: uint64) =
-        for i in 0 ..< 8:
-          code[at + i] = byte((value shr (8 * i)) and 0xFF'u64)
-      let savedRcx = cast[ptr uint64](cast[uint](saved) +
-        ContextAmd64RcxOffset)[]
-      putImm64(stubCode, 6, uint64(cast[uint](fn)))
-      putImm64(stubCode, 18, savedRsp)
-      putImm64(stubCode, 28, savedRcx)
-      putImm64(stubCode, 38, uint64(cast[uint](park.entry)))
+      when defined(arm64):
+        # The same contract on ARM64 (AAPCS64, CONTEXT_ARM64):
+        #  0: ldr x16, =fn          58000150
+        #  4: blr x16               d63f0200   ; LR <- stub+8; X0 = arg
+        #  8: mov x9, x0            aa0003e9   ; fn's result, for the caller
+        # 12: ldr x16, =savedSp     58000130
+        # 16: mov sp, x16           9100021f
+        # 20: ldr x0, =savedX0      58000120   ; the entry point's argument
+        # 24: ldr x30, =savedLr     5800015e   ; the entry point's return
+        # 28: ldr x16, =entry       58000170
+        # 32: br x16                d61f0200   ; onto the `B .` self-jump
+        # 36: nop                   d503201f   ; aligns the pool to 8
+        # 40: .quad fn, savedSp, savedX0, savedLr, entry
+        # Result and first argument share X0 on ARM64, so the result moves to
+        # X9 (a volatile, non-argument register) before X0 is put back; the
+        # caller reads X9 (NativeCtxResultOffset). The detach path relies on
+        # the tail exactly as on x64: on the parked SP, with the entry
+        # point's X0 and LR, by a `br` that pushes nothing. ARM64 has no CET
+        # shadow stack; a PAC-signing callee signs and authenticates its own
+        # LR, which the `blr` above set.
+        const ArmWords = [0x58000150'u32, 0xD63F0200'u32, 0xAA0003E9'u32,
+          0x58000130'u32, 0x9100021F'u32, 0x58000120'u32, 0x5800015E'u32,
+          0x58000170'u32, 0xD61F0200'u32, 0xD503201F'u32]
+        var stubCode: array[80, byte]
+        for i, w in ArmWords:
+          for b in 0 ..< 4:
+            stubCode[i * 4 + b] = byte((w shr (8 * b)) and 0xFF'u32)
+        proc putImm64(code: var array[80, byte]; at: int; value: uint64) =
+          for i in 0 ..< 8:
+            code[at + i] = byte((value shr (8 * i)) and 0xFF'u64)
+        let savedX0 = cast[ptr uint64](cast[uint](saved) +
+          NativeCtxArg0Offset)[]
+        # LR is X30, at X0's offset + 30 * 8.
+        let savedLr = cast[ptr uint64](cast[uint](saved) +
+          NativeCtxArg0Offset + 30'u * 8'u)[]
+        putImm64(stubCode, 40, uint64(cast[uint](fn)))
+        putImm64(stubCode, 48, savedRsp)
+        putImm64(stubCode, 56, savedX0)
+        putImm64(stubCode, 64, savedLr)
+        putImm64(stubCode, 72, uint64(cast[uint](park.entry)))
+      else:
+        # 0: sub rsp, 20h       48 83 EC 20
+        # 4: mov rax, imm64     48 B8 <fn>
+        # 14: call rax          FF D0
+        # 16: mov rsp, imm64    48 BC <savedRsp>
+        # 26: mov rcx, imm64    48 B9 <savedRcx>
+        # 36: mov r11, imm64    49 BB <entry>
+        # 46: jmp r11           41 FF E3
+        # `RAX` -- the callee's result -- is left alone for the caller to read.
+        # `RCX` is put back because it is the entry point's one argument (the
+        # PEB, from `BaseThreadInitThunk`) and the callee is free to clobber
+        # it. When the call comes back to the self-jump the saved context
+        # restores it anyway. When the caller DETACHES a timed-out borrow
+        # (``detachBorrowedChild``), the entry bytes are restored first and
+        # this tail is what carries the thread into the program: on the
+        # parked RSP, with the entry point's RCX, by a `jmp` that leaves the
+        # CET shadow stack exactly as the park found it.
+        var stubCode: array[49, byte] = [
+          0x48'u8, 0x83, 0xEC, 0x20,
+          0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0,
+          0xFF, 0xD0,
+          0x48, 0xBC, 0, 0, 0, 0, 0, 0, 0, 0,
+          0x48, 0xB9, 0, 0, 0, 0, 0, 0, 0, 0,
+          0x49, 0xBB, 0, 0, 0, 0, 0, 0, 0, 0,
+          0x41, 0xFF, 0xE3]
+        proc putImm64(code: var array[49, byte]; at: int; value: uint64) =
+          for i in 0 ..< 8:
+            code[at + i] = byte((value shr (8 * i)) and 0xFF'u64)
+        let savedRcx = cast[ptr uint64](cast[uint](saved) +
+          NativeCtxArg0Offset)[]
+        putImm64(stubCode, 6, uint64(cast[uint](fn)))
+        putImm64(stubCode, 18, savedRsp)
+        putImm64(stubCode, 28, savedRcx)
+        putImm64(stubCode, 38, uint64(cast[uint](park.entry)))
       let stub = VirtualAllocEx(park.hProcess, nil, uint(stubCode.len),
         MemCommit or MemReserve, PageReadWrite)
       if stub == nil:
@@ -1022,15 +1103,15 @@ when defined(i386) or defined(amd64):
         return
       discard FlushInstructionCache(park.hProcess, stub, uint(stubCode.len))
 
-      var callRaw: array[ContextAmd64Size + 16, byte]
+      var callRaw: array[NativeCtxSize + 16, byte]
       let call = alignUp16(addr callRaw[0])
-      copyMem(call, saved, ContextAmd64Size)
-      cast[ptr uint32](cast[uint](call) + ContextAmd64FlagsOffset)[] =
-        ContextAmd64Full
-      cast[ptr uint64](cast[uint](call) + ContextAmd64RspOffset)[] = rsp
-      cast[ptr uint64](cast[uint](call) + ContextAmd64RcxOffset)[] =
+      copyMem(call, saved, NativeCtxSize)
+      cast[ptr uint32](cast[uint](call) + NativeCtxFlagsOffset)[] =
+        NativeCtxFull
+      cast[ptr uint64](cast[uint](call) + NativeCtxSpOffset)[] = rsp
+      cast[ptr uint64](cast[uint](call) + NativeCtxArg0Offset)[] =
         uint64(cast[uint](arg))
-      cast[ptr uint64](cast[uint](call) + ContextAmd64RipOffset)[] =
+      cast[ptr uint64](cast[uint](call) + NativeCtxIpOffset)[] =
         uint64(cast[uint](stub))
       if SetThreadContext(hThread, call) == 0:
         return
@@ -1073,10 +1154,10 @@ when defined(i386) or defined(amd64):
       # stub any more.
       stubOwned = true
 
-      var doneRaw: array[ContextAmd64Size + 16, byte]
+      var doneRaw: array[NativeCtxSize + 16, byte]
       let done = alignUp16(addr doneRaw[0])
-      cast[ptr uint32](cast[uint](done) + ContextAmd64FlagsOffset)[] =
-        ContextAmd64Full
+      cast[ptr uint32](cast[uint](done) + NativeCtxFlagsOffset)[] =
+        NativeCtxFull
       let haveResult = GetThreadContext(hThread, done) != 0
 
       # Hand the thread back byte-for-byte. The stub's tail already put the
@@ -1091,7 +1172,7 @@ when defined(i386) or defined(amd64):
         return
       if haveResult:
         result.ret = cast[ptr uint64](cast[uint](done) +
-          ContextAmd64RaxOffset)[]
+          NativeCtxResultOffset)[]
         result.status = bcsReturned
       else:
         result.status = bcsNoResult

@@ -212,6 +212,22 @@ const testCorpus*: seq[TestEntry] = @[
          "`else: static: doAssert` arm. Live only on native Windows ARM64: " &
          "parks a real ARM64 child, borrows its main thread and runs it to " &
          "its own exit code; elsewhere the cross-target lane compiles it."),
+  TestEntry(stem: "test_windows_machine",
+    targets: AllHostTargets & @[tWindowsArm64],
+    why: "Portable: stackable_hooks/windows_machine is deliberately not " &
+         "OS-gated -- which shim, if any, the root injector may put into a " &
+         "child of a given machine is pure logic over machine codes and PE " &
+         "header bytes -- so the decision behind reprobuild-pm issue " &
+         "2026-11-20 runs for real on every host."),
+  TestEntry(stem: "test_windows_root_machine_gate",
+    runtimeInputs: @["tests/fixtures/root_gate_shim.nim"],
+    targets: @[tLinuxAmd64, tMacosArm64, tWindowsAmd64, tWindowsArm64],
+    why: "Self-gating `when defined(windows) and (amd64 or arm64)` with an " &
+         "`else: static: doAssert` arm. Live on Windows: real children " &
+         "injected or refused through runWithMonitorShim with a fixture " &
+         "shim built at run time. Its issue case (an x64 build on Windows " &
+         "on Arm) and its native ARM64 case run only on eph-win-arm64; " &
+         "elsewhere the cross-target lane compile-verifies it."),
   TestEntry(stem: "test_windows_inline_hook_api", targets: AllHostTargets,
     why: "Off Windows its `else` arm compiles install_windows.c and runs " &
          "real C-ABI doAsserts, so it is genuine coverage everywhere."),
@@ -316,6 +332,11 @@ const moduleCorpus*: seq[ModuleEntry] = @[
   ModuleEntry(path: "src/stackable_hooks/windows_env_block.nim",
     targets: AllHostTargets,
     why: "Deliberately not OS-gated: pure lpEnvironment string encoding."),
+  ModuleEntry(path: "src/stackable_hooks/windows_machine.nim",
+    targets: AllHostTargets & @[tWindowsArm64, tWindowsI386],
+    why: "Deliberately not OS-gated: the root injector's machine decision. " &
+         "Its `hostImageMachine` has an arm per CPU, so each Windows CPU " &
+         "the injector is built for is checked."),
   ModuleEntry(path: "src/stackable_hooks/propagation_windows.nim",
     targets: WindowsOnlyTargets,
     why: "`when not defined(windows): {.error.}` module head."),

@@ -57,7 +57,7 @@ when defined(windows) and defined(arm64):
 
     test "an emulated x86 child is refused before any byte is changed":
       # The park writes this host's own machine code; an x86 image would
-      # receive ARM64 bytes. `epsSetupFailed` leaves the child untouched.
+      # receive ARM64 bytes. `epsUnsupported` leaves the child untouched.
       let x64 = r"C:\Windows\SysWOW64\cmd.exe"   # x86 on every Windows on Arm
       var si: STARTUPINFO
       si.cb = int32(sizeof(si))
@@ -71,7 +71,7 @@ when defined(windows) and defined(arm64):
           discard closeHandle(pi.hProcess)
         let park = parkChildAtEntryPoint(cast[pointer](pi.hProcess),
           cast[pointer](pi.hThread), false, 60_000'u32)
-        check park.status in {epsSetupFailed, epsUnsupported}
+        check park.status == epsUnsupported
         discard resumeThread(pi.hThread)
         check waitForSingleObject(pi.hProcess, 60_000) == waitObject0
         var code: int32

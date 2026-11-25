@@ -81,9 +81,13 @@ type
     ## deliberately distinct because they leave the child in completely
     ## different states, and a caller must treat them differently.
     epsUnsupported
-      ## This host/child combination cannot be parked (ARM64 host, or a
-      ## 32-bit host looking at a 64-bit child). The child was NEVER
-      ## RESUMED and has executed nothing.
+      ## This host/child combination cannot be parked: the child's image is
+      ## of another machine than this host's (an x64-emulated child of an
+      ## ARM64 host, an ARM64 child of an x64 one), or a 32-bit host is
+      ## looking at a 64-bit child. The child was NEVER RESUMED and has
+      ## executed nothing. Unlike `epsSetupFailed`, a remote-thread load is
+      ## NOT a sound fallback: the caller's `LoadLibraryW` is of the wrong
+      ## machine too (reprobuild-pm issue 2026-11-20).
     epsSetupFailed
       ## The PEB read or the entry-point patch failed. The child was NEVER
       ## RESUMED and has executed nothing -- it is still exactly as
@@ -445,7 +449,12 @@ when defined(i386) or defined(amd64) or defined(arm64):
     ## Over-allocating and rounding up needs no alignment pragma.
     cast[pointer]((cast[uint](p) + 15'u) and not 15'u)
 
-  proc childImageEntryPoint(hProcess: pointer; entry: var pointer): bool =
+  type EntryLookup = enum
+    elFound          ## `entry` holds the child's entry point
+    elWrongMachine   ## the image is of another machine than this host's
+    elFailed         ## a read failed or a header field was implausible
+
+  proc childImageEntryPoint(hProcess: pointer; entry: var pointer): EntryLookup =
     ## Resolve the child's ``AddressOfEntryPoint`` through its PEB. Every
     ## step is validated: a plausible-looking wrong address here would put
     ## a two-byte self-jump somewhere arbitrary in the child.
@@ -453,28 +462,28 @@ when defined(i386) or defined(amd64) or defined(arm64):
     var retLen: uint32 = 0
     if NtQueryInformationProcess(hProcess, 0'u32, addr pbi,
         uint32(sizeof(pbi)), addr retLen) != 0:
-      return false
+      return elFailed
     if pbi.pebBaseAddress == nil:
-      return false
+      return elFailed
     var got: uint = 0
     var imageBase: pointer = nil
     if ReadProcessMemory(hProcess,
         cast[pointer](cast[uint](pbi.pebBaseAddress) + PebImageBaseOffset),
         addr imageBase, uint(sizeof(pointer)), addr got) == 0 or
         imageBase == nil:
-      return false
+      return elFailed
     var lfanew: int32 = 0
     if ReadProcessMemory(hProcess,
         cast[pointer](cast[uint](imageBase) + DosLfanewOffset),
         addr lfanew, 4'u, addr got) == 0:
-      return false
+      return elFailed
     if lfanew <= 0 or lfanew > 0x1000:
-      return false
+      return elFailed
     var signature: uint32 = 0
     if ReadProcessMemory(hProcess,
         cast[pointer](cast[uint](imageBase) + uint(lfanew)),
         addr signature, 4'u, addr got) == 0 or signature != NtSignature:
-      return false
+      return elFailed
     # The self-jump and the borrowed-call stub are this host's own machine
     # code, so the child must be of the host's machine: an x86 self-jump in
     # an ARM64 image (or the reverse, an x64 child emulated on an ARM64 host)
@@ -483,21 +492,21 @@ when defined(i386) or defined(amd64) or defined(arm64):
     if ReadProcessMemory(hProcess,
         cast[pointer](cast[uint](imageBase) + uint(lfanew) + 4'u),
         addr machine, 2'u, addr got) == 0 or got != 2'u:
-      return false
+      return elFailed
     when defined(arm64):
       if machine != NativeMachine:
-        return false
+        return elWrongMachine
     else:
       if machine notin [0x8664'u16, 0x014c'u16]:
         # IMAGE_FILE_MACHINE_AMD64 / IMAGE_FILE_MACHINE_I386.
-        return false
+        return elWrongMachine
     var entryRva: uint32 = 0
     if ReadProcessMemory(hProcess,
         cast[pointer](cast[uint](imageBase) + uint(lfanew) + EntryPointOffset),
         addr entryRva, 4'u, addr got) == 0 or entryRva == 0:
-      return false
+      return elFailed
     entry = cast[pointer](cast[uint](imageBase) + uint(entryRva))
-    true
+    elFound
 
   proc instructionPointer(hThread: pointer; childIsWow64: bool;
                           ip: var uint64): bool =
@@ -569,7 +578,13 @@ when defined(i386) or defined(amd64) or defined(arm64):
         return
 
     var entry: pointer = nil
-    if not childImageEntryPoint(hProcess, entry):
+    case childImageEntryPoint(hProcess, entry)
+    of elFound:
+      discard
+    of elWrongMachine:
+      result.status = epsUnsupported
+      return
+    of elFailed:
       result.status = epsSetupFailed
       return
     result.entry = entry

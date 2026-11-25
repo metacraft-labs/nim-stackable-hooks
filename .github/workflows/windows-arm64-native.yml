@@ -1,0 +1,80 @@
+name: Windows ARM64 native tests
+
+# The Windows on Arm tests, built and run as native ARM64 images on the fleet's
+# ARM64 Windows class. `ci-reprobuild.yml`'s windows-arm64 leg cannot be that
+# lane yet: it builds x64 under emulation (`WINDOWS_DIY_ARCH_OVERRIDE: x64`)
+# until a native Nim prefix exists, and reprobuild-pm
+# spec/Distribution-And-Packaging.md section 7.1 does not accept emulation as
+# arm64 coverage. What the script builds, with which pinned toolchain, and why
+# the Nim code generator may run emulated while no tested image does, is in
+# scripts/windows-arm64-native-tests.ps1.
+#
+# The ARM64 Windows class is small (two runners) and shared, so the lane runs
+# only when Windows injection code or its tests change, and on demand.
+
+on:
+  workflow_dispatch:
+  # `native-arm64/**` is the on-demand route for a branch that is not on the
+  # default branch yet (workflow_dispatch only sees the default branch's
+  # workflows): push the commit to `native-arm64/<topic>` to run this lane on
+  # it. Nothing lands from those branches.
+  push:
+    branches: [main, dev, stable, "native-arm64/**"]
+    paths:
+      - "src/stackable_hooks/windows_*.nim"
+      - "src/stackable_hooks/propagation_windows.nim"
+      - "src/stackable_hooks/inline_hook/**"
+      - "tests/test_a64_relocate.nim"
+      - "tests/test_windows_*.nim"
+      - "tests/fixtures/**"
+      - "scripts/windows-arm64-native-tests.ps1"
+      - ".github/workflows/windows-arm64-native.yml"
+  pull_request:
+    branches: [main, dev, stable]
+    paths:
+      - "src/stackable_hooks/windows_*.nim"
+      - "src/stackable_hooks/propagation_windows.nim"
+      - "src/stackable_hooks/inline_hook/**"
+      - "tests/test_a64_relocate.nim"
+      - "tests/test_windows_*.nim"
+      - "tests/fixtures/**"
+      - "scripts/windows-arm64-native-tests.ps1"
+      - ".github/workflows/windows-arm64-native.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  # reprobuild's own pins for its windows-aarch64 leg
+  # (windows/toolchain-versions.env: NIM_VERSION, NIM_WIN_X64_SHA256,
+  # LLVM_MINGW_WIN_ARM64_RELEASE, LLVM_MINGW_WIN_ARM64_SHA256). Move them
+  # together with reprobuild's.
+  NIM_VERSION: 2.2.8
+  NIM_WIN_X64_SHA256: 11fe2415a64a791b899cc78e2eeacdde93b5f122f2fabc447db36d38002bfb8c
+  LLVM_MINGW_WIN_ARM64_RELEASE: "20261104"
+  LLVM_MINGW_WIN_ARM64_SHA256: 7d7f8387a8706639b0b47a629d6e23f8b3ef9acce67e9832b8cd4c5bb2816eab
+
+jobs:
+  native-arm64:
+    name: Windows ARM64 (native) — injection and inline-hook tests
+    runs-on: [self-hosted, windows, arm64]
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Build and run natively
+        run: |
+          ./scripts/windows-arm64-native-tests.ps1 `
+            -WorkRoot (Join-Path $env:RUNNER_TEMP 'arm64-native') `
+            -NimVersion $env:NIM_VERSION -NimSha256 $env:NIM_WIN_X64_SHA256 `
+            -LlvmMingwRelease $env:LLVM_MINGW_WIN_ARM64_RELEASE `
+            -LlvmMingwSha256 $env:LLVM_MINGW_WIN_ARM64_SHA256

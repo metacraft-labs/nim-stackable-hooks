@@ -14,10 +14,12 @@ import std/[locks, os, strtabs, strutils, tables]
 import ./windows_entry_park
 import ./windows_env_block
 import ./windows_fork_runtime
+import ./windows_machine
 
 export windows_entry_park
 export windows_env_block
 export windows_fork_runtime
+export windows_machine
 
 proc toWideCStringSeq(s: string): seq[uint16] =
   result = newSeq[uint16](s.len + 1)
@@ -389,6 +391,85 @@ proc shim64PathFor*(shimPath32: string): string {.raises: [], gcsafe.} =
   else:
     shimPath32
 
+type
+  ProcessMachineInformation = object
+    ## PROCESS_MACHINE_INFORMATION. Public ABI:
+    ## learn.microsoft.com/windows/win32/api/processthreadsapi/
+    ## ns-processthreadsapi-process_machine_information
+    processMachine, reserved: WORD
+    attributes: DWORD
+  QueryProcessInformation = proc(hProcess: HANDLE; informationClass: int32;
+                                 information: pointer; size: DWORD): BOOL
+    {.stdcall, raises: [], gcsafe.}
+
+const ProcessMachineTypeInfo = 9'i32
+  ## The tenth PROCESS_INFORMATION_CLASS member (Windows 11 / Server 2022 on).
+  ## Unlike the `IsWow64Process2` pair, its `ProcessMachine` is the machine
+  ## the process actually runs: `0x8664` for an x64 process emulated on an
+  ## ARM64 host, `0xAA64` for a native ARM64 one.
+
+static: doAssert sizeof(ProcessMachineInformation) == 8
+
+proc queryProcessMachine(hProcess: HANDLE; info: var ProcessMachineInformation;
+                         error: var DWORD): bool {.raises: [], gcsafe.} =
+  ## `GetProcessInformation(ProcessMachineTypeInfo)`, resolved at run time
+  ## because it does not exist before Windows 11. False when the API is
+  ## missing (`error` 0) or the call fails (`error` = `GetLastError()`).
+  info = default(ProcessMachineInformation)
+  error = 0
+  try:
+    var moduleName = toWideCStringSeq("kernel32.dll")
+    let kernel = GetModuleHandleW(cast[LPCWSTR](addr moduleName[0]))
+    let entry = if kernel == nil: nil
+                else: GetProcAddress(kernel, "GetProcessInformation")
+    if entry == nil:
+      return false
+    let query = cast[QueryProcessInformation](entry)
+    if query(hProcess, ProcessMachineTypeInfo, addr info,
+        DWORD(sizeof(info))) == 0:
+      error = GetLastError()
+      info = default(ProcessMachineInformation)
+      return false
+    true
+  except Exception:
+    info = default(ProcessMachineInformation)
+    false
+
+proc processActualMachine*(hProcess: HANDLE): uint16 {.raises: [], gcsafe.} =
+  ## The machine `hProcess` actually runs, or `ImageFileMachineUnknown` where
+  ## the host cannot say (before Windows 11, where no x64 emulation exists
+  ## and the WOW64 flag is enough; see `windows_machine.rootInjectRoute`).
+  var info: ProcessMachineInformation
+  var error: DWORD
+  if queryProcessMachine(hProcess, info, error): info.processMachine
+  else: ImageFileMachineUnknown
+
+proc QueryFullProcessImageNameW(hProcess: HANDLE; dwFlags: DWORD;
+    lpExeName: LPWSTR; lpdwSize: ptr DWORD): BOOL
+  {.importc, stdcall, dynlib: "kernel32", raises: [], gcsafe.}
+
+proc processImageFileMachine*(hProcess: HANDLE): uint16 {.raises: [], gcsafe.} =
+  ## The PE machine of the image FILE `hProcess` was started from, or
+  ## `ImageFileMachineUnknown`. It is read from disk, not from the mapped
+  ## header, because the loader rewrites a hybrid (ARM64X) image's mapped
+  ## header to the machine it runs as. The path comes from
+  ## `QueryFullProcessImageNameW`, which works on a suspended process:
+  ## https://learn.microsoft.com/windows/win32/api/winbase/nf-winbase-queryfullprocessimagenamew
+  var buf: array[32768, uint16]
+  var size = DWORD(buf.len)
+  if QueryFullProcessImageNameW(hProcess, 0, cast[LPWSTR](addr buf[0]),
+      addr size) == 0 or size == 0:
+    return ImageFileMachineUnknown
+  var path = ""
+  try:
+    path = $cast[WideCString](addr buf[0])
+  except Exception:
+    return ImageFileMachineUnknown
+  let ext =
+    try: extendedPath(path)
+    except ValueError, OSError: path
+  peFileMachine(ext)
+
 proc processMachineWitness(hProcess: HANDLE): string {.raises: [], gcsafe.} =
   # Query the public machine pair separately from the legacy WOW64 boolean.
   # Diagnostics do not choose an architecture or change injection behavior.
@@ -410,30 +491,11 @@ proc processMachineWitness(hProcess: HANDLE): string {.raises: [], gcsafe.} =
         apiError = GetLastError()
         processMachine = 0
         nativeMachine = 0
-    # Public ABI: learn.microsoft.com/windows/win32/api/processthreadsapi/
-    # ne-processthreadsapi-process_information_class and
-    # ns-processthreadsapi-process_machine_information.
-    # ProcessMachineTypeInfo is the tenth PROCESS_INFORMATION_CLASS member.
-    # Unlike the WOW64 pair, its ProcessMachine describes the actual process.
-    type
-      MachineInformation = object
-        processMachine, reserved: WORD
-        attributes: DWORD
-      QueryInformation = proc(hProcess: HANDLE; informationClass: int32;
-                              information: pointer; size: DWORD): BOOL
-        {.stdcall, raises: [], gcsafe.}
-    static: doAssert sizeof(MachineInformation) == 8
     let infoEntry = if kernel == nil: nil
                     else: GetProcAddress(kernel, "GetProcessInformation")
-    var info: MachineInformation
-    var infoSucceeded = false
+    var info: ProcessMachineInformation
     var infoError: DWORD = 0
-    if infoEntry != nil:
-      let query = cast[QueryInformation](infoEntry)
-      infoSucceeded = query(hProcess, 9, addr info, DWORD(sizeof(info))) != 0
-      if not infoSucceeded:
-        infoError = GetLastError()
-        info = default(MachineInformation)
+    let infoSucceeded = queryProcessMachine(hProcess, info, infoError)
     result = " machineApiAvailable=" & $(entry != nil) &
       " machineApiSucceeded=" & $succeeded &
       " processMachine=" & $processMachine &
@@ -927,6 +989,40 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
     #    DLL and the LoadLibraryW address have to be switched together.
     let childIsWow64 = processIsWow64(pi.hProcess)
 
+    # 0a. THE MACHINE GATE. Every route below runs code of this process's
+    #     machine in the child (the park's self-jump and borrowed-call stub)
+    #     or hands it an address resolved here (`LoadLibraryW`). A child of
+    #     another machine -- a native ARM64 child of an x64 engine emulated
+    #     on Windows on Arm, the case of reprobuild-pm issue 2026-11-20,
+    #     where `CreateRemoteThread` failed with err=6 and failed the action
+    #     -- gets neither: it is not parked, nothing is written into it, and
+    #     it is resumed uninjected with the loss reported through
+    #     `monitoringSkipped`. A shim of the wrong machine for THIS process
+    #     is a packaging defect and is refused outright. The decision is
+    #     `windows_machine.rootInjectRoute`, unit-tested on every host.
+    let callerMachine = hostImageMachine()
+    let childMachine = processActualMachine(pi.hProcess)
+    let shimMachine =
+      try: peFileMachine(extendedPath(dllPath))
+      except ValueError: ImageFileMachineUnknown
+    let childImageMachine = processImageFileMachine(pi.hProcess)
+    let route = rootInjectRoute(callerMachine, childMachine,
+      childImageMachine, shimMachine, childIsWow64)
+    case route
+    of rirSameMachine, rirWow64:
+      discard
+    of rirUnsupportedMachine:
+      skipInjection = true
+      result.monitoringSkipped = true
+      result.skipReason =
+        if childMachine == callerMachine:
+          hybridImageReason(callerMachine, childMachine, childImageMachine)
+        else:
+          unsupportedMachineReason(callerMachine, childMachine)
+    of rirShimMachineMismatch:
+      raise newException(OSError,
+        shimMismatchReason(callerMachine, shimMachine, dllPath))
+
     # 0b. PARK THE CHILD'S MAIN THREAD AT ITS IMAGE ENTRY POINT.
     #
     # The Windows loader initialises a process on whichever thread reaches
@@ -961,9 +1057,13 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
     # loader-initialised main thread plus a remote-thread load -- so a
     # 32-bit child keeps the legacy technique end to end, and a 32-bit
     # child carrying a fork runtime is refused below rather than wedged.
+    #
+    # A child the machine gate refused is not parked either (timeout 0 is
+    # "no park"): the self-jump would be this machine's code in its image.
     var park = parkChildAtEntryPoint(pi.hProcess, pi.hThread, childIsWow64,
-      (if childIsWow64: 0'u32 else: parkTimeoutMs))
-    if park.status != epsParked and forkRuntime.len > 0:
+      (if childIsWow64 or skipInjection: 0'u32 else: parkTimeoutMs))
+    if not skipInjection and park.status != epsParked and
+        forkRuntime.len > 0:
       # No park (ARM64, a 32-bit host looking at a 64-bit child, or
       # `parkTimeoutMs = 0`) AND a fork runtime: injecting now is the wedge
       # above. Refuse, and say so through the result so the consumer keeps
@@ -981,7 +1081,7 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
 
     let effectiveDllPath =
       if childIsWow64: wow64ShimPathFor(dllPath) else: dllPath
-    if childIsWow64:
+    if childIsWow64 and not skipInjection:
       let shim32Exists =
         try: fileExists(extendedPath(effectiveDllPath))
         except ValueError: false
@@ -991,58 +1091,63 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
           effectiveDllPath & " — build it with `nim c --cpu:i386` and place " &
           "it beside the 64-bit shim, or call setWow64ShimPath")
 
-    # 1. Allocate a buffer in the child for the wide DLL path.
-    var dllPathW = toWideCStringSeq(effectiveDllPath)
-    let bufSize = SIZE_T(dllPathW.len * sizeof(uint16))
-    let remoteBuf = VirtualAllocEx(pi.hProcess, nil, bufSize,
-      MEM_COMMIT or MEM_RESERVE, PAGE_READWRITE)
-    if remoteBuf == nil:
-      raise newException(OSError,
-        "VirtualAllocEx failed (err=" & $GetLastError() & ")")
-
-    # 2. Write the DLL path into the buffer.
-    var written: SIZE_T = 0
-    if WriteProcessMemory(pi.hProcess, remoteBuf, addr dllPathW[0],
-        bufSize, addr written) == 0:
-      discard VirtualFreeEx(pi.hProcess, remoteBuf, 0, MEM_RELEASE)
-      raise newException(OSError,
-        "WriteProcessMemory failed (err=" & $GetLastError() & ")")
-
-    # 3. Resolve LoadLibraryW as the CHILD sees it.
-    #
-    #    Same bitness: our own kernel32 is loaded at the same base in the
-    #    child, so GetProcAddress here is the child's address too.
-    #
-    #    WOW64 child: it is NOT. The child uses SysWOW64\kernel32.dll at an
-    #    unrelated base, and this process cannot resolve that address
-    #    itself. The 32-bit probe reports it via its exit code; see the
-    #    WOW64 section above.
+    # Steps 1-3 prepare the load, so a root that will not be injected (the
+    # machine gate or the fork-runtime refusal above) skips them: nothing
+    # is written into a root that is resumed uninjected.
+    var remoteBuf: LPVOID = nil
     var loadLibraryW: pointer = nil
-    if childIsWow64:
-      let probeExe = wow64ProbePathFor(dllPath)
-      let addr32 = wow64LoadLibraryWAddress(probeExe)
-      if addr32 == 0:
+    if not skipInjection:
+      # 1. Allocate a buffer in the child for the wide DLL path.
+      var dllPathW = toWideCStringSeq(effectiveDllPath)
+      let bufSize = SIZE_T(dllPathW.len * sizeof(uint16))
+      remoteBuf = VirtualAllocEx(pi.hProcess, nil, bufSize,
+        MEM_COMMIT or MEM_RESERVE, PAGE_READWRITE)
+      if remoteBuf == nil:
+        raise newException(OSError,
+          "VirtualAllocEx failed (err=" & $GetLastError() & ")")
+
+      # 2. Write the DLL path into the buffer.
+      var written: SIZE_T = 0
+      if WriteProcessMemory(pi.hProcess, remoteBuf, addr dllPathW[0],
+          bufSize, addr written) == 0:
         discard VirtualFreeEx(pi.hProcess, remoteBuf, 0, MEM_RELEASE)
         raise newException(OSError,
-          "cannot resolve LoadLibraryW for the 32-bit child: the WOW64 probe " &
-          "at " & probeExe & " is missing or reported no address. Build it " &
-          "with `nim c --cpu:i386 src/stackable_hooks/tools/" &
-          "wow64_proc_probe.nim`, or call setWow64ProbePath. Refusing to " &
-          "use this process's 64-bit LoadLibraryW address, which would " &
-          "start a remote thread at a meaningless location in the child.")
-      loadLibraryW = cast[pointer](uint(addr32))
-    else:
-      var kernel32Name = toWideCStringSeq("kernel32.dll")
-      let kernel32 = GetModuleHandleW(cast[LPCWSTR](addr kernel32Name[0]))
-      if kernel32 == nil:
-        discard VirtualFreeEx(pi.hProcess, remoteBuf, 0, MEM_RELEASE)
-        raise newException(OSError,
-          "GetModuleHandleW(kernel32) returned NULL")
-      loadLibraryW = GetProcAddress(kernel32, "LoadLibraryW")
-      if loadLibraryW == nil:
-        discard VirtualFreeEx(pi.hProcess, remoteBuf, 0, MEM_RELEASE)
-        raise newException(OSError,
-          "GetProcAddress(LoadLibraryW) returned NULL")
+          "WriteProcessMemory failed (err=" & $GetLastError() & ")")
+
+      # 3. Resolve LoadLibraryW as the CHILD sees it.
+      #
+      #    Same bitness: our own kernel32 is loaded at the same base in the
+      #    child, so GetProcAddress here is the child's address too.
+      #
+      #    WOW64 child: it is NOT. The child uses SysWOW64\kernel32.dll at an
+      #    unrelated base, and this process cannot resolve that address
+      #    itself. The 32-bit probe reports it via its exit code; see the
+      #    WOW64 section above.
+      if childIsWow64:
+        let probeExe = wow64ProbePathFor(dllPath)
+        let addr32 = wow64LoadLibraryWAddress(probeExe)
+        if addr32 == 0:
+          discard VirtualFreeEx(pi.hProcess, remoteBuf, 0, MEM_RELEASE)
+          raise newException(OSError,
+            "cannot resolve LoadLibraryW for the 32-bit child: the WOW64 probe " &
+            "at " & probeExe & " is missing or reported no address. Build it " &
+            "with `nim c --cpu:i386 src/stackable_hooks/tools/" &
+            "wow64_proc_probe.nim`, or call setWow64ProbePath. Refusing to " &
+            "use this process's 64-bit LoadLibraryW address, which would " &
+            "start a remote thread at a meaningless location in the child.")
+        loadLibraryW = cast[pointer](uint(addr32))
+      else:
+        var kernel32Name = toWideCStringSeq("kernel32.dll")
+        let kernel32 = GetModuleHandleW(cast[LPCWSTR](addr kernel32Name[0]))
+        if kernel32 == nil:
+          discard VirtualFreeEx(pi.hProcess, remoteBuf, 0, MEM_RELEASE)
+          raise newException(OSError,
+            "GetModuleHandleW(kernel32) returned NULL")
+        loadLibraryW = GetProcAddress(kernel32, "LoadLibraryW")
+        if loadLibraryW == nil:
+          discard VirtualFreeEx(pi.hProcess, remoteBuf, 0, MEM_RELEASE)
+          raise newException(OSError,
+            "GetProcAddress(LoadLibraryW) returned NULL")
 
     # 4. MSYS2/Cygwin fork emulation cannot tolerate a remote thread before
     # the runtime initializes. Resume those targets without injection and let
@@ -1125,7 +1230,7 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
         llExit = 0
         discard GetExitCodeThread(llThread, addr llExit)
         discard CloseHandle(llThread)
-    if not rootDetached:
+    if not rootDetached and remoteBuf != nil:
       # A detached child may still be reading the path string from a borrowed
       # LoadLibraryW; the reservation is leaked and reclaimed when it exits.
       discard VirtualFreeEx(pi.hProcess, remoteBuf, 0, MEM_RELEASE)

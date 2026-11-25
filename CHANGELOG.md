@@ -4,6 +4,34 @@
 
 ### Fixed
 
+- **`runWithMonitorShim` never injects a root of another machine.** An x64
+  process on a Windows on Arm host that started a native ARM64 root called
+  `CreateRemoteThread` with its own x64 `LoadLibraryW` address, got
+  `ERROR_INVALID_HANDLE` (6) and raised, so the command failed. The injector
+  now reads the child's actual machine
+  (`GetProcessInformation(ProcessMachineTypeInfo)`) and the shim's PE machine
+  before the park, and a root no shim of this process can serve (an ARM64
+  root of an x64 process, an x86 or x64 root of an ARM64 one, or a hybrid
+  ARM64X image such as System32's cmd.exe that an x64 process starts in
+  x64 mode, detected by comparing the process machine with the machine of
+  its image file) is not parked,
+  has nothing written into it, and is resumed uninjected with
+  `monitoringSkipped` and an `inject=unsupported-process-machine:<machine>`
+  reason, the spelling io-mon's spawn gate already uses. A shim whose machine
+  differs from the injecting process's is a packaging defect and raises. The
+  decision is `windows_machine.rootInjectRoute`, a pure module tested on
+  every host (`tests/test_windows_machine.nim`); the live cases run in
+  `tests/test_windows_root_machine_gate.nim`.
+- **`test_windows_injector_job` waits for the job to report itself empty**
+  (`JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO` on a completion port) before reading
+  its active-process count. Nothing orders a member's exit from the job
+  against its handle becoming signalled, and on native ARM64 the count read
+  straight after the root's exit was still 1.
+- **The entry park reports a child of another machine as `epsUnsupported`.**
+  It reported `epsSetupFailed`, whose contract offers a remote-thread load as
+  a sound fallback; for a foreign-machine child that fallback is the err=6
+  failure above.
+
 - **`rawSyscall6` / `staticRawSyscall6` are safe to forward a CLONE_VM clone
   through at every optimisation level.** A clone with `CLONE_VM` and a new
   stack resumes the child after the syscall instruction with its own stack
@@ -25,6 +53,14 @@
   C body's store.
 
 ### Added
+
+- **A native Windows on Arm test lane** (`windows-arm64-native.yml`,
+  `scripts/windows-arm64-native-tests.ps1`): the ARM64 inline hook, entry
+  park, root machine gate and injector tests built as ARM64 images with
+  pinned llvm-mingw and run on the fleet's ARM64 Windows class, plus the x64
+  build of the machine gate test on the same host. `ci-reprobuild.yml`'s
+  windows-arm64 leg builds x64 under emulation, so these bodies never ran
+  there.
 
 - **`platform/linux_image_code_ranges`: the executable-section ranges of a
   mapped ELF image.** The inline raw-syscall scanner is a linear sweep that

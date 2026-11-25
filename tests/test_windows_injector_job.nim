@@ -37,6 +37,54 @@ proc QueryInformationJobObject(job: HANDLE; cls: int32; info: pointer;
     len: DWORD; ret: ptr DWORD): BOOL {.importc, stdcall, dynlib: "kernel32".}
 proc CloseHandle(h: HANDLE): BOOL {.importc, stdcall, dynlib: "kernel32".}
 proc GetCurrentProcess(): HANDLE {.importc, stdcall, dynlib: "kernel32".}
+proc CreateIoCompletionPort(file, existing: HANDLE; key: uint;
+    threads: DWORD): HANDLE {.importc, stdcall, dynlib: "kernel32".}
+proc SetInformationJobObject(job: HANDLE; cls: int32; info: pointer;
+    len: DWORD): BOOL {.importc, stdcall, dynlib: "kernel32".}
+proc GetQueuedCompletionStatus(port: HANDLE; bytes: ptr DWORD; key: ptr uint;
+    overlapped: ptr pointer; ms: DWORD): BOOL
+  {.importc, stdcall, dynlib: "kernel32".}
+
+type
+  AssociateCompletionPort {.bycopy.} = object
+    ## JOBOBJECT_ASSOCIATE_COMPLETION_PORT
+    completionKey: pointer
+    completionPort: HANDLE
+
+const
+  JobObjectAssociateCompletionPortInformation = 7'i32
+  JobObjectMsgActiveProcessZero = 4'u32
+  InvalidHandleValue = cast[HANDLE](-1)
+
+proc watchJob(job: HANDLE): HANDLE =
+  ## Associate a completion port with `job` BEFORE anything joins it, so its
+  ## JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO is not missed. That message, not the
+  ## root's own exit, is what says the job is empty: a process leaves the
+  ## job's active count during its teardown, and nothing orders that against
+  ## the root's handle becoming signalled. Reading the count straight after
+  ## `runWithMonitorShim` returned saw `active=1` on a native ARM64 host
+  ## (nim-stackable-hooks run 45595100361).
+  ## https://learn.microsoft.com/windows/win32/api/winnt/ns-winnt-jobobject_associate_completion_port
+  result = CreateIoCompletionPort(InvalidHandleValue, nil, 0, 1)
+  doAssert result != nil, "CreateIoCompletionPort failed"
+  var assoc = AssociateCompletionPort(completionKey: job, completionPort: result)
+  doAssert SetInformationJobObject(job,
+    JobObjectAssociateCompletionPortInformation, addr assoc,
+    DWORD(sizeof(assoc))) != 0, "associating the completion port failed"
+
+proc waitJobEmpty(port: HANDLE; timeoutMs: DWORD): bool =
+  ## True once the job reports ACTIVE_PROCESS_ZERO within `timeoutMs`. The
+  ## timeout is a hang guard only: a job whose members have all exited posts
+  ## the message promptly.
+  while true:
+    var msg: DWORD
+    var key: uint
+    var ov: pointer
+    if GetQueuedCompletionStatus(port, addr msg, addr key, addr ov,
+        timeoutMs) == 0:
+      return false
+    if msg == JobObjectMsgActiveProcessZero:
+      return true
 
 const
   RootArg = "--job-root"
@@ -94,8 +142,11 @@ block noJob:
 block withJob:
   let job = CreateJobObjectW(nil, nil)
   doAssert job != nil
+  let port = watchJob(job)
   let outcome = runWithMonitorShim(@[getAppFilename(), RootArg], systemDll,
     job = job)
+  doAssert waitJobEmpty(port, 60_000), "the job never reported itself empty"
+  discard CloseHandle(port)
   let acct = accounting(job)
   echo "job: exit=", outcome.exitCode, " assigned=", outcome.jobAssigned,
     " total=", acct.totalProcesses, " active=", acct.activeProcesses

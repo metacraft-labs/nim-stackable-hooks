@@ -36,62 +36,22 @@
 ## ``test_windows_machine``. No mocks: real processes, a real DLL built from
 ## ``tests/fixtures/root_gate_shim.nim``, and its records read back from disk.
 when defined(windows) and (defined(amd64) or defined(arm64)):
-  import std/[os, osproc, strtabs, strutils, unittest]
+  import std/[os, strtabs, strutils, unittest]
   import stackable_hooks/windows_injector
+  import ./fixtures/machine_gate_support
 
-  type
-    HANDLE = pointer
-    WORD = uint16
-    BOOL = int32
-
-  proc IsWow64Process2(hProcess: HANDLE; processMachine,
-      nativeMachine: ptr WORD): BOOL {.importc, stdcall, dynlib: "kernel32".}
-  proc GetCurrentProcess(): HANDLE {.importc, stdcall, dynlib: "kernel32".}
-
-  const
-    MarkVar = "STACKABLE_HOOKS_ROOT_GATE_MARK"
-    NativeArm64ChildVar = "STACKABLE_HOOKS_NATIVE_ARM64_CHILD"
-    ExitWithArg = "--exit-with"
-
-  # Child mode: exit with the given code and touch nothing else.
+  # Child mode: exit with the given code and touch nothing else. The x64
+  # build of this test and of test_windows_child_machine_gate use the ARM64
+  # build, run this way, as their pure ARM64 child.
   if paramCount() == 2 and paramStr(1) == ExitWithArg:
     quit(parseInt(paramStr(2)))
 
-  proc hostNativeMachine(): uint16 =
-    ## The machine of the host, not of this (possibly emulated) process.
-    var pm, nm: WORD
-    doAssert IsWow64Process2(GetCurrentProcess(), addr pm, addr nm) != 0,
-      "IsWow64Process2 failed"
-    nm
-
-  let system32Cmd = getEnv("SystemRoot", r"C:\Windows") / "System32" / "cmd.exe"
-  let sysWow64Cmd = getEnv("SystemRoot", r"C:\Windows") / "SysWOW64" / "cmd.exe"
+  let system32Cmd = system32Cmd()
+  let sysWow64Cmd = sysWow64Cmd()
   let workDir = getTempDir() / ("stackable-hooks-root-gate-" & hostCPU &
     "-" & $getCurrentProcessId())
   createDir(workDir)
   let shimPath = workDir / "root_gate_shim.dll"
-
-  proc buildShim(): string =
-    ## Build the fixture DLL for THIS binary's CPU, so it matches the caller
-    ## as a real shim would. Returns "" or the reason it could not be built.
-    let nimExe = findExe("nim")
-    if nimExe.len == 0:
-      return "nim is not on PATH; cannot build the fixture DLL"
-    let fixture = currentSourcePath().parentDir() / "fixtures" /
-      "root_gate_shim.nim"
-    let (output, code) = execCmdEx(quoteShellCommand(@[nimExe, "c",
-      "--app:lib", "--cpu:" & hostCPU, "--hints:off", "--warnings:off",
-      "--nimcache:" & (workDir / "nimcache"), "--out:" & shimPath, fixture]))
-    if code != 0 or not fileExists(shimPath):
-      return "fixture DLL build failed (" & $code & "):\n" & output
-    ""
-
-  proc childArgs(exe: string; exitCode: int): seq[string] =
-    ## cmd.exe, or this test in child mode, exiting with `exitCode`.
-    if exe.toLowerAscii.endsWith("cmd.exe"):
-      @[exe, "/d", "/c", "exit " & $exitCode]
-    else:
-      @[exe, ExitWithArg, $exitCode]
 
   proc runRoot(exe: string; exitCode: int; mark: string):
       WindowsInjectionResult =
@@ -102,15 +62,8 @@ when defined(windows) and (defined(amd64) or defined(arm64)):
     removeFile(mark)
     runWithMonitorShim(childArgs(exe, exitCode), shimPath, env = env)
 
-  let nativeArm64Child = getEnv(NativeArm64ChildVar)
-
-  proc records(mark: string): seq[string] =
-    if fileExists(mark):
-      for line in readFile(mark).splitLines():
-        if line.len > 0:
-          result.add line
-
-  let setupError = buildShim()
+  let nativeArm64Child = nativeArm64Child()
+  let setupError = buildShim(workDir, shimPath)
   let native = hostNativeMachine()
 
   suite "Windows root injector: machine gate":
@@ -215,51 +168,14 @@ when defined(windows) and (defined(amd64) or defined(arm64)):
           "except WOW64 ones, which the park handles itself")
         skip()
       else:
-        # `osproc` cannot create a suspended child, so this is CreateProcessW.
-        type
-          StartupInfoW {.bycopy.} = object
-            cb: uint32
-            reserved: array[4, pointer]
-            dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars,
-              dwFillAttribute, dwFlags: uint32
-            wShowWindow, cbReserved2: uint16
-            lpReserved2: pointer
-            hStdInput, hStdOutput, hStdError: HANDLE
-          ProcessInformation {.bycopy.} = object
-            hProcess, hThread: HANDLE
-            dwProcessId, dwThreadId: uint32
-        proc CreateProcessW(app: WideCString; cmd: WideCString;
-            pa, ta: pointer; inherit: BOOL; flags: uint32; env: pointer;
-            cwd: WideCString; si: ptr StartupInfoW;
-            pi: ptr ProcessInformation): BOOL
-          {.importc, stdcall, dynlib: "kernel32".}
-        proc ResumeThread(h: HANDLE): uint32
-          {.importc, stdcall, dynlib: "kernel32".}
-        proc WaitForSingleObject(h: HANDLE; ms: uint32): uint32
-          {.importc, stdcall, dynlib: "kernel32".}
-        proc GetExitCodeProcess(h: HANDLE; code: ptr uint32): BOOL
-          {.importc, stdcall, dynlib: "kernel32".}
-        proc CloseHandle(h: HANDLE): BOOL
-          {.importc, stdcall, dynlib: "kernel32".}
-        var si: StartupInfoW
-        si.cb = uint32(sizeof(si))
-        var pi: ProcessInformation
-        var cmd = newWideCString(quoteShellCommand(childArgs(foreign, 5)))
-        const createSuspended = 0x4'u32
-        const createNoWindow = 0x0800_0000'u32
-        require CreateProcessW(nil, cmd, nil, nil, 0,
-          createSuspended or createNoWindow, nil, nil, addr si, addr pi) != 0
+        let pi = spawnSuspended(foreign, 5)
         defer:
           discard CloseHandle(pi.hThread)
           discard CloseHandle(pi.hProcess)
         let park = parkChildAtEntryPoint(pi.hProcess, pi.hThread, false,
           60_000'u32)
         check park.status == epsUnsupported
-        discard ResumeThread(pi.hThread)
-        check WaitForSingleObject(pi.hProcess, 60_000) == 0
-        var code: uint32
-        check GetExitCodeProcess(pi.hProcess, addr code) != 0
-        check code == 5
+        check resumeAndExitCode(pi) == 5
 else:
   static: doAssert not (defined(windows) and (defined(amd64) or
     defined(arm64)))

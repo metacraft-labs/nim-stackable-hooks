@@ -1,4 +1,8 @@
-## Machine-type decisions for injecting the monitor shim into a Windows root.
+## Machine-type decisions for injecting the monitor shim into a Windows child:
+## the root a launcher starts (`windows_injector.runWithMonitorShim`) and
+## every grandchild a monitored process starts
+## (`propagation_windows.injectShimIntoChildReport`, which a shim's spawn hook
+## calls). Both apply the same decision, `injectRoute`.
 ##
 ## `windows_injector.runWithMonitorShim` loads the shim into a child by running
 ## `LoadLibraryW` in it, either on its parked main thread or on a remote
@@ -42,7 +46,7 @@ const
 
 type
   RootInjectRoute* = enum
-    ## How `runWithMonitorShim` may inject a root child.
+    ## How a root or grandchild may be injected.
     rirSameMachine
       ## The child is of this process's machine and so is the shim: this
       ## process's `LoadLibraryW` address is the child's, and the entry park
@@ -52,9 +56,10 @@ type
       ## A 32-bit x86 child of an x64 process: the 32-bit shim, the WOW64
       ## probe's `LoadLibraryW` address and the remote-thread load.
     rirUnsupportedMachine
-      ## No shim this process can inject serves the child. It is resumed
-      ## uninjected, nothing is written into it first, and the caller is told
-      ## through `monitoringSkipped`, so its capture is graded incomplete.
+      ## No shim this process can inject serves the child. It runs
+      ## uninjected and nothing is written into it first; a root is reported
+      ## through `monitoringSkipped`, a grandchild as `ioUnsupportedMachine`,
+      ## so the capture is graded incomplete.
     rirShimMachineMismatch
       ## The shim beside this process is of a different machine than this
       ## process. That is a packaging defect, not a property of the child, so
@@ -112,9 +117,9 @@ proc peFileMachine*(path: string): uint16 =
     return ImageFileMachineUnknown
   peImageMachine(buf.toOpenArray(0, got - 1))
 
-proc rootInjectRoute*(caller, child, childImage, shim: uint16;
-                      childIsWow64: bool): RootInjectRoute =
-  ## Decide how a root child may be injected.
+proc injectRoute*(caller, child, childImage, shim: uint16;
+                  childIsWow64: bool): RootInjectRoute =
+  ## Decide how a root or grandchild may be injected.
   ##
   ## * `caller` -- this process's machine (`hostImageMachine`).
   ## * `child` -- the child's actual process machine, from
@@ -170,23 +175,48 @@ proc machineName(m: uint16): string =
   else: "other"
 
 proc unsupportedMachineReason*(caller, child: uint16): string =
-  ## The `skipReason` of a root left uninjected by `rirUnsupportedMachine`.
+  ## Why a child is left uninjected by `rirUnsupportedMachine`.
   ## It opens with io-mon's spawn-gate spelling so both ends of the tree read
   ## the same in a capture.
   "inject=unsupported-process-machine:" & toHex(child) & " (" &
     machineName(child) & " child of a " & machineName(caller) & " process, " &
     toHex(caller) & "): no shim of the child's machine can be injected from " &
-    "here, so the root runs unmonitored and its capture is incomplete"
+    "here, so it runs unmonitored and its capture is incomplete"
 
 proc hybridImageReason*(caller, child, image: uint16): string =
-  ## The `skipReason` of a hybrid root (see `rootInjectRoute`'s
+  ## Why a hybrid child is left uninjected (see `injectRoute`'s
   ## `childImage`): the process runs as `child` from an image of machine
   ## `image`. Same prefix as `unsupportedMachineReason`.
   "inject=unsupported-process-machine:" & toHex(child) & " (an " &
     machineName(child) & "-mode process of a hybrid " & machineName(image) &
     " image, " & toHex(image) & ", started by a " & machineName(caller) &
-    " process): no shim of this process can be injected into it, so the " &
-    "root runs unmonitored and its capture is incomplete"
+    " process): no shim of this process can be injected into it, so it " &
+    "runs unmonitored and its capture is incomplete"
+
+type
+  MachineGate* = object
+    ## One gate decision and the machines it was made from, so a caller can
+    ## both act on `route` and report what it saw.
+    route*: RootInjectRoute
+    caller*, child*, image*, shim*: uint16
+
+proc decideGate*(caller, child, image, shim: uint16;
+                 childIsWow64: bool): MachineGate =
+  ## `injectRoute`, kept together with its inputs.
+  MachineGate(route: injectRoute(caller, child, image, shim, childIsWow64),
+    caller: caller, child: child, image: image, shim: shim)
+
+proc gateReason*(g: MachineGate): string =
+  ## "" unless the gate refused the child; otherwise the reason, opening
+  ## with io-mon's `inject=unsupported-process-machine:<child>` token. A
+  ## refused child of the caller's own process machine can only be a hybrid
+  ## image (its image file is of another machine).
+  if g.route != rirUnsupportedMachine:
+    return ""
+  if g.child == g.caller:
+    hybridImageReason(g.caller, g.child, g.image)
+  else:
+    unsupportedMachineReason(g.caller, g.child)
 
 proc shimMismatchReason*(caller, shim: uint16; shimPath: string): string =
   ## The error of `rirShimMachineMismatch`.

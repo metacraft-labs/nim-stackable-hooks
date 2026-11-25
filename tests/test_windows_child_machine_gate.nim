@@ -16,7 +16,7 @@
 ## children and helpers are shared through
 ## ``tests/fixtures/machine_gate_support.nim``. No mocks.
 when defined(windows) and (defined(amd64) or defined(arm64)):
-  import std/[os, unittest]
+  import std/[os, strutils, unittest]
   import stackable_hooks/propagation_windows
   import stackable_hooks/windows_machine
   import ./fixtures/machine_gate_support
@@ -55,9 +55,17 @@ when defined(windows) and (defined(amd64) or defined(arm64)):
         skip()
       else:
         let r = injectChild(system32Cmd(), 7, workDir / "same.log")
+        checkpoint("records: " & $r.records)
         check r.report.outcome == ioInjected
         check r.exitCode == 7
-        check r.records.len == 2
+        # Loaded, and only loaded: `injectShimIntoChildReport` resolves the
+        # init export in the module that contains IT, because in production
+        # that is the shim propagating itself. Here the caller is this test
+        # executable, which exports no `repro_runtime_init`, so no init is
+        # dispatched (measured: run 45619632806). The init of a real shim's
+        # grandchild is io-mon's spawn path and is tested there.
+        check r.records.len == 1
+        check r.records.len == 1 and r.records[0].startsWith("ATTACH")
 
     test "a hybrid ARM64X grandchild of an x64 shim is left alone":
       checkpoint(setupError)
@@ -68,9 +76,10 @@ when defined(windows) and (defined(amd64) or defined(arm64)):
         skip()
       else:
         let r = injectChild(system32Cmd(), 7, workDir / "hybrid.log")
-        check r.report.outcome notin {ioInjected, ioAlreadyPresent,
-          ioInjectFailed, ioInitFailed, ioWaitTimeout, ioChildTerminated,
-          ioParkFailed}
+        check r.report.outcome == ioUnsupportedMachine
+        check "inject=unsupported-process-machine:8664" in
+          gateReason(r.report.machineGate)
+        check r.report.machineGate.image == ImageFileMachineArm64
         check r.exitCode == 7
         check r.records.len == 0
 
@@ -85,9 +94,9 @@ when defined(windows) and (defined(amd64) or defined(arm64)):
         checkpoint(NativeArm64ChildVar & "=" & nativeArm64Child())
         require nativeArm64Child().len > 0
         let r = injectChild(nativeArm64Child(), 7, workDir / "arm64.log")
-        check r.report.outcome notin {ioInjected, ioAlreadyPresent,
-          ioInjectFailed, ioInitFailed, ioWaitTimeout, ioChildTerminated,
-          ioParkFailed}
+        check r.report.outcome == ioUnsupportedMachine
+        check "inject=unsupported-process-machine:AA64" in
+          gateReason(r.report.machineGate)
         check r.exitCode == 7
         check r.records.len == 0
 
@@ -99,9 +108,9 @@ when defined(windows) and (defined(amd64) or defined(arm64)):
         skip()
       else:
         let r = injectChild(sysWow64Cmd(), 9, workDir / "x86.log")
-        check r.report.outcome notin {ioInjected, ioAlreadyPresent,
-          ioInjectFailed, ioInitFailed, ioWaitTimeout, ioChildTerminated,
-          ioParkFailed}
+        check r.report.outcome == ioUnsupportedMachine
+        check "inject=unsupported-process-machine:014C" in
+          gateReason(r.report.machineGate)
         check r.exitCode == 9
         check r.records.len == 0
 else:

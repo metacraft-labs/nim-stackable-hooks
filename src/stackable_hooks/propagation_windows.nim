@@ -146,6 +146,7 @@ import ./propagation
 import ./windows_entry_park
 import ./windows_fork_runtime
 import ./windows_injector
+import ./windows_machine
 
 # Re-exported whole: a consumer that spawns its own suspended children
 # needs the park primitive itself, not only the outcomes this module
@@ -337,6 +338,17 @@ type
       ## is already running (a further ``ResumeThread`` is a no-op); the spawn
       ## succeeds. A ``btpDetach`` that could not detach terminates instead
       ## and is reported as ``ioChildTerminated``.
+    ioUnsupportedMachine
+      ## No shim of this process can serve the child's machine
+      ## (``windows_injector.machineGate``; reprobuild-pm
+      ## spec/Monitor-Hook-Shim.md, "Windows on Arm64 install backend",
+      ## "Machine gate"): an ARM64 child of an x64 shim, an x86 or x64 child
+      ## of an ARM64 one, or a hybrid ARM64X image that an x64 parent started
+      ## in x64 mode, where the x64 park times out and the remote-thread load
+      ## fails with err=5 (measured on Windows on Arm). The child was neither
+      ## parked nor written to: it is exactly as ``CreateProcessW`` left it
+      ## and runs unmonitored once resumed. ``InjectionReport.machineGate``
+      ## says which machines were seen.
 
   InjectionReport* = object
     ## ``injectShimIntoChildReport``'s answer: the outcome, plus how long the
@@ -345,6 +357,10 @@ type
     ## has no effect on the outcome.
     outcome*: InjectionOutcome
     waitedMs*: uint64
+    machineGate*: MachineGate
+      ## The machine gate's decision and the machines it read. Set whenever
+      ## the gate ran; for ``ioUnsupportedMachine``, ``gateReason`` of it is
+      ## the reason to report.
 
 proc defaultInjectionConfig*(): InjectionConfig =
   ## Defaults chosen for webpack-class fork-bomb workloads:
@@ -533,7 +549,8 @@ proc applyBorrowTimeout(call: var BorrowedCall;
 
 proc injectShimIntoChildImpl(hProcess: HANDLE; libraryPath: string;
                              initSymbol: string; cfg: InjectionConfig;
-                             hThread: HANDLE; waitedMs: var uint64):
+                             hThread: HANDLE; waitedMs: var uint64;
+                             gate: var MachineGate):
     InjectionOutcome =
   ## Inject one library into the given child process. The caller is
   ## responsible for having spawned the child with ``CREATE_SUSPENDED``
@@ -593,6 +610,9 @@ proc injectShimIntoChildImpl(hProcess: HANDLE; libraryPath: string;
   ##                          outlived ``parkTimeoutMs``; the child was
   ##                          TERMINATED rather than resumed mid-call. The
   ##                          caller must fail the spawn.
+  ##   ``ioUnsupportedMachine`` — no shim of this process serves the child's
+  ##                          machine; it was not touched and runs
+  ##                          unmonitored once resumed.
   ##
   ## Only ``ioInjected`` and ``ioAlreadyPresent`` mean the child is
   ## instrumented. Every refusal above is deliberately a DIFFERENT value so
@@ -630,6 +650,23 @@ proc injectShimIntoChildImpl(hProcess: HANDLE; libraryPath: string;
   discard IsWow64Process(hProcess, addr childIsWow64)
   let effectiveLibrary =
     if childIsWow64 != 0: wow64ShimPathFor(libraryPath) else: libraryPath
+
+  # THE MACHINE GATE, before anything touches the child: the park writes
+  # this process's machine code into it and every load route hands it an
+  # address resolved here. The same decision as the root launcher's
+  # (`machineGate`). Without it, a foreign child's park reports
+  # `epsUnsupported` and the code below falls back to the remote-thread
+  # load, the exact call that fails across machines.
+  gate = machineGate(hProcess, libraryPath, childIsWow64 != 0)
+  case gate.route
+  of rirSameMachine, rirWow64:
+    discard
+  of rirUnsupportedMachine:
+    return ioUnsupportedMachine
+  of rirShimMachineMismatch:
+    # A packaging defect (a shim of another machine than this process);
+    # loading it is bound to fail, so do not try.
+    return ioInjectFailed
 
   # ---------------------------------------------------------------------
   # HAZARD 1 -- the attach strategy. THIS IS UNIVERSAL, NOT GATED ON MSYS.
@@ -966,9 +1003,10 @@ proc injectShimIntoChildReport*(hProcess: HANDLE;
   ## (park + borrowed calls). See ``InjectionReport``, and
   ## ``injectShimIntoChildImpl`` above for the full contract.
   var waited = 0'u64
+  var gate: MachineGate
   let outcome = injectShimIntoChildImpl(hProcess, libraryPath, initSymbol,
-    cfg, hThread, waited)
-  InjectionReport(outcome: outcome, waitedMs: waited)
+    cfg, hThread, waited, gate)
+  InjectionReport(outcome: outcome, waitedMs: waited, machineGate: gate)
 
 proc injectShimIntoChild*(hProcess: HANDLE;
                           libraryPath: string;

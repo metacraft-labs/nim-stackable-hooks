@@ -76,7 +76,7 @@ suite "PE machine of an image":
     elif defined(i386):
       check hostImageMachine() == ImageFileMachineI386
 
-suite "root injection route":
+suite "injection route (root and grandchild)":
   const
     x86 = ImageFileMachineI386
     x64 = ImageFileMachineAmd64
@@ -84,30 +84,30 @@ suite "root injection route":
     unknown = ImageFileMachineUnknown
 
   test "issue 2026-11-20: an x64 engine never injects a native ARM64 child":
-    check rootInjectRoute(caller = x64, child = a64, childImage = a64,
+    check injectRoute(caller = x64, child = a64, childImage = a64,
       shim = x64, childIsWow64 = false) == rirUnsupportedMachine
 
   test "a native ARM64 engine injects its ARM64 shim into an ARM64 child":
-    check rootInjectRoute(a64, a64, a64, a64, false) == rirSameMachine
+    check injectRoute(a64, a64, a64, a64, false) == rirSameMachine
 
   test "a native ARM64 engine refuses every other child (no x64 shim ships)":
-    check rootInjectRoute(a64, x64, x64, a64, false) == rirUnsupportedMachine
+    check injectRoute(a64, x64, x64, a64, false) == rirUnsupportedMachine
     # An x86 child of an ARM64 parent is WOW64 on Windows on Arm; the WOW64
     # route is the x64 host's and is never taken from an ARM64 caller.
-    check rootInjectRoute(a64, x86, x86, a64, true) == rirUnsupportedMachine
-    check rootInjectRoute(a64, unknown, x86, a64, true) == rirUnsupportedMachine
+    check injectRoute(a64, x86, x86, a64, true) == rirUnsupportedMachine
+    check injectRoute(a64, unknown, x86, a64, true) == rirUnsupportedMachine
 
   test "the x64 routes are unchanged":
-    check rootInjectRoute(x64, x64, x64, x64, false) == rirSameMachine
-    check rootInjectRoute(x64, x86, x86, x64, true) == rirWow64
+    check injectRoute(x64, x64, x64, x64, false) == rirSameMachine
+    check injectRoute(x64, x86, x86, x64, true) == rirWow64
 
   test "an unknown child machine keeps the pre-gate behaviour":
     # `GetProcessInformation(ProcessMachineTypeInfo)` exists from Windows 11
     # and Server 2022 on. Where it is missing the host emulates no x64, so
     # the WOW64 flag alone still tells the routes apart, as it always did.
-    check rootInjectRoute(x64, unknown, unknown, x64, false) == rirSameMachine
-    check rootInjectRoute(x64, unknown, unknown, x64, true) == rirWow64
-    check rootInjectRoute(a64, unknown, unknown, a64, false) == rirSameMachine
+    check injectRoute(x64, unknown, unknown, x64, false) == rirSameMachine
+    check injectRoute(x64, unknown, unknown, x64, true) == rirWow64
+    check injectRoute(a64, unknown, unknown, a64, false) == rirSameMachine
 
   test "an ARM64X image run as an x64 process is a hybrid root, refused":
     # Measured on the fleet's Windows on Arm class (run 45595100361):
@@ -115,28 +115,46 @@ suite "root injection route":
     # runs as an x64-mode (ARM64EC) process, `ProcessMachineTypeInfo` says
     # 8664, and the x64 park and remote-thread load both fail on it (the
     # park times out, CreateRemoteThread returns err=5).
-    check rootInjectRoute(x64, x64, a64, x64, false) == rirUnsupportedMachine
+    check injectRoute(x64, x64, a64, x64, false) == rirUnsupportedMachine
     # The same image started by a native ARM64 process runs as ARM64.
-    check rootInjectRoute(a64, a64, a64, a64, false) == rirSameMachine
+    check injectRoute(a64, a64, a64, a64, false) == rirSameMachine
     # An unreadable image says nothing either way.
-    check rootInjectRoute(x64, x64, unknown, x64, false) == rirSameMachine
+    check injectRoute(x64, x64, unknown, x64, false) == rirSameMachine
 
   test "the hybrid refusal names both machines":
     let reason = hybridImageReason(caller = x64, child = x64, image = a64)
     check "inject=unsupported-process-machine:8664" in reason
     check "AA64" in reason
 
+  test "a gate carries the reason that names its case":
+    let refused = MachineGate(route: rirUnsupportedMachine, caller: x64,
+      child: a64, image: a64, shim: x64)
+    check "inject=unsupported-process-machine:AA64" in gateReason(refused)
+    let hybrid = MachineGate(route: rirUnsupportedMachine, caller: x64,
+      child: x64, image: a64, shim: x64)
+    check "hybrid" in gateReason(hybrid)
+    check "inject=unsupported-process-machine:8664" in gateReason(hybrid)
+    let fine = MachineGate(route: rirSameMachine, caller: x64, child: x64,
+      image: x64, shim: x64)
+    check gateReason(fine) == ""
+
+  test "decideGate fills the route from the machines":
+    let g = decideGate(caller = x64, child = x64, image = a64, shim = x64,
+      childIsWow64 = false)
+    check g.route == rirUnsupportedMachine
+    check g.image == a64
+
   test "a 32-bit caller keeps its pre-gate routes":
-    check rootInjectRoute(x86, x86, x86, x86, true) == rirWow64
-    check rootInjectRoute(x86, unknown, unknown, x86, false) == rirSameMachine
+    check injectRoute(x86, x86, x86, x86, true) == rirWow64
+    check injectRoute(x86, unknown, unknown, x86, false) == rirSameMachine
 
   test "a shim of another machine than this process is never injected":
     # A packaging defect, not a property of the child: refuse loudly rather
     # than run every action unmonitored.
-    check rootInjectRoute(a64, a64, a64, x64, false) == rirShimMachineMismatch
-    check rootInjectRoute(x64, x64, x64, a64, false) == rirShimMachineMismatch
+    check injectRoute(a64, a64, a64, x64, false) == rirShimMachineMismatch
+    check injectRoute(x64, x64, x64, a64, false) == rirShimMachineMismatch
     # An unreadable shim header is not a mismatch: LoadLibraryW reports it.
-    check rootInjectRoute(x64, x64, x64, unknown, false) == rirSameMachine
+    check injectRoute(x64, x64, x64, unknown, false) == rirSameMachine
 
   test "the refusal names the child machine the way io-mon's spawn gate does":
     let reason = unsupportedMachineReason(caller = x64, child = a64)

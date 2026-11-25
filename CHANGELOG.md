@@ -22,6 +22,17 @@
   decision is `windows_machine.rootInjectRoute`, a pure module tested on
   every host (`tests/test_windows_machine.nim`); the live cases run in
   `tests/test_windows_root_machine_gate.nim`.
+- **Grandchild propagation applies the same machine gate.**
+  `injectShimIntoChildReport`, which a shim's spawn hook calls, decided
+  nothing about machines: on Windows on Arm an x64 shim's ARM64 grandchild
+  and an ARM64 shim's x86 grandchild came back `ioInjectFailed`, and an
+  ARM64X grandchild that the x64 shim's process started in x64 mode
+  (`cmd.exe`) came back `ioParkFailed` after the park timed out (measured,
+  run 45619632806). The gate (`windows_injector.machineGate`, shared with
+  the root launcher, deciding through `windows_machine.injectRoute`) now
+  runs before the park; a child no shim of this process serves is untouched
+  and reported as the new `ioUnsupportedMachine`, with the machines it read
+  in `InjectionReport.machineGate`. `rootInjectRoute` is now `injectRoute`.
 - **`test_windows_injector_job` waits for the job to report itself empty**
   (`JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO` on a completion port) before reading
   its active-process count. Nothing orders a member's exit from the job

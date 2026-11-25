@@ -438,7 +438,7 @@ proc queryProcessMachine(hProcess: HANDLE; info: var ProcessMachineInformation;
 proc processActualMachine*(hProcess: HANDLE): uint16 {.raises: [], gcsafe.} =
   ## The machine `hProcess` actually runs, or `ImageFileMachineUnknown` where
   ## the host cannot say (before Windows 11, where no x64 emulation exists
-  ## and the WOW64 flag is enough; see `windows_machine.rootInjectRoute`).
+  ## and the WOW64 flag is enough; see `windows_machine.injectRoute`).
   var info: ProcessMachineInformation
   var error: DWORD
   if queryProcessMachine(hProcess, info, error): info.processMachine
@@ -469,6 +469,20 @@ proc processImageFileMachine*(hProcess: HANDLE): uint16 {.raises: [], gcsafe.} =
     try: extendedPath(path)
     except ValueError, OSError: path
   peFileMachine(ext)
+
+proc machineGate*(hProcess: HANDLE; shimPath: string;
+                  childIsWow64: bool): MachineGate {.raises: [], gcsafe.} =
+  ## Read the machines `windows_machine.injectRoute` decides on -- this
+  ## process's, the child's actual process machine, the machine of the
+  ## child's image file, and the shim's -- and decide. The one machine gate
+  ## for both the root launcher (`runWithMonitorShim`) and grandchild
+  ## propagation (`propagation_windows.injectShimIntoChildReport`), so the
+  ## two cannot disagree about which child a shim may enter.
+  let shim =
+    try: peFileMachine(extendedPath(shimPath))
+    except ValueError, OSError: ImageFileMachineUnknown
+  decideGate(hostImageMachine(), processActualMachine(hProcess),
+    processImageFileMachine(hProcess), shim, childIsWow64)
 
 proc processMachineWitness(hProcess: HANDLE): string {.raises: [], gcsafe.} =
   # Query the public machine pair separately from the legacy WOW64 boolean.
@@ -999,29 +1013,19 @@ proc runWithMonitorShim*(argv: openArray[string], dllPath: string,
     #     it is resumed uninjected with the loss reported through
     #     `monitoringSkipped`. A shim of the wrong machine for THIS process
     #     is a packaging defect and is refused outright. The decision is
-    #     `windows_machine.rootInjectRoute`, unit-tested on every host.
-    let callerMachine = hostImageMachine()
-    let childMachine = processActualMachine(pi.hProcess)
-    let shimMachine =
-      try: peFileMachine(extendedPath(dllPath))
-      except ValueError: ImageFileMachineUnknown
-    let childImageMachine = processImageFileMachine(pi.hProcess)
-    let route = rootInjectRoute(callerMachine, childMachine,
-      childImageMachine, shimMachine, childIsWow64)
-    case route
+    #     `machineGate` (`windows_machine.injectRoute`, unit-tested on every
+    #     host), the same one grandchild propagation applies.
+    let gate = machineGate(pi.hProcess, dllPath, childIsWow64)
+    case gate.route
     of rirSameMachine, rirWow64:
       discard
     of rirUnsupportedMachine:
       skipInjection = true
       result.monitoringSkipped = true
-      result.skipReason =
-        if childMachine == callerMachine:
-          hybridImageReason(callerMachine, childMachine, childImageMachine)
-        else:
-          unsupportedMachineReason(callerMachine, childMachine)
+      result.skipReason = gateReason(gate)
     of rirShimMachineMismatch:
       raise newException(OSError,
-        shimMismatchReason(callerMachine, shimMachine, dllPath))
+        shimMismatchReason(gate.caller, gate.shim, dllPath))
 
     # 0b. PARK THE CHILD'S MAIN THREAD AT ITS IMAGE ENTRY POINT.
     #

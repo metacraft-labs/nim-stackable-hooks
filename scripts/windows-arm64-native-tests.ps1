@@ -130,11 +130,13 @@ $plan = @(
       'test_windows_arm64_inline_hook',
       'test_windows_arm64_entry_park',
       'test_windows_root_machine_gate',
+      'test_windows_child_machine_gate',
       'test_windows_injector_capture',
       'test_windows_injector_job') },
   @{ cpu = 'amd64'; tests = @(
       'test_windows_machine',
-      'test_windows_root_machine_gate') }
+      'test_windows_root_machine_gate',
+      'test_windows_child_machine_gate') }
 )
 
 $failed = @()

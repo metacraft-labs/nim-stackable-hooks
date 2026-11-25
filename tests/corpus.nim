@@ -228,6 +228,16 @@ const testCorpus*: seq[TestEntry] = @[
          "shim built at run time. Its issue case (an x64 build on Windows " &
          "on Arm) and its native ARM64 case run only on eph-win-arm64; " &
          "elsewhere the cross-target lane compile-verifies it."),
+  TestEntry(stem: "test_windows_child_machine_gate",
+    runtimeInputs: @["tests/fixtures/root_gate_shim.nim",
+                     "tests/fixtures/machine_gate_support.nim"],
+    targets: @[tLinuxAmd64, tMacosArm64, tWindowsAmd64, tWindowsArm64],
+    why: "Self-gating `when defined(windows) and (amd64 or arm64)` with an " &
+         "`else: static: doAssert` arm. Live on Windows: the shim's " &
+         "grandchild path, injectShimIntoChildReport, on real suspended " &
+         "children of each machine. Its Windows on Arm cases (a hybrid " &
+         "ARM64X or pure ARM64 grandchild of an x64 shim, an x86 one of an " &
+         "ARM64 shim) run only on eph-win-arm64."),
   TestEntry(stem: "test_windows_inline_hook_api", targets: AllHostTargets,
     why: "Off Windows its `else` arm compiles install_windows.c and runs " &
          "real C-ABI doAsserts, so it is genuine coverage everywhere."),

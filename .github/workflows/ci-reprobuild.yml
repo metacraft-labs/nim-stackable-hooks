@@ -117,17 +117,29 @@ jobs:
         # setup-dev-env clones the siblings listed in .github/sibling-repos
         # (codetracer-trace-format, codetracer-trace-format-nim) at the
         # workspace-lock-pinned revisions before materialising the env.
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@41d0680bd78ca59ad110a261a20bcaa93a38fffd
+        id: dev-env
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
         with:
           env-flavor: reprobuild
-          # The selected source bootstrap supplies the runtime closure on
-          # every host, including a usable macOS shell and Windows compiler.
-          repro-from-source: true
-          repro-build-pin: 37a109c4e1cf650e6eb79b11d9fadf6e49e64614
-          repro-runquota-pin: 83d89e581d01c96eadb157bee48cecab6aba1866
-          repro-io-mon-pin: 1365943692eedfb0699ce90e59c4602d90317561
-          repro-stackable-hooks-pin: c34e3252d413361a0f250d8921e00c119d30e114
+          # The Reprobuild engine is the fleet pin, the action's default:
+          # `pins/reprobuild.json` in metacraft-labs/metacraft-github-actions,
+          # built against the companion revisions that pinned revision locks.
           gh-token: ${{ steps.ci_token.outputs.token }}
+
+      - name: Assert the pinned engine
+        # setup-dev-env reports the engine it installed, by whichever route
+        # (source build, binary cache, pin prerelease): it must be the pin,
+        # not an override.
+        shell: bash
+        env:
+          REPRO_COMMIT: ${{ steps.dev-env.outputs.repro-commit }}
+          REPRO_ORIGIN: ${{ steps.dev-env.outputs.repro-origin }}
+          REPRO_INSTALL_SOURCE: ${{ steps.dev-env.outputs.repro-install-source }}
+        run: |
+          set -euo pipefail
+          echo "repro ${REPRO_COMMIT} (origin ${REPRO_ORIGIN}, ${REPRO_INSTALL_SOURCE})"
+          [[ "${REPRO_COMMIT}" =~ ^[0-9a-f]{40}$ ]]
+          test "${REPRO_ORIGIN}" = pin
 
       - name: repro build
         # Builds the conventional `build` collection declared in
